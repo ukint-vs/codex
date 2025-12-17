@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "programs/ethapp_with_events",
+    "programs/ethapp",
+    "programs/vault",
+    "programs/vault/client", "libraries/clob-common", "programs/orderbook", "programs/orderbook/client", "programs/registry",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+sails-rs = { git = "https://github.com/gear-tech/sails", branch = "master" }
+tokio = { version = "1", features = ["rt", "macros"] }
+gtest = "1"
+insta = "1"
+alloy-sol-types = { version = "0.8.15", default-features = false }

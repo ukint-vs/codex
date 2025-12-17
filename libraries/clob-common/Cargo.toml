@@ -1,0 +1,7 @@
+[package]
+name = "clob-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sails-rs = { workspace = true, features = ["ethexe", "debug"] }

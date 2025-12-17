@@ -1,0 +1,19 @@
+/target
+**/.DS_Store
+programs/ethapp/
+programs/ethapp_with_events/
+programs/one-of-us/
+programs/vara-eth-demo/
+docs/
+.serena/
+node_modules/
+tasks/
+deploy/clob/node_modules/
+# Foundry broadcast outputs
+broadcast/
+# Conductor files
+conductor/
+ACT.md
+.env
+**/out/
+**/cache/

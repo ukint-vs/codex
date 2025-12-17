@@ -1,0 +1,42 @@
+constructor {
+  Create : (vault_id: actor_id);
+};
+
+service OrderBook {
+  CancelOrder : (order_id: u128, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
+  CancelOrderEth : (user: [u8, 20], order_id: u128, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
+  ContinueMatching : (base_token: [u8, 20], quote_token: [u8, 20]) -> null;
+  PlaceOrder : (price: u128, quantity: u128, is_buy: bool, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
+  PlaceOrderEth : (user: [u8, 20], price: u128, quantity: u128, is_buy: bool, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
+  SetEthOrderbookCaller : (program_id: actor_id) -> null;
+  SetMarketScale : (base_token: [u8, 20], quote_token: [u8, 20], price_scale: u128) -> null;
+  SetVault : (new_vault: actor_id) -> null;
+  query Admin : () -> actor_id;
+  query BestAsk : () -> struct { bool, u128, u128 };
+  query BestBid : () -> struct { bool, u128, u128 };
+  query GetOrder : (order_id: u128) -> struct { bool, actor_id, bool, u128, u128 };
+  query MarketScale : (base_token: [u8, 20], quote_token: [u8, 20]) -> u128;
+  query OrderCounter : () -> u128;
+  query Vault : () -> actor_id;
+
+  events {
+    OrderPlaced: struct {
+      order_id: u128,
+      price: u128,
+      quantity: u128,
+      is_buy: u32,
+    };
+    OrderCanceled: struct {
+      order_id: u128
+    };
+    TradeExecuted: struct {
+      maker_order_id: u128,
+      taker_order_id: u128,
+      price: u128,
+      quantity: u128,
+      maker: [u8, 32],
+      taker: [u8, 32],
+    };
+  }
+};
+

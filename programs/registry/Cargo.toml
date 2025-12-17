@@ -1,0 +1,11 @@
+[package]
+name = "registry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sails-rs = { workspace = true, features = ["ethexe"] }
+clob-common = { path = "../../libraries/clob-common" }
+
+[build-dependencies]
+sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }

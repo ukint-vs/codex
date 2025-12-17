@@ -1,0 +1,18 @@
+[package]
+name = "orderbook"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sails-rs = { workspace = true, features = ["ethexe", "debug"] }
+clob-common = { path = "../../libraries/clob-common" }
+vault-client = { path = "../vault/client" }
+
+[build-dependencies]
+sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
+
+[dev-dependencies]
+insta.workspace = true
+sails-rs = { workspace = true, features = ["ethexe", "gtest", "idl-gen"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+orderbook-client = { path = "client" }

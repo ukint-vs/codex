@@ -1,0 +1,16 @@
+[package]
+name = "vault-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mockall = { version = "0.12", optional = true }
+sails-rs = { workspace = true, features = ["ethexe"] }
+
+[build-dependencies]
+sails-client-gen = { git = "https://github.com/gear-tech/sails", branch = "master" }
+sails-idl-gen = { git = "https://github.com/gear-tech/sails", branch = "master" }
+vault-app = { path = "../" }
+
+[features]
+mocks = ["sails-rs/mockall", "dep:mockall"]
