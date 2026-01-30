@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod state;
+
 use alloc::vec::Vec;
 use clob_common::{
     actor_to_eth, eth_to_actor, mul_div_ceil, EthAddress, Order, OrderId, Price, Quantity, Side,
@@ -13,6 +15,8 @@ use sails_rs::{
     hex,
     prelude::*,
 };
+use state::arena::{Arena, Index};
+use state::linked_list::{OrderNode, OrderQueue};
 use vault_client::vault::io::{VaultReserveFunds, VaultSettleTrade, VaultUnlockFunds};
 
 // --- Events ---
@@ -45,9 +49,10 @@ pub enum Events {
 
 #[derive(Default)]
 pub struct OrderBookState {
-    pub bids: BTreeMap<Price, Vec<Order>>,
-    pub asks: BTreeMap<Price, Vec<Order>>,
-    pub orders: HashMap<OrderId, Order>,
+    pub bids: BTreeMap<Price, OrderQueue>,
+    pub asks: BTreeMap<Price, OrderQueue>,
+    pub arena: Arena<OrderNode>,
+    pub order_indices: HashMap<OrderId, Index>,
     pub vault_id: ActorId,
     pub admin: Option<ActorId>,
     pub eth_orderbook_caller: Option<ActorId>,
@@ -135,6 +140,26 @@ impl OrderBookService {
         }
     }
 
+    fn calculate_total_qty(queue: &OrderQueue, arena: &Arena<OrderNode>) -> Quantity {
+        let mut total = 0;
+        let mut current = queue.head;
+        while let Some(idx) = current {
+            if let Some(node) = arena.get(idx) {
+                total += node.order.quantity;
+                current = node.next;
+            } else {
+                break;
+            }
+        }
+        total
+    }
+
+    fn peek_first_order(queue: &OrderQueue, arena: &Arena<OrderNode>) -> Option<Order> {
+        queue
+            .head
+            .and_then(|idx| arena.get(idx).map(|node| node.order.clone()))
+    }
+
     #[export]
     pub fn set_vault(&mut self, new_vault: ActorId) {
         self.ensure_admin();
@@ -150,13 +175,20 @@ impl OrderBookService {
     }
 
     #[export]
-    pub fn set_market_scale(&mut self, base_token: TokenId, quote_token: TokenId, price_scale: u128) {
+    pub fn set_market_scale(
+        &mut self,
+        base_token: TokenId,
+        quote_token: TokenId,
+        price_scale: u128,
+    ) {
         self.ensure_admin();
         if price_scale == 0 {
             panic!("InvalidPriceScale");
         }
         let state = OrderBookState::get_mut();
-        state.market_scales.insert((base_token, quote_token), price_scale);
+        state
+            .market_scales
+            .insert((base_token, quote_token), price_scale);
     }
 
     #[export]
@@ -179,19 +211,20 @@ impl OrderBookService {
     #[export]
     pub fn get_order(&self, order_id: OrderId) -> (bool, TraderId, bool, Price, Quantity) {
         let state = OrderBookState::get_mut();
-        if let Some(order) = state.orders.get(&order_id) {
-            let (trader, is_buy, price, qty) = Self::order_to_tuple(order);
-            (true, trader, is_buy, price, qty)
-        } else {
-            (false, ActorId::from([0u8; 32]), false, 0, 0)
+        if let Some(idx) = state.order_indices.get(&order_id) {
+            if let Some(node) = state.arena.get(*idx) {
+                let (trader, is_buy, price, qty) = Self::order_to_tuple(&node.order);
+                return (true, trader, is_buy, price, qty);
+            }
         }
+        (false, ActorId::from([0u8; 32]), false, 0, 0)
     }
 
     #[export]
     pub fn best_bid(&self) -> (bool, Price, Quantity) {
         let state = OrderBookState::get_mut();
-        if let Some((price, orders)) = state.bids.iter().next_back() {
-            let total_qty: Quantity = orders.iter().map(|o| o.quantity).sum();
+        if let Some((price, queue)) = state.bids.iter().next_back() {
+            let total_qty = Self::calculate_total_qty(queue, &state.arena);
             (true, *price, total_qty)
         } else {
             (false, 0, 0)
@@ -201,8 +234,8 @@ impl OrderBookService {
     #[export]
     pub fn best_ask(&self) -> (bool, Price, Quantity) {
         let state = OrderBookState::get_mut();
-        if let Some((price, orders)) = state.asks.iter().next() {
-            let total_qty: Quantity = orders.iter().map(|o| o.quantity).sum();
+        if let Some((price, queue)) = state.asks.iter().next() {
+            let total_qty = Self::calculate_total_qty(queue, &state.arena);
             (true, *price, total_qty)
         } else {
             (false, 0, 0)
@@ -231,10 +264,7 @@ impl OrderBookService {
 
         // 1. Calculate required amount
         let (required_amount, required_token) = match side {
-            Side::Buy => (
-                mul_div_ceil(price, quantity, price_scale),
-                quote_token,
-            ),
+            Side::Buy => (mul_div_ceil(price, quantity, price_scale), quote_token),
             Side::Sell => (quantity, base_token),
         };
 
@@ -273,16 +303,13 @@ impl OrderBookService {
             created_at: 0,
         };
 
-        state.orders.insert(order_id, order.clone());
+        let queue = match side {
+            Side::Buy => state.bids.entry(price).or_default(),
+            Side::Sell => state.asks.entry(price).or_default(),
+        };
 
-        match side {
-            Side::Buy => {
-                state.bids.entry(price).or_default().push(order.clone());
-            }
-            Side::Sell => {
-                state.asks.entry(price).or_default().push(order.clone());
-            }
-        }
+        let idx = queue.push_back(&mut state.arena, order.clone());
+        state.order_indices.insert(order_id, idx);
 
         self.emit_eth_event(Events::OrderPlaced {
             order_id,
@@ -302,8 +329,6 @@ impl OrderBookService {
             .unwrap();
 
         // 4. Match Orders
-        // We ignore the result of matching to ensure the order placement (and reservation) is not reverted
-        // if matching fails or hits limits.
         let _ = self.match_orders(base_token, quote_token).await;
     }
 
@@ -353,27 +378,35 @@ impl OrderBookService {
     ) {
         let state = OrderBookState::get_mut();
 
-        let order = state.orders.get(&order_id).expect("OrderNotFound").clone();
+        let idx = *state.order_indices.get(&order_id).expect("OrderNotFound");
+        let node = state.arena.get(idx).expect("OrderNodeNotFound");
+        let order = node.order.clone();
+
         if order.trader != caller {
             core::panic!("Unauthorized");
         }
 
         // Remove from book
-        state.orders.remove(&order_id);
-
-        let book_side = match order.side {
-            Side::Buy => &mut state.bids,
-            Side::Sell => &mut state.asks,
+        let queue = match order.side {
+            Side::Buy => state.bids.get_mut(&order.price),
+            Side::Sell => state.asks.get_mut(&order.price),
         };
 
-        if let Some(orders) = book_side.get_mut(&order.price) {
-            if let Some(pos) = orders.iter().position(|o| o.id == order_id) {
-                orders.remove(pos);
-            }
-            if orders.is_empty() {
-                book_side.remove(&order.price);
+        if let Some(q) = queue {
+            q.remove(&mut state.arena, idx);
+            if q.head.is_none() {
+                match order.side {
+                    Side::Buy => {
+                        state.bids.remove(&order.price);
+                    }
+                    Side::Sell => {
+                        state.asks.remove(&order.price);
+                    }
+                }
             }
         }
+
+        state.order_indices.remove(&order_id);
 
         // Unlock Funds
         let price_scale = self.market_scale_value(base_token, quote_token);
@@ -447,7 +480,7 @@ impl OrderBookService {
 
     async fn match_orders(&mut self, base_token: TokenId, quote_token: TokenId) -> Result<(), ()> {
         let mut matches_count = 0;
-        const MAX_MATCHES: u32 = 10;
+        const MAX_MATCHES: u32 = 50;
         let price_scale = self.market_scale_value(base_token, quote_token);
         if price_scale == 0 {
             panic!("InvalidPriceScale");
@@ -475,13 +508,14 @@ impl OrderBookService {
                 let best_bid_entry = state.bids.iter_mut().next_back();
                 let best_ask_entry = state.asks.iter_mut().next();
 
-                if let (Some((bid_price, bids)), Some((ask_price, asks))) =
+                if let (Some((bid_price, bids_queue)), Some((ask_price, asks_queue))) =
                     (best_bid_entry, best_ask_entry)
                 {
                     if *bid_price >= *ask_price {
-                        if let (Some(bid_order), Some(ask_order)) =
-                            (bids.first().cloned(), asks.first().cloned())
-                        {
+                        let bid_order = Self::peek_first_order(bids_queue, &state.arena);
+                        let ask_order = Self::peek_first_order(asks_queue, &state.arena);
+
+                        if let (Some(bid_order), Some(ask_order)) = (bid_order, ask_order) {
                             Some((*bid_price, *ask_price, bid_order, ask_order))
                         } else {
                             None
@@ -494,11 +528,11 @@ impl OrderBookService {
                 }
             };
 
-            if let Some((bid_price, ask_price, bid_order, ask_order)) = match_data {
+            if let Some((_bid_price, _ask_price, bid_order, ask_order)) = match_data {
                 let trade_price = if bid_order.id < ask_order.id {
-                    bid_price
+                    bid_order.price // Maker price (Bid)
                 } else {
-                    ask_price
+                    ask_order.price // Maker price (Ask)
                 };
 
                 let trade_quantity = core::cmp::min(bid_order.quantity, ask_order.quantity);
@@ -597,55 +631,46 @@ impl OrderBookService {
 
                 let state = OrderBookState::get_mut();
 
-                let mut bid_done = false;
-                let mut ask_done = false;
+                // Update orders in arena
+                let mut bid_filled = false;
+                let mut ask_filled = false;
 
-                if let Some(o) = state.orders.get_mut(&bid_order.id) {
-                    o.quantity -= trade_quantity;
-                    if o.quantity == 0 {
-                        bid_done = true;
-                    }
-                }
-
-                if let Some(o) = state.orders.get_mut(&ask_order.id) {
-                    o.quantity -= trade_quantity;
-                    if o.quantity == 0 {
-                        ask_done = true;
-                    }
-                }
-
-                if bid_done {
-                    state.orders.remove(&bid_order.id);
-                    if let Some(orders) = state.bids.get_mut(&bid_order.price) {
-                        if let Some(pos) = orders.iter().position(|x| x.id == bid_order.id) {
-                            orders.remove(pos);
-                        }
-                        if orders.is_empty() {
-                            state.bids.remove(&bid_order.price);
-                        }
-                    }
-                } else {
-                    if let Some(orders) = state.bids.get_mut(&bid_order.price) {
-                        if let Some(o) = orders.iter_mut().find(|x| x.id == bid_order.id) {
-                            o.quantity -= trade_quantity;
+                if let Some(idx) = state.order_indices.get(&bid_order.id).copied() {
+                    if let Some(node) = state.arena.get_mut(idx) {
+                        node.order.quantity -= trade_quantity;
+                        if node.order.quantity == 0 {
+                            bid_filled = true;
                         }
                     }
                 }
 
-                if ask_done {
-                    state.orders.remove(&ask_order.id);
-                    if let Some(orders) = state.asks.get_mut(&ask_order.price) {
-                        if let Some(pos) = orders.iter().position(|x| x.id == ask_order.id) {
-                            orders.remove(pos);
-                        }
-                        if orders.is_empty() {
-                            state.asks.remove(&ask_order.price);
+                if let Some(idx) = state.order_indices.get(&ask_order.id).copied() {
+                    if let Some(node) = state.arena.get_mut(idx) {
+                        node.order.quantity -= trade_quantity;
+                        if node.order.quantity == 0 {
+                            ask_filled = true;
                         }
                     }
-                } else {
-                    if let Some(orders) = state.asks.get_mut(&ask_order.price) {
-                        if let Some(o) = orders.iter_mut().find(|x| x.id == ask_order.id) {
-                            o.quantity -= trade_quantity;
+                }
+
+                if bid_filled {
+                    if let Some(idx) = state.order_indices.remove(&bid_order.id) {
+                        if let Some(queue) = state.bids.get_mut(&bid_order.price) {
+                            queue.remove(&mut state.arena, idx);
+                            if queue.head.is_none() {
+                                state.bids.remove(&bid_order.price);
+                            }
+                        }
+                    }
+                }
+
+                if ask_filled {
+                    if let Some(idx) = state.order_indices.remove(&ask_order.id) {
+                        if let Some(queue) = state.asks.get_mut(&ask_order.price) {
+                            queue.remove(&mut state.arena, idx);
+                            if queue.head.is_none() {
+                                state.asks.remove(&ask_order.price);
+                            }
                         }
                     }
                 }

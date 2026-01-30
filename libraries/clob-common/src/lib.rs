@@ -74,3 +74,6 @@ pub const GAS_FOR_SETTLE: u64 = 15_000_000_000;
 
 // Reply deposit to cover the cost of the reply message itself.
 pub const REPLY_DEPOSIT: u128 = 0;
+
+#[cfg(test)]
+mod tests;

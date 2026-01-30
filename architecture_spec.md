@@ -23,9 +23,10 @@ This document describes the current on-chain implementation in `programs/` and `
 
 ```rust
 pub struct OrderBookState {
-    pub bids: BTreeMap<Price, Vec<Order>>,
-    pub asks: BTreeMap<Price, Vec<Order>>,
-    pub orders: HashMap<OrderId, Order>,
+    pub bids: BTreeMap<Price, OrderQueue>,
+    pub asks: BTreeMap<Price, OrderQueue>,
+    pub arena: Arena<OrderNode>,
+    pub order_indices: HashMap<OrderId, Index>,
     pub vault_id: ActorId,
     pub admin: Option<ActorId>,
     pub eth_orderbook_caller: Option<ActorId>,
@@ -37,40 +38,46 @@ pub struct OrderBookState {
 ### Order Model
 
 ```rust
+pub struct OrderNode {
+    pub order: Order,
+    pub next: Option<Index>,
+    pub prev: Option<Index>,
+}
+
 pub struct Order {
     pub id: OrderId,
     pub trader: TraderId,
-    pub side: Side, // Buy | Sell
+    pub side: Side,
     pub price: Price,
     pub quantity: Quantity,
-    pub created_at: u64, // currently unused
+    pub created_at: u64,
 }
 ```
 
 ### Price/Time Priority
 
 - **Price priority:** Best bid = highest price; best ask = lowest price.
-- **Time priority:** Orders at the same price are FIFO by insertion order in `Vec<Order>`.
+- **Time priority:** Orders at the same price are stored in a doubly-linked list (`OrderQueue`) backed by an `Arena`.
 - **Maker selection:** The maker is the order with the lower `order_id` (older in insertion order), and the trade price is the maker's price.
 
 ### Placement Flow
 
 1. Compute required amount using the market scale.
 2. Reserve funds in the Vault via `VaultReserveFunds`.
-3. Append order to `bids` or `asks`, increment `order_counter`, and store in `orders`.
+3. Append order to the tail of the `OrderQueue` for that price, allocating a node in the `Arena`.
 4. Emit `OrderPlaced` (Gear + Ethereum-compatible event).
 5. Invoke matching.
 
 ### Cancellation Flow
 
 1. Verify caller is the original trader.
-2. Remove from `orders` and from the per-price `Vec<Order>` (O(N) for that price).
+2. Remove from `OrderQueue` (O(1) using stored index from `order_indices`) and deallocate from `Arena`.
 3. Unlock reserved funds in Vault via `VaultUnlockFunds`.
 4. Emit `OrderCanceled`.
 
 ### Matching Loop
 
-- **Max matches per call:** 10 (`MAX_MATCHES`).
+- **Max matches per call:** 50 (`MAX_MATCHES`).
 - **Continuation:** If the limit is reached, send a self-message (`ContinueMatching`) to resume later.
 - **Trade parameters:**
   - `trade_price`: maker's price (older order id).
@@ -79,7 +86,7 @@ pub struct Order {
   - `fee = cost * FEE_RATE_BPS / 10_000` (constant in `clob-common`).
 - **Settlement:** Send `VaultSettleTrade` with `price_scale` and `fee`.
 - **Price improvement:** If the bid is the taker and executes below its limit price, the buyer is refunded the difference via `VaultUnlockFunds`.
-- **Order updates:** Quantities are decremented; fully filled orders are removed from maps/vectors.
+- **Order updates:** Quantities are decremented; fully filled orders are removed from queue and arena.
 
 ### Market Scaling
 
@@ -144,6 +151,6 @@ Vault methods accept calls from:
 
 ## Complexity Notes
 
-- Per-price cancellation is O(N) due to `Vec<Order>` storage.
-- Matching is O(1) per match for best price lookup, plus vector head access.
+- Per-price cancellation is **O(1)** due to doubly-linked list + index map.
+- Matching is **O(1)** per match for best price lookup, plus linked list head access.
 - Continuation prevents long loops from exceeding gas limits.
