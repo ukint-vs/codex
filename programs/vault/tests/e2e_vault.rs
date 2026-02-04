@@ -73,7 +73,9 @@ async fn test_deposit_token_a() {
         .set_eth_vault_caller(eth_caller)
         .await
         .unwrap();
-    remoting.system().mint_to(eth_caller, 100_000_000_000_000_000);
+    remoting
+        .system()
+        .mint_to(eth_caller, 100_000_000_000_000_000);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
     let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
     eth_service.eth_deposit(payload).await.unwrap();
@@ -119,7 +121,9 @@ async fn test_deposit_token_b_isolation() {
         .set_eth_vault_caller(eth_caller)
         .await
         .unwrap();
-    remoting.system().mint_to(eth_caller, 100_000_000_000_000_000);
+    remoting
+        .system()
+        .mint_to(eth_caller, 100_000_000_000_000_000);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
     let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
     eth_service.eth_deposit(payload_a).await.unwrap();
@@ -170,7 +174,9 @@ async fn test_withdraw_token_a() {
         .set_eth_vault_caller(eth_caller)
         .await
         .unwrap();
-    remoting.system().mint_to(eth_caller, 100_000_000_000_000_000);
+    remoting
+        .system()
+        .mint_to(eth_caller, 100_000_000_000_000_000);
 
     let user = [1u8; 20];
     let token_a = [10u8; 20];
@@ -220,7 +226,9 @@ async fn test_withdraw_insufficient_balance() {
         .set_eth_vault_caller(eth_caller)
         .await
         .unwrap();
-    remoting.system().mint_to(eth_caller, 100_000_000_000_000_000);
+    remoting
+        .system()
+        .mint_to(eth_caller, 100_000_000_000_000_000);
 
     let user = [1u8; 20];
     let token = [10u8; 20];
@@ -268,7 +276,9 @@ async fn test_round_trip_token_b() {
         .set_eth_vault_caller(eth_caller)
         .await
         .unwrap();
-    remoting.system().mint_to(eth_caller, 100_000_000_000_000_000);
+    remoting
+        .system()
+        .mint_to(eth_caller, 100_000_000_000_000_000);
 
     let user = [1u8; 20];
     let token_b = [11u8; 20];

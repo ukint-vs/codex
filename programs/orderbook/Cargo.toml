@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "debug"] }
 clob-common = { path = "../../libraries/clob-common" }
+vault-client = { path = "../vault/client" }
+intrusive_arena = { path = "../../libraries/intrusive_arena" }
+matching_engine = { path = "../../libraries/matching_engine" }
 
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }

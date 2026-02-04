@@ -1744,23 +1744,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b241177c7107d9829286c2ffdc5eee98d992d6356f3515e7f412f988b1a72fd"
 
 [[package]]
-name = "ethapp"
-version = "0.1.0"
-dependencies = [
- "sails-rs",
- "tokio",
-]
-
-[[package]]
-name = "ethapp-with-events"
-version = "0.1.0"
-dependencies = [
- "insta",
- "sails-rs",
- "tokio",
-]
-
-[[package]]
 name = "expander"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3174,6 +3157,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "intrusive_arena"
+version = "0.1.0"
+dependencies = [
+ "sails-rs",
+]
+
+[[package]]
 name = "io-lifetimes"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3587,6 +3577,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "matching_engine"
+version = "0.1.0"
+dependencies = [
+ "sails-rs",
+]
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3982,9 +3979,12 @@ version = "0.1.0"
 dependencies = [
  "clob-common",
  "insta",
+ "intrusive_arena",
+ "matching_engine",
  "orderbook-client",
  "sails-rs",
  "tokio",
+ "vault-client",
 ]
 
 [[package]]
@@ -4911,8 +4911,9 @@ dependencies = [
 
 [[package]]
 name = "sails-client-gen"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddd93868445aa99aa3fe50342ada5ba1264f5fe7b6d5b43130f4f45c2ebf0b2"
 dependencies = [
  "anyhow",
  "convert_case 0.7.1",
@@ -4923,8 +4924,9 @@ dependencies = [
 
 [[package]]
 name = "sails-idl-gen"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea7b9ced73a79650df1d8c1bfa506f4e08cd77a4cef264258e5f0b04d910a835"
 dependencies = [
  "convert_case 0.7.1",
  "gprimitives",
@@ -4938,16 +4940,18 @@ dependencies = [
 
 [[package]]
 name = "sails-idl-meta"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4a22a7f17abed84627afdb89ef58a55e07ecf34e54665dab3157189b86f3a9c"
 dependencies = [
  "scale-info",
 ]
 
 [[package]]
 name = "sails-idl-parser"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9c0dd7750fbc0e29c888a03c22d057c7ce046077d9a574e875c5aaa83aecb00"
 dependencies = [
  "lalrpop",
  "lalrpop-util",
@@ -4957,8 +4961,9 @@ dependencies = [
 
 [[package]]
 name = "sails-macros"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bdd89a1e06800a39c9ec894862579d9698080fcc259cbae0aa5a9f1c5ab532c"
 dependencies = [
  "proc-macro-error",
  "sails-macros-core",
@@ -4966,8 +4971,9 @@ dependencies = [
 
 [[package]]
 name = "sails-macros-core"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0108a50192e715db43ba94d3fcffaf0904c255e9f2b045950cec4325d2970b7e"
 dependencies = [
  "convert_case 0.7.1",
  "parity-scale-codec",
@@ -4979,8 +4985,9 @@ dependencies = [
 
 [[package]]
 name = "sails-rs"
-version = "0.10.1"
-source = "git+https://github.com/gear-tech/sails?branch=master#70246109cd0a159b6abdcf92c11f1d3ef52df76b"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e3f3db39d829e94899ade845992761597ca504e87db9b7f57141886f0117077"
 dependencies = [
  "alloy-primitives 1.5.1",
  "alloy-sol-types 1.5.1",

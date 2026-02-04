@@ -1,69 +1,18 @@
 constructor {
-  Create : (vault_id: actor_id);
+  Create : (vault_id: actor_id, base_token_id: [u8, 20], quote_token_id: [u8, 20], max_trades: u32, max_preview_scans: u32);
 };
 
-service OrderBook {
-  CancelOrder : (order_id: u128, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
-  CancelOrderEth : (user: [u8, 20], order_id: u128, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
-  ContinueMatching : (base_token: [u8, 20], quote_token: [u8, 20]) -> null;
-  DebugSeedOrders : (count: u64, price: u128) -> null;
-  Deposit : (user: actor_id, token: [u8, 20], amount: u128) -> null;
-  Pause : (paused: bool) -> null;
-  PlaceOrder : (price: u128, quantity: u128, is_buy: bool, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
-  PlaceOrderEth : (user: [u8, 20], price: u128, quantity: u128, is_buy: bool, base_token: [u8, 20], quote_token: [u8, 20]) -> null;
-  /// Registers an emergency exit for a user.
-  /// 
-  /// This function reduces the user's internal balance and emits a Withdrawal event,
-  /// but it does NOT transfer any funds out of the contract.
-  /// It is intended to be used when the contract is paused, allowing users to signal
-  /// their intent to withdraw so that an off-chain process or migration utility can
-  /// reimburse them or migrate their funds.
-  RegisterEmergencyExit : (token: [u8, 20], amount: u128) -> null;
-  SetEthOrderbookCaller : (program_id: actor_id) -> null;
-  SetMarketScale : (base_token: [u8, 20], quote_token: [u8, 20], price_scale: u128) -> null;
-  SetVault : (new_vault: actor_id) -> null;
-  WithdrawToVault : (token: [u8, 20], amount: u128) -> null;
-  query Admin : () -> actor_id;
-  query BestAsk : () -> struct { bool, u128, u128 };
-  query BestBid : () -> struct { bool, u128, u128 };
-  query GetBalance : (user: actor_id, token: [u8, 20]) -> u128;
-  query GetOrder : (order_id: u128) -> struct { bool, actor_id, bool, u128, u128 };
-  query MarketScale : (base_token: [u8, 20], quote_token: [u8, 20]) -> u128;
-  query OrderCounter : () -> u128;
-  query Vault : () -> actor_id;
-
-  events {
-    OrderPlaced: struct {
-      order_id: u128,
-      price: u128,
-      quantity: u128,
-      is_buy: u32,
-    };
-    OrderCanceled: struct {
-      order_id: u128
-    };
-    TradeExecuted: struct {
-      maker_order_id: u128,
-      taker_order_id: u128,
-      price: u128,
-      quantity: u128,
-      maker: [u8, 32],
-      taker: [u8, 32],
-    };
-    Deposit: struct {
-      user: [u8, 32],
-      token: [u8, 20],
-      amount: u128,
-    };
-    Withdrawal: struct {
-      user: [u8, 32],
-      token: [u8, 20],
-      amount: u128,
-    };
-    TradesExecuted: struct {
-      count: u32,
-      data: vec u8,
-    };
-  }
+service Orderbook {
+  CancelOrder : (order_id: u64) -> null;
+  Deposit : (account: actor_id, token: [u8, 20], amount: u128) -> null;
+  /// Submits an order and immediately matches against the book.
+  /// Limit remainder is placed as resting order inside the book.
+  SubmitOrder : (side: u16, kind: u16, limit_price: u128, amount_base: u128, max_quote: u128) -> u64;
+  WithdrawBase : (amount: u128) -> null;
+  WithdrawQuote : (amount: u128) -> null;
+  query BalanceOf : (who: actor_id) -> struct { u128, u128 };
+  query BestAskPrice : () -> u128;
+  query BestBidPrice : () -> u128;
+  query OrderById : (order_id: u64) -> struct { bool, u64, actor_id, u16, u128, u128, u128 };
 };
 

@@ -8,8 +8,8 @@ mockall = { version = "0.12", optional = true }
 sails-rs = { workspace = true, features = ["ethexe"] }
 
 [build-dependencies]
-sails-client-gen = { git = "https://github.com/gear-tech/sails", branch = "master" }
-sails-idl-gen = { git = "https://github.com/gear-tech/sails", branch = "master" }
+sails-client-gen.workspace = true
+sails-idl-gen.workspace = true
 vault-app = { path = "../" }
 
 [features]

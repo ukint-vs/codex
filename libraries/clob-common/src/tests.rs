@@ -15,10 +15,13 @@ mod tests {
         let addr: EthAddress = [0x12; 20];
         let actor = eth_to_actor(addr);
         let bytes: [u8; 32] = actor.into();
-        
+
         let mut expected_right = [0u8; 32];
         expected_right[12..].copy_from_slice(&addr);
-        
-        assert_eq!(bytes, expected_right, "ActorId should be RIGHT-aligned for Ethereum compatibility");
+
+        assert_eq!(
+            bytes, expected_right,
+            "ActorId should be RIGHT-aligned for Ethereum compatibility"
+        );
     }
 }

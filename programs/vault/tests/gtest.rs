@@ -714,8 +714,7 @@ async fn test_unauthorized_vault_calls() {
 
     // Call as Unauthorized User (ActorId 100)
     let user_remoting = remoting.clone().with_actor_id(ActorId::from(100u64));
-    let mut user_service =
-        Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault".into());
+    let mut user_service = Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault".into());
 
     let res = user_service
         .vault_reserve_funds(actor(USER_1), TOKEN_BASE, 1u128)

@@ -1,4 +1,4 @@
-use clob_common::{eth_to_actor, actor_to_eth};
+use clob_common::{actor_to_eth, eth_to_actor};
 use sails_rs::prelude::*;
 use vault_app::encode_release_funds;
 
