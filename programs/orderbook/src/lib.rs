@@ -3,21 +3,22 @@
 extern crate alloc;
 
 pub mod state;
+pub mod varint;
 
-use alloc::vec::Vec;
 use clob_common::{
-    actor_to_eth, eth_to_actor, mul_div_ceil, EthAddress, Order, OrderId, Price, Quantity, Side,
-    TokenId, TraderId, DEFAULT_PRICE_SCALE, FEE_RATE_BPS,
+    eth_to_actor, mul_div_ceil, EthAddress, Order, OrderId, Price, Quantity, Side, TokenId,
+    TraderId, DEFAULT_PRICE_SCALE, FEE_RATE_BPS,
 };
 use sails_rs::{
     collections::{BTreeMap, HashMap},
     gstd::{debug, msg},
-    hex,
     prelude::*,
 };
 use state::arena::{Arena, Index};
 use state::linked_list::{OrderNode, OrderQueue};
-use vault_client::vault::io::{VaultReserveFunds, VaultSettleTrade, VaultUnlockFunds};
+use varint::VarintWriter;
+
+pub const MATCH_GAS_THRESHOLD: u64 = 300_000_000;
 
 // --- Events ---
 
@@ -43,6 +44,22 @@ pub enum Events {
         maker: [u8; 32],
         taker: [u8; 32],
     },
+    Deposit {
+        user: [u8; 32],
+        token: TokenId,
+        amount: u128,
+    },
+    Withdrawal {
+        user: [u8; 32],
+        token: TokenId,
+        amount: u128,
+    },
+    TradesExecuted {
+        count: u32,
+        // Header: [taker (32 bytes)]
+        // Body: [Varint Encoded (maker_id, taker_id, price, quantity)...]
+        data: Vec<u8>,
+    },
 }
 
 // --- State ---
@@ -58,6 +75,11 @@ pub struct OrderBookState {
     pub eth_orderbook_caller: Option<ActorId>,
     pub order_counter: u128,
     pub market_scales: HashMap<(TokenId, TokenId), u128>,
+    pub balances: HashMap<ActorId, HashMap<TokenId, u128>>,
+    pub treasury: HashMap<TokenId, u128>,
+    pub pending_withdrawals: HashMap<ActorId, HashMap<TokenId, u128>>,
+    pub paused: bool,
+    pub program_id: ActorId,
 }
 
 static mut STATE: Option<OrderBookState> = None;
@@ -74,11 +96,8 @@ fn actor_bytes(actor: ActorId) -> [u8; 32] {
     out
 }
 
-fn actor_eth_bytes(actor: ActorId) -> [u8; 32] {
-    let eth: EthAddress = actor_to_eth(actor);
-    let mut out = [0u8; 32];
-    out[12..].copy_from_slice(&eth);
-    out
+fn reply_ok() {
+    msg::reply((), 0).expect("ReplyFailed");
 }
 
 pub struct OrderBookProgram;
@@ -90,6 +109,7 @@ impl OrderBookProgram {
         let state = OrderBookState::get_mut();
         state.vault_id = vault_id;
         state.admin = Some(msg::source());
+        state.program_id = sails_rs::gstd::exec::program_id();
         OrderBookProgram
     }
 
@@ -124,6 +144,38 @@ impl OrderBookService {
         }
     }
 
+    fn ensure_not_paused(&self) {
+        let state = OrderBookState::get_mut();
+        if state.paused && state.admin != Some(msg::source()) {
+            panic!("ProgramPaused");
+        }
+    }
+
+    #[export]
+    pub fn debug_seed_orders(&mut self, count: u64, price: u128) {
+        let state = OrderBookState::get_mut();
+        let source = Self::caller_trader();
+
+        for _ in 0..count {
+            state.order_counter += 1;
+            let order_id = state.order_counter;
+
+            let order = Order {
+                id: order_id,
+                trader: source,
+                side: Side::Sell,
+                price,
+                quantity: 1_000_000, // 1 * DECIMALS
+                created_at: 0,
+            };
+
+            // Directly insert to queue
+            let queue = state.asks.entry(order.price).or_default();
+            let idx = queue.push_back(&mut state.arena, order);
+            state.order_indices.insert(order_id, idx);
+        }
+    }
+
     fn market_scale_value(&self, base_token: TokenId, quote_token: TokenId) -> u128 {
         let state = OrderBookState::get_mut();
         state
@@ -152,12 +204,6 @@ impl OrderBookService {
             }
         }
         total
-    }
-
-    fn peek_first_order(queue: &OrderQueue, arena: &Arena<OrderNode>) -> Option<Order> {
-        queue
-            .head
-            .and_then(|idx| arena.get(idx).map(|node| node.order.clone()))
     }
 
     #[export]
@@ -247,6 +293,111 @@ impl OrderBookService {
         self.market_scale_value(base_token, quote_token)
     }
 
+    #[export]
+    pub fn deposit(&mut self, user: ActorId, token: TokenId, amount: u128) {
+        let state = OrderBookState::get_mut();
+        if msg::source() != state.vault_id {
+            panic!("Unauthorized: Only Vault can deposit");
+        }
+        let user_balances = state.balances.entry(user).or_default();
+        let balance = user_balances.entry(token).or_default();
+        *balance = balance.checked_add(amount).expect("MathOverflow");
+
+        let mut emitter = self.emitter();
+        emitter
+            .emit_event(Events::Deposit {
+                user: actor_bytes(user),
+                token,
+                amount,
+            })
+            .unwrap();
+
+        reply_ok();
+    }
+
+    #[export]
+    pub async fn withdraw_to_vault(&mut self, token: TokenId, amount: u128) {
+        self.ensure_not_paused();
+        let trader = Self::caller_trader();
+        let state = OrderBookState::get_mut();
+
+        let user_balances = state.balances.get_mut(&trader).expect("UserNotFound");
+        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+
+        if *balance < amount {
+            panic!("InsufficientBalance");
+        }
+
+        // 1. Move to pending
+        *balance = balance.checked_sub(amount).expect("MathOverflow");
+        let pending = state
+            .pending_withdrawals
+            .entry(trader)
+            .or_default()
+            .entry(token)
+            .or_default();
+        *pending = pending.checked_add(amount).expect("MathOverflow");
+
+        let vault_id = state.vault_id;
+        let payload = ("Vault", "VaultDeposit", (trader, token, amount)).encode();
+
+        let reply_result = msg::send_bytes_for_reply(vault_id, payload, 0);
+
+        if let Err(e) = reply_result {
+            debug!("OrderBook: Failed to send Withdrawal message: {:?}", e);
+            // Revert pending
+            *balance = balance.checked_add(amount).expect("MathOverflow");
+            if let Some(user_pending) = state.pending_withdrawals.get_mut(&trader) {
+                if let Some(token_pending) = user_pending.get_mut(&token) {
+                    *token_pending = token_pending.saturating_sub(amount);
+                }
+            }
+            return;
+        }
+
+        let res = reply_result.unwrap().await;
+
+        let state = OrderBookState::get_mut();
+        // 2. Remove from pending regardless of outcome
+        if let Some(user_pending) = state.pending_withdrawals.get_mut(&trader) {
+            if let Some(token_pending) = user_pending.get_mut(&token) {
+                *token_pending = token_pending.saturating_sub(amount);
+            }
+        }
+
+        if res.is_ok() {
+            // 3a. Success: Emit event
+            let mut emitter = self.emitter();
+            emitter
+                .emit_event(Events::Withdrawal {
+                    user: actor_bytes(trader),
+                    token,
+                    amount,
+                })
+                .unwrap();
+        } else {
+            // 3b. Failure: Revert from pending to available
+            let user_balances = state.balances.entry(trader).or_default();
+            let bal = user_balances.entry(token).or_default();
+            *bal = bal.checked_add(amount).expect("MathOverflow");
+
+            debug!("OrderBook: Withdrawal to Vault failed, funds reverted to local balance.");
+        }
+
+        reply_ok();
+    }
+
+    #[export]
+    pub fn get_balance(&self, user: ActorId, token: TokenId) -> u128 {
+        let state = OrderBookState::get_mut();
+        state
+            .balances
+            .get(&user)
+            .and_then(|m| m.get(&token))
+            .copied()
+            .unwrap_or(0)
+    }
+
     async fn place_order_internal(
         &mut self,
         trader: TraderId,
@@ -268,29 +419,21 @@ impl OrderBookService {
             Side::Sell => (quantity, base_token),
         };
 
-        // 2. Reserve Funds
+        // 2. Reserve Funds (Internal)
         let state = OrderBookState::get_mut();
-        let vault_id = state.vault_id;
+        let user_balances = state.balances.entry(trader).or_default();
+        let balance = user_balances.entry(required_token).or_default();
 
-        // Encode using generated Vault IO helpers to match routing
-        let payload = VaultReserveFunds::encode_params_with_prefix(
-            "Vault",
-            trader,
-            required_token,
-            required_amount,
-        );
-        debug!(
-            "OrderBook::place_order reserve payload_hex=0x{}",
-            hex::encode(&payload)
-        );
+        if *balance < required_amount {
+            panic!(
+                "InsufficientBalance: Required {}, available {}",
+                required_amount, *balance
+            );
+        }
 
-        msg::send_bytes_for_reply(vault_id, payload, 0)
-            .expect("SendFailed")
-            .await
-            .expect("ReserveFailed");
+        *balance = balance.checked_sub(required_amount).expect("MathOverflow");
 
         // 3. Add Order to Book
-        let state = OrderBookState::get_mut();
         state.order_counter += 1;
         let order_id = state.order_counter;
 
@@ -311,13 +454,6 @@ impl OrderBookService {
         let idx = queue.push_back(&mut state.arena, order.clone());
         state.order_indices.insert(order_id, idx);
 
-        self.emit_eth_event(Events::OrderPlaced {
-            order_id,
-            price,
-            quantity,
-            is_buy: if is_buy { 1 } else { 0 },
-        })
-        .unwrap();
         let mut emitter = self.emitter();
         emitter
             .emit_event(Events::OrderPlaced {
@@ -341,6 +477,7 @@ impl OrderBookService {
         base_token: TokenId,
         quote_token: TokenId,
     ) {
+        self.ensure_not_paused();
         let src = msg::source();
         debug!("OrderBook::place_order msg::source={:?}", src);
         let trader = Self::caller_trader();
@@ -358,6 +495,7 @@ impl OrderBookService {
         base_token: TokenId,
         quote_token: TokenId,
     ) {
+        self.ensure_not_paused();
         let src = msg::source();
         debug!(
             "OrderBook::place_order_eth msg::source={:?} user={:?}",
@@ -408,11 +546,8 @@ impl OrderBookService {
 
         state.order_indices.remove(&order_id);
 
-        // Unlock Funds
+        // 2. Return Funds (Internal)
         let price_scale = self.market_scale_value(base_token, quote_token);
-        if price_scale == 0 {
-            panic!("InvalidPriceScale");
-        }
         let (unlock_amount, unlock_token) = match order.side {
             Side::Buy => (
                 mul_div_ceil(order.price, order.quantity, price_scale),
@@ -421,21 +556,11 @@ impl OrderBookService {
             Side::Sell => (order.quantity, base_token),
         };
 
-        let vault_id = state.vault_id;
-        let payload = VaultUnlockFunds::encode_params_with_prefix(
-            "Vault",
-            caller,
-            unlock_token,
-            unlock_amount,
-        );
+        let state = OrderBookState::get_mut();
+        let user_balances = state.balances.entry(order.trader).or_default();
+        let balance = user_balances.entry(unlock_token).or_default();
+        *balance = balance.checked_add(unlock_amount).expect("MathOverflow");
 
-        msg::send_bytes_for_reply(vault_id, payload, 0)
-            .expect("SendFailed")
-            .await
-            .expect("UnlockFailed");
-
-        self.emit_eth_event(Events::OrderCanceled { order_id })
-            .unwrap();
         let mut emitter = self.emitter();
         emitter
             .emit_event(Events::OrderCanceled { order_id })
@@ -470,7 +595,8 @@ impl OrderBookService {
 
     #[export]
     pub async fn continue_matching(&mut self, base_token: TokenId, quote_token: TokenId) {
-        let program_id = sails_rs::gstd::exec::program_id();
+        let state = OrderBookState::get_mut(); // Access state to get cached ID
+        let program_id = state.program_id;
         if msg::source() != program_id {
             // Only allow self-calls
             return;
@@ -479,32 +605,62 @@ impl OrderBookService {
     }
 
     async fn match_orders(&mut self, base_token: TokenId, quote_token: TokenId) -> Result<(), ()> {
-        let mut matches_count = 0;
-        const MAX_MATCHES: u32 = 50;
         let price_scale = self.market_scale_value(base_token, quote_token);
         if price_scale == 0 {
             panic!("InvalidPriceScale");
         }
 
+        let state = OrderBookState::get_mut();
+        let mut batch_treasury_updates: HashMap<TokenId, u128> = HashMap::new();
+        let mut batch_balance_updates: HashMap<ActorId, HashMap<TokenId, u128>> = HashMap::new();
+
+        // Batched byte buffer
+        let mut batch_count: u32 = 0;
+        let mut batch_writer = VarintWriter::with_capacity(4096);
+        let mut batch_taker = [0u8; 32]; // Single taker
+
+        let mut loop_counter: u32 = 0;
         loop {
-            if matches_count >= MAX_MATCHES {
-                debug!("OrderBook: Max matches reached, triggering ContinueMatching.");
+            // Check remaining gas every 20 iterations
+            loop_counter += 1;
+            if loop_counter >= 20 {
+                loop_counter = 0;
+                if sails_rs::gstd::exec::gas_available() < MATCH_GAS_THRESHOLD {
+                    debug!("OrderBook: Gas low, triggering continue_matching.");
+                    // Commit batched updates before breaking
+                    for (token, amount) in batch_treasury_updates {
+                        let tr = state.treasury.entry(token).or_default();
+                        *tr = tr.checked_add(amount).expect("MathOverflow");
+                    }
+                    for (user, tokens) in batch_balance_updates {
+                        let user_bal = state.balances.entry(user).or_default();
+                        for (token, amount) in tokens {
+                            let b = user_bal.entry(token).or_default();
+                            *b = b.checked_add(amount).expect("MathOverflow");
+                        }
+                    }
 
-                // Send deferred matching message to Self
-                let payload = ("OrderBook", "ContinueMatching", (base_token, quote_token));
+                    if batch_count > 0 {
+                        let mut emitter = self.emitter();
+                        emitter
+                            .emit_event(Events::TradesExecuted {
+                                count: batch_count,
+                                data: batch_writer.buf.clone(),
+                            })
+                            .unwrap();
+                        // Reset batch
+                        batch_count = 0;
+                        batch_writer.buf.clear();
+                    }
 
-                // We use send (not send_for_reply) because we don't need to wait for it here
-                // Note: sails routing expects Service/Method/Args tuple.
-                // Since we are inside the same program, we can address Self.
-                let program_id = sails_rs::gstd::exec::program_id();
-                msg::send(program_id, payload, 0).expect("Failed to send ContinueMatching");
-
-                break;
+                    let payload = ("OrderBook", "ContinueMatching", (base_token, quote_token));
+                    let program_id = state.program_id;
+                    msg::send(program_id, payload, 0).expect("Failed to send ContinueMatching");
+                    break;
+                }
             }
 
             let match_data = {
-                let state = OrderBookState::get_mut();
-
                 let best_bid_entry = state.bids.iter_mut().next_back();
                 let best_ask_entry = state.asks.iter_mut().next();
 
@@ -512,8 +668,8 @@ impl OrderBookService {
                     (best_bid_entry, best_ask_entry)
                 {
                     if *bid_price >= *ask_price {
-                        let bid_order = Self::peek_first_order(bids_queue, &state.arena);
-                        let ask_order = Self::peek_first_order(asks_queue, &state.arena);
+                        let bid_order = bids_queue.iter(&state.arena).next().cloned();
+                        let ask_order = asks_queue.iter(&state.arena).next().cloned();
 
                         if let (Some(bid_order), Some(ask_order)) = (bid_order, ask_order) {
                             Some((*bid_price, *ask_price, bid_order, ask_order))
@@ -538,32 +694,49 @@ impl OrderBookService {
                 let trade_quantity = core::cmp::min(bid_order.quantity, ask_order.quantity);
                 let cost = mul_div_ceil(trade_price, trade_quantity, price_scale);
                 let fee = cost.checked_mul(FEE_RATE_BPS).expect("MathOverflow") / 10000;
-                debug!(
-                    "OrderBook: match_orders price={} qty={} cost={} fee={}",
-                    trade_price, trade_quantity, cost, fee
-                );
 
-                let state = OrderBookState::get_mut();
-                let vault_id = state.vault_id;
+                // --- Internal Settlement ---
 
-                let payload = VaultSettleTrade::encode_params_with_prefix(
-                    "Vault",
-                    bid_order.trader,
-                    ask_order.trader,
-                    base_token,
-                    quote_token,
-                    trade_price,
-                    trade_quantity,
-                    fee,
-                    price_scale,
-                );
+                // 1. Maker/Taker roles
+                let (maker, taker, maker_side) = if bid_order.id < ask_order.id {
+                    (bid_order.trader, ask_order.trader, Side::Buy)
+                } else {
+                    (ask_order.trader, bid_order.trader, Side::Sell)
+                };
 
-                msg::send_bytes_for_reply(vault_id, payload, 0)
-                    .expect("SendFailed")
-                    .await
-                    .expect("SettleFailed");
+                // 2. Update Maker Balance
+                let (received_token, received_amount) = match maker_side {
+                    Side::Buy => (base_token, trade_quantity),
+                    Side::Sell => (quote_token, cost.checked_sub(fee).expect("MathOverflow")),
+                };
+                {
+                    let user_bal = batch_balance_updates.entry(maker).or_default();
+                    let b = user_bal.entry(received_token).or_default();
+                    *b = b.checked_add(received_amount).expect("MathOverflow");
+                }
 
-                // Price improvement for Taker Buyer
+                if matches!(maker_side, Side::Sell) && fee > 0 {
+                    let tr = batch_treasury_updates.entry(quote_token).or_default();
+                    *tr = tr.checked_add(fee).expect("MathOverflow");
+                }
+
+                // 3. Update Taker Balance
+                let (t_received_token, t_received_amount) = match maker_side {
+                    Side::Buy => (quote_token, cost.checked_sub(fee).expect("MathOverflow")), // Taker is Seller
+                    Side::Sell => (base_token, trade_quantity), // Taker is Buyer
+                };
+                {
+                    let user_bal = batch_balance_updates.entry(taker).or_default();
+                    let b = user_bal.entry(t_received_token).or_default();
+                    *b = b.checked_add(t_received_amount).expect("MathOverflow");
+                }
+
+                if matches!(maker_side, Side::Buy) && fee > 0 {
+                    let tr = batch_treasury_updates.entry(quote_token).or_default();
+                    *tr = tr.checked_add(fee).expect("MathOverflow");
+                }
+
+                // 4. Price improvement for Taker Buyer
                 if bid_order.id > ask_order.id && trade_price < bid_order.price {
                     let improvement_per_unit = bid_order
                         .price
@@ -572,18 +745,12 @@ impl OrderBookService {
                     let total_improvement =
                         mul_div_ceil(improvement_per_unit, trade_quantity, price_scale);
                     if total_improvement > 0 {
-                        let unlock_payload = VaultUnlockFunds::encode_params_with_prefix(
-                            "Vault",
-                            bid_order.trader,
-                            quote_token,
-                            total_improvement,
-                        );
-                        msg::send_bytes_for_reply(vault_id, unlock_payload, 0)
-                            .expect("SendFailed")
-                            .await
-                            .expect("UnlockImprovementFailed");
+                        let user_bal = batch_balance_updates.entry(bid_order.trader).or_default();
+                        let b = user_bal.entry(quote_token).or_default();
+                        *b = b.checked_add(total_improvement).expect("MathOverflow");
                     }
                 }
+                // --- End Internal Settlement ---
 
                 let maker_order_id = if bid_order.id < ask_order.id {
                     bid_order.id
@@ -595,41 +762,51 @@ impl OrderBookService {
                 } else {
                     bid_order.id
                 };
-                let maker_actor = if bid_order.id < ask_order.id {
-                    bid_order.trader
+                let (_maker_actor, taker_actor) = if bid_order.id < ask_order.id {
+                    (bid_order.trader, ask_order.trader)
                 } else {
-                    ask_order.trader
-                };
-                let taker_actor = if bid_order.id < ask_order.id {
-                    ask_order.trader
-                } else {
-                    bid_order.trader
+                    (ask_order.trader, bid_order.trader)
                 };
 
-                self.emit_eth_event(Events::TradeExecuted {
-                    maker_order_id,
-                    taker_order_id,
-                    price: trade_price,
-                    quantity: trade_quantity,
-                    maker: actor_eth_bytes(maker_actor),
-                    taker: actor_eth_bytes(taker_actor),
-                })
-                .unwrap();
-                let mut emitter = self.emitter();
-                emitter
-                    .emit_event(Events::TradeExecuted {
-                        maker_order_id,
-                        taker_order_id,
-                        price: trade_price,
-                        quantity: trade_quantity,
-                        maker: actor_bytes(maker_actor),
-                        taker: actor_bytes(taker_actor),
-                    })
-                    .unwrap();
+                let taker_bytes = actor_bytes(taker_actor);
 
-                matches_count += 1;
+                // Flush if taker changes
+                if batch_count > 0 && batch_taker != taker_bytes {
+                    let mut emitter = self.emitter();
+                    emitter
+                        .emit_event(Events::TradesExecuted {
+                            count: batch_count,
+                            data: batch_writer.buf.clone(),
+                        })
+                        .unwrap();
+                    batch_count = 0;
+                    batch_writer.buf.clear();
+                }
 
-                let state = OrderBookState::get_mut();
+                if batch_count == 0 {
+                    batch_taker = taker_bytes;
+                    // Write Header: Taker (32 bytes)
+                    batch_writer.write_bytes(&batch_taker);
+                }
+
+                batch_writer.write_u128(maker_order_id);
+                batch_writer.write_u128(taker_order_id);
+                batch_writer.write_u128(trade_price);
+                batch_writer.write_u128(trade_quantity);
+                batch_count += 1;
+
+                // Threshold check: roughly 200 items or 4KB
+                if batch_count >= 250 || batch_writer.buf.len() > 3000 {
+                    let mut emitter = self.emitter();
+                    emitter
+                        .emit_event(Events::TradesExecuted {
+                            count: batch_count,
+                            data: batch_writer.buf.clone(),
+                        })
+                        .unwrap();
+                    batch_count = 0;
+                    batch_writer.buf.clear();
+                }
 
                 // Update orders in arena
                 let mut bid_filled = false;
@@ -675,9 +852,76 @@ impl OrderBookService {
                     }
                 }
             } else {
+                // No more matches, commit treasury updates
+                for (token, amount) in batch_treasury_updates {
+                    let tr = state.treasury.entry(token).or_default();
+                    *tr = tr.checked_add(amount).expect("MathOverflow");
+                }
+                for (user, tokens) in batch_balance_updates {
+                    let user_bal = state.balances.entry(user).or_default();
+                    for (token, amount) in tokens {
+                        let b = user_bal.entry(token).or_default();
+                        *b = b.checked_add(amount).expect("MathOverflow");
+                    }
+                }
                 break;
             }
         }
+
+        // Flush remaining trades in batch
+        if batch_count > 0 {
+            let mut emitter = self.emitter();
+            emitter
+                .emit_event(Events::TradesExecuted {
+                    count: batch_count,
+                    data: batch_writer.buf.clone(),
+                })
+                .unwrap();
+        }
         Ok(())
+    }
+
+    #[export]
+    pub fn pause(&mut self, paused: bool) {
+        self.ensure_admin();
+        OrderBookState::get_mut().paused = paused;
+    }
+
+    /// Registers an emergency exit for a user.
+    ///
+    /// This function reduces the user's internal balance and emits a Withdrawal event,
+    /// but it does NOT transfer any funds out of the contract.
+    /// It is intended to be used when the contract is paused, allowing users to signal
+    /// their intent to withdraw so that an off-chain process or migration utility can
+    /// reimburse them or migrate their funds.
+    #[export]
+    pub fn register_emergency_exit(&mut self, token: TokenId, amount: u128) {
+        let state = OrderBookState::get_mut();
+        if !state.paused {
+            panic!("OnlyInPausedState");
+        }
+        let trader = Self::caller_trader();
+        let user_balances = state.balances.get_mut(&trader).expect("UserNotFound");
+        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+
+        if *balance < amount {
+            panic!("InsufficientBalance");
+        }
+
+        *balance = balance.checked_sub(amount).expect("MathOverflow");
+
+        // Emergency withdraw just emits event and updates internal state.
+        // In a real scenario, this might send to an "Emergency Vault" or simply
+        // leave the funds in a state where a separate migration program can claim them.
+        // For now, we'll emit a Withdrawal event.
+        let mut emitter = self.emitter();
+        emitter
+            .emit_event(Events::Withdrawal {
+                user: actor_bytes(trader),
+                token,
+                amount,
+            })
+            .unwrap();
+        reply_ok();
     }
 }

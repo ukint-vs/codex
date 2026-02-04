@@ -1,5 +1,5 @@
 use super::arena::{Arena, Index};
-use clob_common::Order; // Assuming this is available
+use clob_common::Order;
 
 #[derive(Debug, Clone)]
 pub struct OrderNode {
@@ -100,6 +100,55 @@ impl OrderQueue {
 
         Some(node.order)
     }
+
+    pub fn consume_from_head(&mut self, arena: &mut Arena<OrderNode>, count: usize) -> u32 {
+        let mut removed_count = 0;
+        let mut current = self.head;
+        for _ in 0..count {
+            if let Some(idx) = current {
+                let node = arena.remove(idx).expect("Head broken");
+                current = node.next;
+                removed_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Update Head
+        self.head = current;
+
+        if let Some(new_head) = current {
+            if let Some(node) = arena.get_mut(new_head) {
+                node.prev = None;
+            }
+        } else {
+            self.tail = None;
+        }
+
+        removed_count
+    }
+    pub fn iter<'a>(&self, arena: &'a Arena<OrderNode>) -> OrderIter<'a> {
+        OrderIter {
+            current: self.head,
+            arena,
+        }
+    }
+}
+
+pub struct OrderIter<'a> {
+    current: Option<Index>,
+    arena: &'a Arena<OrderNode>,
+}
+
+impl<'a> Iterator for OrderIter<'a> {
+    type Item = &'a Order;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = self.current?;
+        let node = self.arena.get(idx)?;
+        self.current = node.next;
+        Some(&node.order)
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +244,20 @@ mod tests {
 
         assert_eq!(queue.tail, Some(idx1));
         assert!(arena.get(idx1).unwrap().next.is_none());
+    }
+    #[test]
+    fn test_iterator() {
+        let mut arena = Arena::new();
+        let mut queue = OrderQueue::new();
+
+        queue.push_back(&mut arena, mock_order(1, 100));
+        queue.push_back(&mut arena, mock_order(2, 100));
+        queue.push_back(&mut arena, mock_order(3, 100));
+
+        let mut iter = queue.iter(&arena);
+        assert_eq!(iter.next().unwrap().id, 1);
+        assert_eq!(iter.next().unwrap().id, 2);
+        assert_eq!(iter.next().unwrap().id, 3);
+        assert!(iter.next().is_none());
     }
 }

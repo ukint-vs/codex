@@ -363,6 +363,52 @@ impl VaultService {
     }
 
     #[export]
+    pub async fn transfer_to_market(&mut self, market_id: ActorId, token: TokenId, amount: u128) {
+        let user = msg::source();
+        self.ensure_authorized(Some(user)); // User can transfer their own funds
+
+        let state = VaultState::get_mut();
+        if !state.authorized_programs.contains(&market_id) {
+            panic!("UnauthorizedMarket");
+        }
+
+        // 1. Verify and deduct balance
+        let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
+        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+
+        if balance.available < amount {
+            panic!("InsufficientBalance");
+        }
+
+        balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
+
+        // 2. Send deposit message to OrderBook
+        // TODO: switch to OrderBook client once deposit method is exposed there.
+        // Raw encoding of ("OrderBook", "Deposit", (user, token, amount))
+        let payload = ("OrderBook", "Deposit", (user, token, amount)).encode();
+
+        let result = msg::send_bytes_for_reply(market_id, payload, 0)
+            .expect("SendFailed")
+            .await;
+
+        if result.is_err() {
+            // Revert balance change if market deposit failed
+            let state = VaultState::get_mut();
+            let balance = state
+                .balances
+                .get_mut(&user)
+                .and_then(|b| b.get_mut(&token))
+                .expect("User and token balance must exist here");
+            balance.available = balance.available.checked_add(amount).expect("MathOverflow");
+            debug!("OrderBookDepositFailed");
+            reply_ok();
+            return;
+        }
+
+        reply_ok();
+    }
+
+    #[export]
     pub fn vault_force_exit(&mut self, user: ActorId, token: TokenId, amount: u128) {
         self.ensure_authorized(Some(user));
         let state = VaultState::get_mut();

@@ -3985,7 +3985,6 @@ dependencies = [
  "orderbook-client",
  "sails-rs",
  "tokio",
- "vault-client",
 ]
 
 [[package]]

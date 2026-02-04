@@ -151,6 +151,21 @@ export async function deployL2() {
     );
     deployment.l2.orderbook = obId;
 
+    // 4. Authorize OrderBook in Vault
+    console.log(`Authorizing OrderBook (${obId}) in Vault (${vaultId})...`);
+    const vaultIdl = readFileSync(VAULT_IDL_PATH, 'utf-8');
+    const parser = await SailsIdlParser.new();
+    const sails = new Sails(parser);
+    await sails.parseIdl(vaultIdl);
+    
+    const addMarketPayload = sails.services.Vault.functions.AddMarket.encodePayload(
+        toActorId32(obId, 'ORDERBOOK_ID')
+    );
+    const addMarketHex = payloadToHex(addMarketPayload);
+    const res = await runEthexeTx(['send-message', '-w', '-j', vaultId, addMarketHex, '0']);
+    assertInitOk(res, 'Vault: AddMarket');
+    console.log('✓ OrderBook authorized in Vault');
+
     deployment.timestamp = new Date().toISOString();
     saveDeployment(deployment);
     console.log('\n=== L2 Deployment Complete ===');

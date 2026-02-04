@@ -1,22 +1,21 @@
 use clob_common::TokenId;
 use orderbook_client::{
-    order_book::OrderBook as OrderBookServiceTrait, order_book::OrderBookImpl, OrderbookCtors,
-    OrderbookProgram,
+    order_book::OrderBookImpl, OrderbookCtors, OrderbookProgram,
 };
+use orderbook_client::order_book::OrderBook; // Explicit trait import
 use sails_rs::{
     client::{Deployment, GtestEnv, Service},
-    gtest::System,
+    gtest::{Program, System},
     prelude::*,
     ActorId,
 };
-use vault_client::{vault::Vault as VaultServiceTrait, vault::VaultImpl, VaultCtors, VaultProgram};
 
 pub(crate) const ORDERBOOK_WASM: &str = "../../target/wasm32-gear/release/orderbook.opt.wasm";
 pub(crate) const VAULT_WASM: &str = "../../target/wasm32-gear/release/vault_app.opt.wasm";
 
-pub(crate) const ADMIN_ID: u64 = 10;
-pub(crate) const BUYER_ID: u64 = 1;
-pub(crate) const SELLER_ID: u64 = 2;
+pub(crate) const ADMIN_ID: u64 = 100;
+pub(crate) const BUYER_ID: u64 = 101;
+pub(crate) const SELLER_ID: u64 = 102;
 pub(crate) const TOKEN_BASE: TokenId = [11u8; 20];
 pub(crate) const TOKEN_QUOTE: TokenId = [12u8; 20];
 
@@ -35,17 +34,19 @@ async fn setup_programs() -> (GtestEnv, ActorId, ActorId) {
     system.mint_to(buyer(), 100_000_000_000_000_000);
     system.mint_to(seller(), 100_000_000_000_000_000);
 
-    let code_vault = system.submit_code_file(VAULT_WASM);
     let remoting = GtestEnv::new(system, ADMIN_ID.into());
+    let system_ref = remoting.system();
 
-    let vault_actor =
-        Deployment::<VaultProgram, _>::new(remoting.clone(), code_vault, b"vault_salt".to_vec())
-            .create()
-            .await
-            .unwrap();
-    let vault_id = vault_actor.id();
+    // Vault Deployment (Raw)
+    let vault_program = Program::from_file(system_ref, VAULT_WASM);
+    let vault_id = vault_program.id();
+    let encoded_ctor = ("Create", ()).encode();
+    let mid = vault_program.send_bytes(ADMIN_ID, encoded_ctor);
+    let res = system_ref.run_next_block();
+    assert!(res.succeed.contains(&mid), "Vault init failed");
 
-    let code_orderbook = remoting.system().submit_code_file(ORDERBOOK_WASM);
+    // OrderBook Deployment (Client)
+    let code_orderbook = system_ref.submit_code_file(ORDERBOOK_WASM);
     let orderbook_actor = Deployment::<OrderbookProgram, _>::new(
         remoting.clone(),
         code_orderbook,
@@ -56,9 +57,12 @@ async fn setup_programs() -> (GtestEnv, ActorId, ActorId) {
     .unwrap();
     let orderbook_id = orderbook_actor.id();
 
-    let mut vault_service =
-        Service::<VaultImpl, _>::new(remoting.clone(), vault_id, "Vault".into());
-    vault_service.add_market(orderbook_id).await.unwrap();
+    // Vault: add_market (Raw)
+    let payload = ("Vault", "AddMarket", (orderbook_id)).encode();
+    let vault_prg = system_ref.get_program(vault_id).expect("Vault program not found");
+    let mid = vault_prg.send_bytes(ADMIN_ID, payload);
+    let res = system_ref.run_next_block();
+    assert!(res.succeed.contains(&mid), "add_market failed");
 
     (remoting, vault_id, orderbook_id)
 }
@@ -75,23 +79,29 @@ fn orderbook_service_for(
     )
 }
 
+// Helper for raw vault calls
+fn send_vault(system: &System, from: u64, vault_id: ActorId, method: &str, args: impl Encode) {
+    let payload = ("Vault", method, args).encode();
+    let program = system.get_program(vault_id).expect("Vault program not found");
+    let mid = program.send_bytes(from, payload);
+    let res = system.run_next_block();
+    assert!(res.succeed.contains(&mid), "Vault call {} failed", method);
+}
+
 #[tokio::test]
 async fn test_batching_continuation() {
     let (remoting, vault_id, orderbook_id) = setup_programs().await;
-    let mut vault_service =
-        Service::<VaultImpl, _>::new(remoting.clone(), vault_id, "Vault".into());
+    let system = remoting.system();
     let mut orderbook_seller = orderbook_service_for(&remoting, orderbook_id, seller());
     let mut orderbook_buyer = orderbook_service_for(&remoting, orderbook_id, buyer());
 
-    // Fund
-    vault_service
-        .vault_deposit(seller(), TOKEN_BASE, 1000u128)
-        .await
-        .unwrap();
-    vault_service
-        .vault_deposit(buyer(), TOKEN_QUOTE, 100000u128)
-        .await
-        .unwrap();
+    // Fund Seller and Transfer Base
+    send_vault(system, SELLER_ID, vault_id, "VaultDeposit", (seller(), TOKEN_BASE, 1000u128));
+    send_vault(system, SELLER_ID, vault_id, "TransferToMarket", (orderbook_id, TOKEN_BASE, 1000u128));
+
+    // Fund Buyer and Transfer Quote
+    send_vault(system, BUYER_ID, vault_id, "VaultDeposit", (buyer(), TOKEN_QUOTE, 100000u128));
+    send_vault(system, BUYER_ID, vault_id, "TransferToMarket", (orderbook_id, TOKEN_QUOTE, 100000u128));
 
     // Place 70 Sell orders (Makers) @ 100
     for _ in 0..70 {
@@ -113,13 +123,8 @@ async fn test_batching_continuation() {
 
     if found {
         println!("Order partially filled, remaining qty: {}", qty);
-        // If gtest runs fully, we expect 0.
-        // If gtest stops after 1 batch, we expect 20.
-        // Based on previous run, it likely runs fully or until gas limit.
-        // 70 should be well within gas limit if 129 passed.
         assert_eq!(qty, 0, "Expected order to be fully filled via continuation");
     } else {
         println!("Order fully filled (or not found)");
-        // Success
     }
 }

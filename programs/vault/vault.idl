@@ -8,6 +8,7 @@ service Vault {
   EthDeposit : (payload: vec u8) -> null;
   EthWithdraw : (payload: vec u8) -> null;
   SetEthVaultCaller : (program_id: actor_id) -> null;
+  TransferToMarket : (market_id: actor_id, token: [u8, 20], amount: u128) -> null;
   UpdateFeeRate : (new_rate: u128) -> null;
   VaultDeposit : (user: actor_id, token: [u8, 20], amount: u128) -> null;
   VaultForceExit : (user: actor_id, token: [u8, 20], amount: u128) -> null;
