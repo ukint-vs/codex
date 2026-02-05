@@ -1,5 +1,4 @@
 /target
-**/.DS_Store
 programs/ethapp/
 programs/ethapp_with_events/
 programs/one-of-us/
@@ -14,6 +13,10 @@ broadcast/
 # Conductor files
 conductor/
 ACT.md
-.env
 **/out/
 **/cache/
+
+.DS_Store
+.env
+.binpath
+*.log
