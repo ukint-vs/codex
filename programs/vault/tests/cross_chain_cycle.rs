@@ -48,8 +48,7 @@ async fn test_full_cross_chain_cycle_simulation() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup: Connect Eth Caller (Bridge simulation)
     let eth_bridge_id = ActorId::from(20u64);
@@ -71,12 +70,12 @@ async fn test_full_cross_chain_cycle_simulation() {
 
     // Send the cross-chain message
     let eth_remoting = remoting.clone().with_actor_id(eth_bridge_id);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(deposit_payload).await.unwrap();
 
     // Verify L2 Balance
     let (available, _) = service_client
-        .get_balance(user_actor, token_addr.into())
+        .get_balance(user_actor, token_addr)
         .await
         .unwrap();
     assert_eq!(available, amount);
@@ -84,16 +83,16 @@ async fn test_full_cross_chain_cycle_simulation() {
     // 2. L2 -> L1 Withdrawal Simulation
     // User initiates withdrawal on Gear
     let user_remoting = remoting.clone().with_actor_id(user_actor);
-    let mut user_service = Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault".into());
+    let mut user_service = Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault");
 
     user_service
-        .vault_withdraw(user_actor, token_addr.into(), amount)
+        .vault_withdraw(user_actor, token_addr, amount)
         .await
         .unwrap();
 
     // Verify L2 Balance is now 0
     let (bal_after, _) = service_client
-        .get_balance(user_actor, token_addr.into())
+        .get_balance(user_actor, token_addr)
         .await
         .unwrap();
     assert_eq!(bal_after, 0);
@@ -146,8 +145,7 @@ async fn test_force_exit_cancellation_simulation() {
 
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup: Connect Eth Caller
 
@@ -172,7 +170,7 @@ async fn test_force_exit_cancellation_simulation() {
     };
 
     let eth_remoting = remoting.clone().with_actor_id(eth_bridge_id);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service
         .eth_deposit(deposit_data.abi_encode())
         .await
@@ -185,14 +183,14 @@ async fn test_force_exit_cancellation_simulation() {
     // The bridge is usually the Admin or an authorized program.
 
     service_client
-        .vault_force_exit(user_actor, token_addr.into(), amount)
+        .vault_force_exit(user_actor, token_addr, amount)
         .await
         .unwrap();
 
     // 3. Verify L2 Balance is deducted
 
     let (available, _) = service_client
-        .get_balance(user_actor, token_addr.into())
+        .get_balance(user_actor, token_addr)
         .await
         .unwrap();
 

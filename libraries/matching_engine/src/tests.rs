@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 extern crate std;
 use sails_rs::{
     collections::{BTreeMap, VecDeque},
@@ -60,7 +58,7 @@ impl MockBook {
         let q = self
             .side_map_mut(maker.side)
             .entry(maker.price)
-            .or_insert_with(VecDeque::new);
+            .or_default();
         q.push_back(maker);
     }
 
@@ -192,7 +190,7 @@ fn maker(id: u64, side: Side, price: u64, base: u64, owner: u64) -> MakerView {
         side,
         price: u(price),
         remaining_base: u(base),
-        reserved_quote: reserved_quote,
+        reserved_quote,
     }
 }
 

@@ -3,6 +3,7 @@
 use ::alloy_sol_types::{sol, SolCall, SolType};
 use clob_common::{actor_to_eth, eth_to_actor, mul_div_ceil, EthAddress, TokenId};
 use sails_rs::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     gstd::debug,
     gstd::msg,
@@ -86,15 +87,9 @@ pub struct VaultState {
     pub eth_vault_caller: Option<ActorId>,
 }
 
-static mut STATE: Option<VaultState> = None;
-
-impl VaultState {
-    pub fn get_mut() -> &'static mut Self {
-        unsafe { STATE.get_or_insert(Default::default()) }
-    }
+pub struct VaultProgram {
+    state: RefCell<VaultState>,
 }
-
-pub struct VaultProgram;
 
 fn reply_ok() {
     // Empty reply is enough for callers; depositless on ethexe.
@@ -138,22 +133,43 @@ pub fn encode_cancel_force_exit(user: ActorId, token: TokenId, amount: u128) -> 
 impl VaultProgram {
     #[export]
     pub fn create() -> Self {
-        let state = VaultState::get_mut();
-        state.admin = Some(sails_rs::gstd::msg::source());
-        VaultProgram
+        Self {
+            state: RefCell::new(VaultState {
+                admin: Some(sails_rs::gstd::msg::source()),
+                ..Default::default()
+            }),
+        }
     }
 
-    pub fn vault(&self) -> VaultService {
-        VaultService
+    pub fn vault(&self) -> VaultService<'_> {
+        VaultService::new(&self.state)
     }
 }
 
-pub struct VaultService;
+pub struct VaultService<'a> {
+    state: &'a RefCell<VaultState>,
+}
+
+impl<'a> VaultService<'a> {
+    pub fn new(state: &'a RefCell<VaultState>) -> Self {
+        Self { state }
+    }
+
+    #[inline]
+    pub fn get_mut(&self) -> sails_rs::cell::RefMut<'_, VaultState> {
+        self.state.borrow_mut()
+    }
+
+    #[inline]
+    pub fn get(&self) -> sails_rs::cell::Ref<'_, VaultState> {
+        self.state.borrow()
+    }
+}
 
 #[service(events = Events)]
-impl VaultService {
+impl<'a> VaultService<'a> {
     fn ensure_eth_caller(&self) {
-        let state = VaultState::get_mut();
+        let state = self.get();
         if state.eth_vault_caller != Some(msg::source()) {
             panic!("UnauthorizedEthCaller");
         }
@@ -161,7 +177,7 @@ impl VaultService {
     // Admin function to authorize an OrderBook program
     #[export]
     pub fn add_market(&mut self, program_id: ActorId) {
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         if state.admin != Some(sails_rs::gstd::msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
@@ -176,7 +192,7 @@ impl VaultService {
 
     #[export]
     pub fn update_fee_rate(&mut self, new_rate: u128) {
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
@@ -189,7 +205,7 @@ impl VaultService {
 
     #[export]
     pub fn set_eth_vault_caller(&mut self, program_id: ActorId) {
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
@@ -200,7 +216,7 @@ impl VaultService {
     // Admin function to claim accumulated fees
     #[export]
     pub fn claim_fees(&mut self, token: TokenId) {
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
@@ -221,7 +237,7 @@ impl VaultService {
     }
 
     fn ensure_authorized(&self, user: Option<ActorId>) {
-        let state = VaultState::get_mut();
+        let state = self.get();
         let caller = sails_rs::gstd::msg::source();
         debug!(
             "Vault::ensure_authorized caller={:?} admin={:?} user={:?} authorized_set={:?}",
@@ -286,7 +302,7 @@ impl VaultService {
             token,
             amount
         );
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         let user_balances = state.balances.entry(user).or_default();
         let tokens_for_user = user_balances.len();
         let balance = user_balances.entry(token).or_default();
@@ -327,7 +343,7 @@ impl VaultService {
     }
 
     fn vault_withdraw_unchecked(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
         let balance = user_balances.get_mut(&token).expect("TokenNotFound");
 
@@ -367,25 +383,26 @@ impl VaultService {
         let user = msg::source();
         self.ensure_authorized(Some(user)); // User can transfer their own funds
 
-        let state = VaultState::get_mut();
-        if !state.authorized_programs.contains(&market_id) {
-            panic!("UnauthorizedMarket");
-        }
+        let payload = {
+            let mut state = self.get_mut();
+            if !state.authorized_programs.contains(&market_id) {
+                panic!("UnauthorizedMarket");
+            }
 
-        // 1. Verify and deduct balance
-        let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
-        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+            // 1. Verify and deduct balance
+            let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
+            let balance = user_balances.get_mut(&token).expect("TokenNotFound");
 
-        if balance.available < amount {
-            panic!("InsufficientBalance");
-        }
+            if balance.available < amount {
+                panic!("InsufficientBalance");
+            }
 
-        balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
-
-        // 2. Send deposit message to OrderBook
-        // TODO: switch to OrderBook client once deposit method is exposed there.
-        // Raw encoding of ("OrderBook", "Deposit", (user, token, amount))
-        let payload = ("OrderBook", "Deposit", (user, token, amount)).encode();
+            balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
+            // 2. Send deposit message to OrderBook
+            // TODO: switch to Orderbook client once deposit method is exposed there.
+            // Raw encoding of ("Orderbook", "Deposit", (user, token, amount))
+            ("Orderbook", "Deposit", (user, token, amount)).encode()
+        };
 
         let result = msg::send_bytes_for_reply(market_id, payload, 0)
             .expect("SendFailed")
@@ -393,13 +410,14 @@ impl VaultService {
 
         if result.is_err() {
             // Revert balance change if market deposit failed
-            let state = VaultState::get_mut();
+            let mut state = self.get_mut();
             let balance = state
                 .balances
                 .get_mut(&user)
                 .and_then(|b| b.get_mut(&token))
                 .expect("User and token balance must exist here");
             balance.available = balance.available.checked_add(amount).expect("MathOverflow");
+
             debug!("OrderBookDepositFailed");
             reply_ok();
             return;
@@ -411,7 +429,7 @@ impl VaultService {
     #[export]
     pub fn vault_force_exit(&mut self, user: ActorId, token: TokenId, amount: u128) {
         self.ensure_authorized(Some(user));
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
         let balance = user_balances.get_mut(&token).expect("TokenNotFound");
 
@@ -461,7 +479,7 @@ impl VaultService {
         );
         self.ensure_authorized(None); // Reserve must be from an authorized program (OrderBook)
 
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
 
         if !state.balances.contains_key(&user) {
             debug!("Vault: UserNotFound: {:?}", user);
@@ -509,7 +527,7 @@ impl VaultService {
     pub fn vault_unlock_funds(&mut self, user: ActorId, token: TokenId, amount: u128) {
         self.ensure_authorized(None); // Unlock must be from an authorized program
 
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
         let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
         let balance = user_balances.get_mut(&token).expect("TokenNotFound");
 
@@ -537,6 +555,7 @@ impl VaultService {
         reply_ok();
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[export]
     pub fn vault_settle_trade(
         &mut self,
@@ -552,7 +571,7 @@ impl VaultService {
         self.ensure_authorized(None); // Settle must be from an authorized program
 
         let cost = mul_div_ceil(price, quantity, price_scale);
-        let state = VaultState::get_mut();
+        let mut state = self.get_mut();
 
         // Verification Phase
         let buyer_has_funds = state
@@ -576,7 +595,6 @@ impl VaultService {
         }
 
         // Fee Verification
-        let state = VaultState::get_mut();
         let expected_fee = cost.checked_mul(state.fee_rate_bps).expect("MathOverflow") / 10000;
 
         if fee < expected_fee {
@@ -587,13 +605,11 @@ impl VaultService {
             panic!("InsufficientBalance: Fee");
         }
         let seller_proceeds = cost.checked_sub(fee).expect("MathOverflow");
-
         // Fee Accounting
         if fee > 0 {
             let treasury_balance = state.treasury.entry(quote_token).or_default();
             *treasury_balance = treasury_balance.checked_add(fee).expect("MathOverflow");
         }
-
         // Execution Phase
         // Buyer Quote: Reserved -= Cost
         let b_q = state
@@ -603,7 +619,6 @@ impl VaultService {
             .get_mut(&quote_token)
             .unwrap();
         b_q.reserved = b_q.reserved.checked_sub(cost).expect("MathOverflow");
-
         // Seller Quote: Available += Proceeds
         let s_q = state
             .balances
@@ -662,27 +677,25 @@ impl VaultService {
     // --- Queries ---
     #[export]
     pub fn admin(&self) -> ActorId {
-        VaultState::get_mut()
-            .admin
-            .unwrap_or(ActorId::from([0u8; 32]))
+        self.get().admin.unwrap_or(ActorId::from([0u8; 32]))
     }
 
     #[export]
     pub fn eth_vault_caller(&self) -> ActorId {
-        VaultState::get_mut()
+        self.get()
             .eth_vault_caller
             .unwrap_or(ActorId::from([0u8; 32]))
     }
 
     #[export]
     pub fn is_authorized(&self, program_id: ActorId) -> bool {
-        let state = VaultState::get_mut();
+        let state = self.get();
         state.admin == Some(program_id) || state.authorized_programs.contains(&program_id)
     }
 
     #[export]
     pub fn get_balance(&self, user: ActorId, token: TokenId) -> (u128, u128) {
-        let state = VaultState::get_mut();
+        let state = self.get();
         debug!(
             "Vault::get_balance user_raw={:?} normalized={:?} token={:?} existing_keys={}",
             user,
@@ -706,7 +719,7 @@ impl VaultService {
 
     #[export]
     pub fn get_treasury(&self, token: TokenId) -> u128 {
-        let state = VaultState::get_mut();
+        let state = self.get();
         *state.treasury.get(&token).unwrap_or(&0)
     }
 }

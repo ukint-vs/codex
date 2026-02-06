@@ -50,8 +50,7 @@ async fn test_deposit() {
     let program_id = program_actor.id();
 
     // Call: VaultDeposit using Client
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
     service_client
         .vault_deposit(actor(USER_1), TOKEN_BASE, 1000u128)
         .await
@@ -74,8 +73,7 @@ async fn test_reserve_unlock() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
     // Add Market (Admin)
     service_client
         .add_market(ActorId::from(ADMIN_ID))
@@ -117,8 +115,7 @@ async fn test_withdraw() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Deposit
     service_client
@@ -149,8 +146,7 @@ async fn test_settle_trade() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Add Market
     service_client
@@ -212,8 +208,7 @@ async fn test_fee_accumulation() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Add Market
     service_client
@@ -278,8 +273,7 @@ async fn test_insufficient_reserved_funds() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     service_client
         .add_market(ActorId::from(ADMIN_ID))
@@ -313,8 +307,7 @@ async fn test_settle_trade_without_reservation() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     service_client
         .add_market(ActorId::from(ADMIN_ID))
@@ -361,8 +354,7 @@ async fn test_abi_deposit() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     let eth_caller = ActorId::from(20u64);
     service_client
@@ -372,7 +364,7 @@ async fn test_abi_deposit() {
     remoting.system().mint_to(eth_caller, 1_000_000_000_000_000);
     remoting.system().mint_to(eth_caller, 1_000_000_000_000_000);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
 
     let user_addr = [1u8; 20];
     let token_addr = [10u8; 20];
@@ -427,8 +419,7 @@ async fn test_cross_chain_raw_injection() {
     // BUT, we want to test ROUTING.
     // Inject message directly into system to test routing and ABI decoding
     let eth_caller = ActorId::from(20u64);
-    let mut admin_service =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut admin_service = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
     admin_service
         .set_eth_vault_caller(eth_caller)
         .await
@@ -446,7 +437,7 @@ async fn test_cross_chain_raw_injection() {
     assert!(res.succeed.contains(&mid));
 
     // Verify balance via client
-    let service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     let mut user_h160 = [0u8; 20];
     user_h160[18] = 0xab;
@@ -480,8 +471,7 @@ async fn test_withdraw_cross_chain() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Set Eth Vault Caller (Mocked as ActorId 20)
     let eth_caller = ActorId::from(20u64);
@@ -527,8 +517,7 @@ async fn test_ping_pong_withdrawal() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // 1. Setup: Set Eth Vault Caller and Deposit Funds
     let eth_caller = ActorId::from(20u64);
@@ -625,8 +614,7 @@ async fn test_force_exit_sync() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // 1. Setup: Set Eth Vault Caller and Deposit Funds
     let eth_caller = ActorId::from(20u64);
@@ -714,7 +702,7 @@ async fn test_unauthorized_vault_calls() {
 
     // Call as Unauthorized User (ActorId 100)
     let user_remoting = remoting.clone().with_actor_id(ActorId::from(100u64));
-    let mut user_service = Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault".into());
+    let mut user_service = Service::<VaultImpl, _>::new(user_remoting, program_id, "Vault");
 
     let res = user_service
         .vault_reserve_funds(actor(USER_1), TOKEN_BASE, 1u128)

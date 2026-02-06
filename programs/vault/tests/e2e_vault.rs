@@ -58,8 +58,7 @@ async fn test_deposit_token_a() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // 1. Setup
     let user = [1u8; 20];
@@ -77,12 +76,12 @@ async fn test_deposit_token_a() {
         .system()
         .mint_to(eth_caller, 100_000_000_000_000_000);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(payload).await.unwrap();
 
     // 3. Verify Balance
     let (balance, _) = service_client
-        .get_balance(eth_to_actor(user), token_a.into())
+        .get_balance(eth_to_actor(user), token_a)
         .await
         .unwrap();
     assert_eq!(balance, amount);
@@ -104,8 +103,7 @@ async fn test_deposit_token_b_isolation() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup
     let user = [1u8; 20];
@@ -125,7 +123,7 @@ async fn test_deposit_token_b_isolation() {
         .system()
         .mint_to(eth_caller, 100_000_000_000_000_000);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(payload_a).await.unwrap();
 
     // 2. Deposit Token B
@@ -134,11 +132,11 @@ async fn test_deposit_token_b_isolation() {
 
     // 3. Verify Balances
     let (balance_a, _) = service_client
-        .get_balance(eth_to_actor(user), token_a.into())
+        .get_balance(eth_to_actor(user), token_a)
         .await
         .unwrap();
     let (balance_b, _) = service_client
-        .get_balance(eth_to_actor(user), token_b.into())
+        .get_balance(eth_to_actor(user), token_b)
         .await
         .unwrap();
 
@@ -165,8 +163,7 @@ async fn test_withdraw_token_a() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup: Connect Eth Caller for withdrawal routing
     let eth_caller = ActorId::from(20u64);
@@ -186,7 +183,7 @@ async fn test_withdraw_token_a() {
     // 1. Deposit
     let payload = encode_deposit_payload(user, token_a, deposit_amount);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(payload).await.unwrap();
 
     // 2. Withdraw
@@ -195,7 +192,7 @@ async fn test_withdraw_token_a() {
 
     // 3. Verify Balance
     let (balance, _) = service_client
-        .get_balance(eth_to_actor(user), token_a.into())
+        .get_balance(eth_to_actor(user), token_a)
         .await
         .unwrap();
     assert_eq!(balance, deposit_amount - withdraw_amount);
@@ -217,8 +214,7 @@ async fn test_withdraw_insufficient_balance() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup: Connect Eth Caller
     let eth_caller = ActorId::from(20u64);
@@ -238,7 +234,7 @@ async fn test_withdraw_insufficient_balance() {
     // 1. Deposit
     let payload = encode_deposit_payload(user, token, deposit_amount);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(payload).await.unwrap();
 
     // 2. Withdraw (Expect Failure)
@@ -267,8 +263,7 @@ async fn test_round_trip_token_b() {
             .unwrap();
     let program_id = program_actor.id();
 
-    let mut service_client =
-        Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault".into());
+    let mut service_client = Service::<VaultImpl, _>::new(remoting.clone(), program_id, "Vault");
 
     // Setup: Connect Eth Caller
     let eth_caller = ActorId::from(20u64);
@@ -287,11 +282,11 @@ async fn test_round_trip_token_b() {
     // 1. Deposit
     let deposit_payload = encode_deposit_payload(user, token_b, amount);
     let eth_remoting = remoting.clone().with_actor_id(eth_caller);
-    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault".into());
+    let mut eth_service = Service::<VaultImpl, _>::new(eth_remoting, program_id, "Vault");
     eth_service.eth_deposit(deposit_payload).await.unwrap();
 
     let (bal_after_deposit, _) = service_client
-        .get_balance(eth_to_actor(user), token_b.into())
+        .get_balance(eth_to_actor(user), token_b)
         .await
         .unwrap();
     assert_eq!(bal_after_deposit, amount);
@@ -302,7 +297,7 @@ async fn test_round_trip_token_b() {
 
     // 3. Verify Final Balance is 0
     let (bal_final, _) = service_client
-        .get_balance(eth_to_actor(user), token_b.into())
+        .get_balance(eth_to_actor(user), token_b)
         .await
         .unwrap();
     assert_eq!(bal_final, 0);

@@ -31,7 +31,7 @@ impl<'a> Orderbook<'a> {
 #[sails_rs::service]
 impl<'a> Orderbook<'a> {
     #[export]
-    pub fn deposit(&mut self, account: ActorId, token: TokenId, amount: u128) {
+    pub fn deposit(&mut self, account: ActorId, token: TokenId, amount: u128) -> bool {
         let mut st = self.get_mut();
         if sails_rs::gstd::msg::source() != st.vault_id {
             panic!("Not allowed to deposit")
@@ -40,46 +40,58 @@ impl<'a> Orderbook<'a> {
             st.deposit(account, Asset::Base, U256::from(amount));
         } else if token == st.quote_token_id {
             st.deposit(account, Asset::Quote, U256::from(amount));
+        } else {
+            panic!("Unknown token");
         }
+        true
     }
 
     #[export]
     pub async fn withdraw_base(&mut self, amount: u128) {
         let caller = msg::source();
-        let mut st = self.get_mut();
-        st.withdraw(caller, Asset::Base, U256::from(amount));
-        let payload = vault_io::VaultUnlockFunds::encode_params_with_prefix(
-            "Vault",
-            caller,
-            st.base_token_id,
-            amount,
-        );
-        let result = msg::send_bytes_for_reply(st.vault_id, payload, 0)
+        let (vault_id, payload) = {
+            let mut st = self.get_mut();
+            st.withdraw(caller, Asset::Base, U256::from(amount));
+            let payload = vault_io::VaultDeposit::encode_params_with_prefix(
+                "Vault",
+                caller,
+                st.base_token_id,
+                amount,
+            );
+            (st.vault_id, payload)
+        };
+
+        let result = msg::send_bytes_for_reply(vault_id, payload, 0)
             .expect("SendFailed")
             .await;
 
         if result.is_err() {
-            st.deposit(caller, Asset::Base, U256::from(amount));
+            self.get_mut()
+                .deposit(caller, Asset::Base, U256::from(amount));
         }
     }
 
     #[export]
     pub async fn withdraw_quote(&mut self, amount: u128) {
         let caller = msg::source();
-        let mut st = self.get_mut();
-        st.withdraw(caller, Asset::Quote, U256::from(amount));
-        let payload = vault_io::VaultUnlockFunds::encode_params_with_prefix(
-            "Vault",
-            caller,
-            st.quote_token_id,
-            amount,
-        );
-        let result = msg::send_bytes_for_reply(st.vault_id, payload, 0)
+        let (vault_id, payload) = {
+            let mut st = self.get_mut();
+            st.withdraw(caller, Asset::Quote, U256::from(amount));
+            let payload = vault_io::VaultDeposit::encode_params_with_prefix(
+                "Vault",
+                caller,
+                st.quote_token_id,
+                amount,
+            );
+            (st.vault_id, payload)
+        };
+        let result = msg::send_bytes_for_reply(vault_id, payload, 0)
             .expect("SendFailed")
             .await;
 
         if result.is_err() {
-            st.deposit(caller, Asset::Quote, U256::from(amount));
+            self.get_mut()
+                .deposit(caller, Asset::Quote, U256::from(amount));
         }
     }
 
@@ -137,7 +149,6 @@ impl<'a> Orderbook<'a> {
                 st.unlock(caller, Asset::Quote, maker.reserved_quote);
             }
         }
-
     }
 
     #[export]

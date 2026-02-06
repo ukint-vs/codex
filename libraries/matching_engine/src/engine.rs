@@ -236,16 +236,16 @@ pub fn execute<B: Book>(
     order: &IncomingOrder,
     limits: EngineLimits,
 ) -> Result<ExecutionReport, MatchError> {
-    validate(&order)?;
+    validate(order)?;
 
     let is_strict_market_buy = order.kind == OrderKind::Market && order.side == Side::Buy;
     if is_strict_market_buy {
-        preview_market_buy_budget_strict(book, &order, limits)?;
+        preview_market_buy_budget_strict(book, order, limits)?;
     }
 
     // FOK precheck: MUST NOT mutate the book when failing
     if order.kind == OrderKind::FillOrKill {
-        let ok = preview_fillable(book, &order, limits.max_preview_scans)?;
+        let ok = preview_fillable(book, order, limits.max_preview_scans)?;
         if !ok {
             return Ok(ExecutionReport {
                 trades: Vec::new(),
@@ -350,11 +350,9 @@ pub fn execute<B: Book>(
     }
 
     // finalize
-    if is_strict_market_buy {
-        if !remaining.is_zero() {
-            // after successfull preview it must be impossible
-            return Err(MatchError::MarketBuyLiquidityCheckInconsistent);
-        }
+    if is_strict_market_buy && !remaining.is_zero() {
+        // after successfull preview it must be impossible
+        return Err(MatchError::MarketBuyLiquidityCheckInconsistent);
     }
     if remaining.is_zero() {
         return Ok(ExecutionReport {

@@ -282,7 +282,7 @@ mod tests {
         let mut idxs = Vec::new();
 
         for v in 0..1000 {
-            idxs.push(a.alloc(v as i32));
+            idxs.push(a.alloc(v));
         }
         let len_before = a.storage.len();
 

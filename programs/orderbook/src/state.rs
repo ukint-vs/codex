@@ -86,7 +86,7 @@ impl State {
     }
 
     pub fn balance_mut(&mut self, who: ActorId) -> &mut AccountBalances {
-        self.balances.entry(who).or_insert_with(Default::default)
+        self.balances.entry(who).or_default()
     }
 
     fn lock(&mut self, who: ActorId, asset: Asset, amount: U256) {

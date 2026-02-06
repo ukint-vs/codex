@@ -4,7 +4,7 @@ constructor {
 
 service Orderbook {
   CancelOrder : (order_id: u64) -> null;
-  Deposit : (account: actor_id, token: [u8, 20], amount: u128) -> null;
+  Deposit : (account: actor_id, token: [u8, 20], amount: u128) -> bool;
   /// Submits an order and immediately matches against the book.
   /// Limit remainder is placed as resting order inside the book.
   SubmitOrder : (side: u16, kind: u16, limit_price: u128, amount_base: u128, max_quote: u128) -> u64;

@@ -1,5 +1,7 @@
 #![no_std]
 
+use core::cell::RefCell;
+
 use clob_common::TokenId;
 use sails_rs::{collections::HashMap, gstd::msg, prelude::*};
 
@@ -17,34 +19,49 @@ pub struct RegistryState {
     pub admin: Option<ActorId>,
 }
 
-static mut STATE: Option<RegistryState> = None;
-
-impl RegistryState {
-    pub fn get_mut() -> &'static mut Self {
-        unsafe { STATE.get_or_insert(Default::default()) }
-    }
+pub struct RegistryProgram {
+    state: RefCell<RegistryState>,
 }
-
-pub struct RegistryProgram;
 
 #[program]
 impl RegistryProgram {
     #[export]
     pub fn create() -> Self {
-        let state = RegistryState::get_mut();
-        state.admin = Some(msg::source());
-        RegistryProgram
+        Self {
+            state: RefCell::new(RegistryState {
+                admin: Some(msg::source()),
+                ..Default::default()
+            }),
+        }
     }
 
-    pub fn registry(&self) -> RegistryService {
-        RegistryService
+    pub fn registry(&self) -> RegistryService<'_> {
+        RegistryService::new(&self.state)
     }
 }
 
-pub struct RegistryService;
+pub struct RegistryService<'a> {
+    state: &'a RefCell<RegistryState>,
+}
+
+impl<'a> RegistryService<'a> {
+    pub fn new(state: &'a RefCell<RegistryState>) -> Self {
+        Self { state }
+    }
+
+    #[inline]
+    pub fn get_mut(&self) -> sails_rs::cell::RefMut<'_, RegistryState> {
+        self.state.borrow_mut()
+    }
+
+    #[inline]
+    pub fn get(&self) -> sails_rs::cell::Ref<'_, RegistryState> {
+        self.state.borrow()
+    }
+}
 
 #[service]
-impl RegistryService {
+impl<'a> RegistryService<'a> {
     #[export]
     pub fn register_market(
         &mut self,
@@ -53,7 +70,7 @@ impl RegistryService {
         orderbook_id: ActorId,
         vault_id: ActorId,
     ) {
-        let state = RegistryState::get_mut();
+        let mut state = self.get_mut();
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized");
         }
@@ -68,7 +85,7 @@ impl RegistryService {
     }
 
     pub fn get_market(&self, base_token: TokenId, quote_token: TokenId) -> Option<MarketInfo> {
-        let state = RegistryState::get_mut();
+        let state = self.get();
         state.markets.get(&(base_token, quote_token)).cloned()
     }
 }
