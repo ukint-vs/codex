@@ -33,15 +33,19 @@ impl<'a> Orderbook<'a> {
     #[export]
     pub fn deposit(&mut self, account: ActorId, token: TokenId, amount: u128) -> bool {
         let mut st = self.get_mut();
-        if sails_rs::gstd::msg::source() != st.vault_id {
-            panic!("Not allowed to deposit")
-        }
+        let caller = sails_rs::gstd::msg::source();
         if token == st.base_token_id {
+            if caller != st.base_vault_id {
+                panic!("Not allowed to deposit")
+            }
             st.deposit(account, Asset::Base, U256::from(amount));
         } else if token == st.quote_token_id {
+            if caller != st.quote_vault_id {
+                panic!("Not allowed to deposit")
+            }
             st.deposit(account, Asset::Quote, U256::from(amount));
         } else {
-            panic!("Unknown token");
+            panic!("Invalid token");
         }
         true
     }
@@ -49,49 +53,38 @@ impl<'a> Orderbook<'a> {
     #[export]
     pub async fn withdraw_base(&mut self, amount: u128) {
         let caller = msg::source();
-        let (vault_id, payload) = {
+        let base_vault_id = {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Base, U256::from(amount));
-            let payload = vault_io::VaultDeposit::encode_params_with_prefix(
-                "Vault",
-                caller,
-                st.base_token_id,
-                amount,
-            );
-            (st.vault_id, payload)
+            st.base_vault_id
         };
-
-        let result = msg::send_bytes_for_reply(vault_id, payload, 0)
+        let payload = vault_io::VaultDeposit::encode_params_with_prefix("Vault", caller, amount);
+        let result = msg::send_bytes_for_reply(base_vault_id, payload, 0)
             .expect("SendFailed")
             .await;
 
         if result.is_err() {
-            self.get_mut()
-                .deposit(caller, Asset::Base, U256::from(amount));
+            let mut st = self.get_mut();
+            st.deposit(caller, Asset::Base, U256::from(amount));
         }
     }
 
     #[export]
     pub async fn withdraw_quote(&mut self, amount: u128) {
         let caller = msg::source();
-        let (vault_id, payload) = {
+        let quote_vault_id = {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Quote, U256::from(amount));
-            let payload = vault_io::VaultDeposit::encode_params_with_prefix(
-                "Vault",
-                caller,
-                st.quote_token_id,
-                amount,
-            );
-            (st.vault_id, payload)
+            st.quote_vault_id
         };
-        let result = msg::send_bytes_for_reply(vault_id, payload, 0)
+        let payload = vault_io::VaultDeposit::encode_params_with_prefix("Vault", caller, amount);
+        let result = msg::send_bytes_for_reply(quote_vault_id, payload, 0)
             .expect("SendFailed")
             .await;
 
         if result.is_err() {
-            self.get_mut()
-                .deposit(caller, Asset::Quote, U256::from(amount));
+            let mut st = self.get_mut();
+            st.deposit(caller, Asset::Quote, U256::from(amount));
         }
     }
 
@@ -210,7 +203,8 @@ pub struct OrderBookProgram {
 #[sails_rs::program]
 impl OrderBookProgram {
     pub fn create(
-        vault_id: ActorId,
+        base_vault_id: ActorId,
+        quote_vault_id: ActorId,
         base_token_id: TokenId,
         quote_token_id: TokenId,
         max_trades: u32,
@@ -218,7 +212,8 @@ impl OrderBookProgram {
     ) -> Self {
         Self {
             state: RefCell::new(state::State::new(
-                vault_id,
+                base_vault_id,
+                quote_vault_id,
                 base_token_id,
                 quote_token_id,
                 max_trades,

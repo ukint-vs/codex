@@ -1,27 +1,10 @@
 #![no_std]
 
-use ::alloy_sol_types::{sol, SolCall, SolType};
-use clob_common::{actor_to_eth, eth_to_actor, mul_div_ceil, EthAddress, TokenId};
-use sails_rs::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    gstd::debug,
-    gstd::msg,
-    prelude::*,
-};
+use clob_common::{actor_to_eth, TokenId};
+use sails_rs::{cell::RefCell, gstd::debug, gstd::exec, gstd::msg, prelude::*};
 
-sol! {
-    struct EthDeposit {
-        address user;
-        address token;
-        uint256 amount;
-    }
-
-    interface IVault {
-        function releaseFunds(address user, address token, uint256 amount);
-        function cancelForceExit(address user, address token, uint256 amount);
-    }
-}
+mod state;
+use state::*;
 
 // --- Events ---
 
@@ -31,60 +14,27 @@ sol! {
 #[scale_info(crate = sails_rs::scale_info)]
 pub enum Events {
     Deposit {
-        user: [u8; 32],
+        user: [u8; 20],
         token: TokenId,
         amount: u128,
         balance_after: u128,
     },
     Withdrawal {
-        user: [u8; 32],
+        user: [u8; 20],
         token: TokenId,
         amount: u128,
         status: String,
-    },
-    FundsReserved {
-        user: [u8; 32],
-        token: TokenId,
-        amount: u128,
-    },
-    FundsUnlocked {
-        user: [u8; 32],
-        token: TokenId,
-        amount: u128,
-    },
-    TradeSettled {
-        buyer: [u8; 32],
-        seller: [u8; 32],
-        base_token: TokenId,
-        quote_token: TokenId,
-        price: u128,
-        quantity: u128,
-        fee: u128,
     },
     FeesClaimed {
         token: TokenId,
         amount: u128,
     },
-}
-
-// --- State ---
-
-#[derive(Clone, Debug, Default, Encode, Decode, TypeInfo)]
-#[codec(crate = sails_rs::scale_codec)]
-#[scale_info(crate = sails_rs::scale_info)]
-pub struct Balance {
-    pub available: u128,
-    pub reserved: u128,
-}
-
-#[derive(Default)]
-pub struct VaultState {
-    pub balances: HashMap<ActorId, HashMap<TokenId, Balance>>,
-    pub treasury: HashMap<TokenId, u128>,
-    pub fee_rate_bps: u128, // Basis points (e.g., 30 = 0.3%)
-    pub authorized_programs: HashSet<ActorId>,
-    pub admin: Option<ActorId>,
-    pub eth_vault_caller: Option<ActorId>,
+    QuarantineReleased {
+        user: [u8; 20],
+        token: TokenId,
+        amount: u128,
+        balance_after: u128,
+    },
 }
 
 pub struct VaultProgram {
@@ -96,48 +46,45 @@ fn reply_ok() {
     msg::reply((), 0).expect("ReplyFailed");
 }
 
-fn actor_bytes(actor: ActorId) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(actor.as_ref());
-    out
+fn actor_addr(actor: ActorId) -> [u8; 20] {
+    actor_to_eth(actor)
 }
 
-fn actor_eth_bytes(actor: ActorId) -> [u8; 32] {
-    let eth: EthAddress = actor_to_eth(actor);
-    let mut out = [0u8; 32];
-    out[12..].copy_from_slice(&eth);
-    out
+fn locked_balance_of(state: &VaultState, user: ActorId) -> u128 {
+    let in_transit = state
+        .locked_in_transit
+        .iter()
+        .filter(|((u, _), _)| *u == user)
+        .try_fold(0u128, |acc, (_, amount)| acc.checked_add(*amount))
+        .expect("MathOverflow");
+    in_transit
 }
 
-pub fn encode_release_funds(user: ActorId, token: TokenId, amount: u128) -> Vec<u8> {
-    let user: EthAddress = actor_to_eth(user);
-    let call = IVault::releaseFundsCall {
-        user: user.into(),
-        token: token.into(),
-        amount: ::alloy_sol_types::private::U256::from(amount),
-    };
-    call.abi_encode()
-}
+fn decode_orderbook_deposit_ack(reply: &[u8]) -> bool {
+    let mut wrapped = reply;
+    if let Ok((service, method, ack)) = <(String, String, bool)>::decode(&mut wrapped) {
+        return wrapped.is_empty() && service == "Orderbook" && method == "Deposit" && ack;
+    }
 
-pub fn encode_cancel_force_exit(user: ActorId, token: TokenId, amount: u128) -> Vec<u8> {
-    let user: EthAddress = actor_to_eth(user);
-    let call = IVault::cancelForceExitCall {
-        user: user.into(),
-        token: token.into(),
-        amount: ::alloy_sol_types::private::U256::from(amount),
-    };
-    call.abi_encode()
+    let mut raw = reply;
+    if let Ok(ack) = bool::decode(&mut raw) {
+        return raw.is_empty() && ack;
+    }
+
+    false
 }
 
 #[program]
 impl VaultProgram {
     #[export]
-    pub fn create() -> Self {
+    pub fn create(token_id: ActorId) -> Self {
+        let state = VaultState {
+            admin: Some(sails_rs::gstd::msg::source()),
+            token: actor_to_eth(token_id),
+            ..VaultState::default()
+        };
         Self {
-            state: RefCell::new(VaultState {
-                admin: Some(sails_rs::gstd::msg::source()),
-                ..Default::default()
-            }),
+            state: RefCell::new(state),
         }
     }
 
@@ -156,22 +103,55 @@ impl<'a> VaultService<'a> {
     }
 
     #[inline]
-    pub fn get_mut(&self) -> sails_rs::cell::RefMut<'_, VaultState> {
+    fn get_mut(&self) -> sails_rs::cell::RefMut<'_, VaultState> {
         self.state.borrow_mut()
     }
 
     #[inline]
-    pub fn get(&self) -> sails_rs::cell::Ref<'_, VaultState> {
+    fn get(&self) -> sails_rs::cell::Ref<'_, VaultState> {
         self.state.borrow()
     }
 }
 
 #[service(events = Events)]
 impl<'a> VaultService<'a> {
-    fn ensure_eth_caller(&self) {
-        let state = self.get();
-        if state.eth_vault_caller != Some(msg::source()) {
-            panic!("UnauthorizedEthCaller");
+    fn release_matured_quarantine(&self) {
+        let now = exec::block_timestamp();
+        let mut state = self.get_mut();
+        if state.quarantined_deposits.is_empty() {
+            return;
+        }
+
+        let token = state.token;
+        let matured_count = state
+            .quarantined_deposits
+            .partition_point(|q| q.release_timestamp <= now);
+        if matured_count == 0 {
+            return;
+        }
+
+        let matured: Vec<_> = state.quarantined_deposits.drain(..matured_count).collect();
+        for q in matured {
+            let balance = state.balances.entry(q.user).or_default();
+            *balance = balance.checked_add(q.amount).expect("MathOverflow");
+            let balance_after = *balance;
+
+            self.emit_eth_event(Events::QuarantineReleased {
+                user: actor_addr(q.user),
+                token,
+                amount: q.amount,
+                balance_after,
+            })
+            .expect("EmitEventFailed");
+            let mut emitter = self.emitter();
+            emitter
+                .emit_event(Events::QuarantineReleased {
+                    user: actor_addr(q.user),
+                    token,
+                    amount: q.amount,
+                    balance_after,
+                })
+                .expect("EmitEventFailed");
         }
     }
     // Admin function to authorize an OrderBook program
@@ -186,7 +166,7 @@ impl<'a> VaultService<'a> {
             msg::source(),
             program_id
         );
-        state.authorized_programs.insert(program_id);
+        state.registered_orderbooks.insert(program_id);
         reply_ok();
     }
 
@@ -204,29 +184,43 @@ impl<'a> VaultService<'a> {
     }
 
     #[export]
-    pub fn set_eth_vault_caller(&mut self, program_id: ActorId) {
+    pub fn set_quarantine_period(&mut self, period: u64) {
         let mut state = self.get_mut();
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
-        state.eth_vault_caller = Some(program_id);
+        state.quarantine_period = period;
+        reply_ok();
+    }
+
+    /// Enable/disable debug minting helpers (intended for test environments).
+    #[export]
+    pub fn set_debug_mode(&mut self, enabled: bool) {
+        let mut state = self.get_mut();
+        if state.admin != Some(msg::source()) {
+            panic!("Unauthorized: Not Admin");
+        }
+        state.debug_mode = enabled;
         reply_ok();
     }
 
     // Admin function to claim accumulated fees
     #[export]
-    pub fn claim_fees(&mut self, token: TokenId) {
+    pub fn claim_fees(&mut self) {
         let mut state = self.get_mut();
+
         if state.admin != Some(msg::source()) {
             panic!("Unauthorized: Not Admin");
         }
 
-        let amount = state.treasury.remove(&token).unwrap_or(0);
+        let amount = state.treasury;
         if amount == 0 {
             // No fees to claim, return early to save gas/noise
             return;
         }
+        state.treasury = 0;
 
+        let token = state.token;
         self.emit_eth_event(Events::FeesClaimed { token, amount })
             .expect("EmitEventFailed");
         let mut emitter = self.emitter();
@@ -236,65 +230,57 @@ impl<'a> VaultService<'a> {
         reply_ok();
     }
 
-    fn ensure_authorized(&self, user: Option<ActorId>) {
+    fn ensure_authorized_program(&self) {
         let state = self.get();
         let caller = sails_rs::gstd::msg::source();
         debug!(
-            "Vault::ensure_authorized caller={:?} admin={:?} user={:?} authorized_set={:?}",
+            "Vault::ensure_authorized_program caller={:?} admin={:?} authorized_set={:?}",
             caller,
             state.admin,
-            user,
-            state.authorized_programs.contains(&caller)
+            state.registered_orderbooks.contains(&caller)
         );
         if state.admin == Some(caller) {
             return;
         }
-        if state.eth_vault_caller == Some(caller) {
-            return;
-        }
-        if let Some(u) = user {
-            if u == caller {
-                return;
-            }
-        }
-        if !state.authorized_programs.contains(&caller) {
+        if !state.registered_orderbooks.contains(&caller) {
             panic!("Unauthorized: Program not authorized");
         }
     }
 
-    #[export]
-    pub fn eth_deposit(&mut self, payload: Vec<u8>) {
-        self.ensure_eth_caller();
-        let decoded = EthDeposit::abi_decode(&payload, true).expect("Failed to decode ABI payload");
-
-        let user: [u8; 20] = decoded.user.into();
-        let token: [u8; 20] = decoded.token.into();
-        let amount: u128 = decoded.amount.try_into().expect("Amount overflow");
-
-        // Ethereum-side deposits are validated on L1; only the configured L1 caller may submit them.
-        self.vault_deposit_unchecked(eth_to_actor(user), token, amount);
+    fn ensure_authorized_program_or_user(&self, user: ActorId) {
+        let caller = sails_rs::gstd::msg::source();
+        if caller == user {
+            return;
+        }
+        self.ensure_authorized_program();
     }
 
     #[export]
-    pub fn eth_withdraw(&mut self, payload: Vec<u8>) {
-        self.ensure_eth_caller();
-        let decoded = EthDeposit::abi_decode(&payload, true).expect("Failed to decode ABI payload");
-
-        let user: [u8; 20] = decoded.user.into();
-        let token: [u8; 20] = decoded.token.into();
-        let amount: u128 = decoded.amount.try_into().expect("Amount overflow");
-
-        // L1-validated ingress; only the configured L1 caller may submit it.
-        self.vault_withdraw_unchecked(eth_to_actor(user), token, amount);
+    pub fn vault_deposit(&mut self, user: ActorId, amount: u128) {
+        self.ensure_authorized_program();
+        self.vault_deposit_unchecked(user, amount);
     }
 
+    /// Debug/testing helper to mint balance without requiring market/admin routing.
+    /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
     #[export]
-    pub fn vault_deposit(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        self.ensure_authorized(Some(user));
-        self.vault_deposit_unchecked(user, token, amount);
+    pub fn debug_deposit(&mut self, user: ActorId, amount: u128) {
+        let state = self.get();
+        let caller = msg::source();
+        if !state.debug_mode {
+            panic!("DebugModeDisabled");
+        }
+        if state.admin != Some(caller) && caller != user {
+            panic!("UnauthorizedDebugDeposit");
+        }
+        drop(state);
+        self.vault_deposit_unchecked(user, amount);
     }
 
-    fn vault_deposit_unchecked(&mut self, user: ActorId, token: TokenId, amount: u128) {
+    fn vault_deposit_unchecked(&mut self, user: ActorId, amount: u128) {
+        let mut state = self.get_mut();
+        let token = state.token;
+
         debug!(
             "Vault::vault_deposit caller={:?} user={:?} token={:?} amount={}",
             sails_rs::gstd::msg::source(),
@@ -302,65 +288,68 @@ impl<'a> VaultService<'a> {
             token,
             amount
         );
-        let mut state = self.get_mut();
-        let user_balances = state.balances.entry(user).or_default();
-        let tokens_for_user = user_balances.len();
-        let balance = user_balances.entry(token).or_default();
+        if state.quarantine_period == 0 {
+            let balance = state.balances.entry(user).or_default();
+            *balance = balance.checked_add(amount).expect("MathOverflow");
+            let balance_after = *balance;
 
-        balance.available = balance.available.checked_add(amount).expect("MathOverflow");
-
-        let balance_after = balance.available;
-        debug!(
-            "Vault::vault_deposit stored available={} reserved={} tokens_for_user={}",
-            balance.available,
-            balance.reserved,
-            tokens_for_user + 1 // entry will be present after insert
-        );
-
-        self.emit_eth_event(Events::Deposit {
-            user: actor_eth_bytes(user),
-            token,
-            amount,
-            balance_after,
-        })
-        .expect("EmitEventFailed");
-        let mut emitter = self.emitter();
-        emitter
-            .emit_event(Events::Deposit {
-                user: actor_bytes(user),
+            // Emitting event with token
+            self.emit_eth_event(Events::Deposit {
+                user: actor_addr(user),
                 token,
                 amount,
                 balance_after,
             })
             .expect("EmitEventFailed");
+            let mut emitter = self.emitter();
+            emitter
+                .emit_event(Events::Deposit {
+                    user: actor_addr(user),
+                    token,
+                    amount,
+                    balance_after,
+                })
+                .expect("EmitEventFailed");
+        } else {
+            let now = exec::block_timestamp();
+            let quarantine_period = state.quarantine_period;
+            let release_timestamp = now.saturating_add(quarantine_period);
+            let idx = state
+                .quarantined_deposits
+                .partition_point(|q| q.release_timestamp <= release_timestamp);
+            state.quarantined_deposits.insert(
+                idx,
+                QuarantinedDeposit {
+                    user,
+                    amount,
+                    deposit_timestamp: now,
+                    release_timestamp,
+                },
+            );
+        }
         reply_ok();
     }
 
     #[export]
-    pub fn vault_withdraw(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        self.ensure_authorized(Some(user));
-        self.vault_withdraw_unchecked(user, token, amount);
+    pub fn vault_withdraw(&mut self, user: ActorId, amount: u128) {
+        self.ensure_authorized_program_or_user(user);
+        self.release_matured_quarantine();
+        self.vault_withdraw_unchecked(user, amount);
     }
 
-    fn vault_withdraw_unchecked(&mut self, user: ActorId, token: TokenId, amount: u128) {
+    fn vault_withdraw_unchecked(&mut self, user: ActorId, amount: u128) {
         let mut state = self.get_mut();
-        let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
-        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+        let token = state.token;
+        let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-        if balance.available < amount {
+        if *balance < amount {
             panic!("InsufficientBalance");
         }
 
-        balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
-
-        // Cross-chain release
-        if let Some(eth_dest) = state.eth_vault_caller {
-            let payload = encode_release_funds(user, token, amount);
-            msg::send(eth_dest, payload, 0).expect("Failed to send cross-chain message");
-        }
+        *balance = balance.checked_sub(amount).expect("MathOverflow");
 
         self.emit_eth_event(Events::Withdrawal {
-            user: actor_eth_bytes(user),
+            user: actor_addr(user),
             token,
             amount,
             status: "Initiated".into(),
@@ -369,7 +358,7 @@ impl<'a> VaultService<'a> {
         let mut emitter = self.emitter();
         emitter
             .emit_event(Events::Withdrawal {
-                user: actor_bytes(user),
+                user: actor_addr(user),
                 token,
                 amount,
                 status: "Initiated".into(),
@@ -379,78 +368,96 @@ impl<'a> VaultService<'a> {
     }
 
     #[export]
-    pub async fn transfer_to_market(&mut self, market_id: ActorId, token: TokenId, amount: u128) {
+    pub async fn transfer_to_market(&mut self, market_id: ActorId, amount: u128) {
         let user = msg::source();
-        self.ensure_authorized(Some(user)); // User can transfer their own funds
+        self.ensure_authorized_program_or_user(user);
 
-        let payload = {
+        self.release_matured_quarantine();
+        let token = {
             let mut state = self.get_mut();
-            if !state.authorized_programs.contains(&market_id) {
+            if !state.registered_orderbooks.contains(&market_id) {
                 panic!("UnauthorizedMarket");
             }
 
             // 1. Verify and deduct balance
-            let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
-            let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+            let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-            if balance.available < amount {
+            if *balance < amount {
                 panic!("InsufficientBalance");
             }
 
-            balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
-            // 2. Send deposit message to OrderBook
-            // TODO: switch to Orderbook client once deposit method is exposed there.
-            // Raw encoding of ("Orderbook", "Deposit", (user, token, amount))
-            ("Orderbook", "Deposit", (user, token, amount)).encode()
+            *balance = balance.checked_sub(amount).expect("MathOverflow");
+            let in_transit = state
+                .locked_in_transit
+                .entry((user, market_id))
+                .or_insert(0);
+            *in_transit = in_transit.checked_add(amount).expect("MathOverflow");
+            state.token
         };
+
+        // 2. Send deposit message to OrderBook using the current service envelope.
+        // Payload is ("Orderbook", "Deposit", (user, token, amount)).
+        let payload = ("Orderbook", "Deposit", (user, token, amount)).encode();
 
         let result = msg::send_bytes_for_reply(market_id, payload, 0)
             .expect("SendFailed")
             .await;
 
-        if result.is_err() {
-            // Revert balance change if market deposit failed
-            let mut state = self.get_mut();
-            let balance = state
-                .balances
-                .get_mut(&user)
-                .and_then(|b| b.get_mut(&token))
-                .expect("User and token balance must exist here");
-            balance.available = balance.available.checked_add(amount).expect("MathOverflow");
+        let deposit_acked = match result {
+            Ok(reply) => decode_orderbook_deposit_ack(&reply),
+            Err(_) => false,
+        };
 
-            debug!("OrderBookDepositFailed");
+        if !deposit_acked {
+            let mut state = self.get_mut();
+            let balance = state.balances.get_mut(&user).expect("UserNotFound");
+            *balance = balance.checked_add(amount).expect("MathOverflow");
+
+            let key = (user, market_id);
+            let in_transit = state
+                .locked_in_transit
+                .get_mut(&key)
+                .expect("TransitMissing");
+            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
+            if *in_transit == 0 {
+                state.locked_in_transit.remove(&key);
+            }
+
+            debug!("OrderbookDepositFailed");
             reply_ok();
             return;
+        }
+
+        {
+            let mut state = self.get_mut();
+            let key = (user, market_id);
+            let in_transit = state
+                .locked_in_transit
+                .get_mut(&key)
+                .expect("TransitMissing");
+            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
+            if *in_transit == 0 {
+                state.locked_in_transit.remove(&key);
+            }
         }
 
         reply_ok();
     }
 
     #[export]
-    pub fn vault_force_exit(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        self.ensure_authorized(Some(user));
+    pub fn vault_force_exit(&mut self, user: ActorId, amount: u128) {
+        self.ensure_authorized_program_or_user(user);
+        self.release_matured_quarantine();
         let mut state = self.get_mut();
-        let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
-        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
+        let token = state.token;
+        let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-        let to_deduct = if balance.available < amount {
-            balance.available
-        } else {
-            amount
-        };
+        let to_deduct = if *balance < amount { *balance } else { amount };
 
-        balance.available = balance
-            .available
-            .checked_sub(to_deduct)
-            .expect("MathOverflow");
-
-        if let Some(eth_dest) = state.eth_vault_caller {
-            let payload = encode_cancel_force_exit(user, token, to_deduct);
-            msg::send(eth_dest, payload, 0).expect("Failed to send cross-chain message");
-        }
+        *balance = balance.checked_sub(to_deduct).expect("MathOverflow");
 
         self.emit_eth_event(Events::Withdrawal {
-            user: actor_eth_bytes(user),
+            user: actor_addr(user),
             token,
             amount: to_deduct,
             status: "ForceExit".into(),
@@ -460,217 +467,13 @@ impl<'a> VaultService<'a> {
         let mut emitter = self.emitter();
         emitter
             .emit_event(Events::Withdrawal {
-                user: actor_bytes(user),
+                user: actor_addr(user),
                 token,
                 amount: to_deduct,
                 status: "ForceExit".into(),
             })
             .expect("EmitEventFailed");
 
-        reply_ok();
-    }
-
-    #[export]
-    pub fn vault_reserve_funds(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        let caller = msg::source();
-        debug!(
-            "Vault::vault_reserve_funds caller={:?} user={:?} token={:?} amount={}",
-            caller, user, token, amount
-        );
-        self.ensure_authorized(None); // Reserve must be from an authorized program (OrderBook)
-
-        let mut state = self.get_mut();
-
-        if !state.balances.contains_key(&user) {
-            debug!("Vault: UserNotFound: {:?}", user);
-            panic!("UserNotFound");
-        }
-        let user_balances = state.balances.get_mut(&user).unwrap();
-
-        if !user_balances.contains_key(&token) {
-            debug!("Vault: TokenNotFound: {:?} for user {:?}", token, user);
-            panic!("TokenNotFound");
-        }
-        let balance = user_balances.get_mut(&token).unwrap();
-
-        debug!("Vault: Balance available={}", balance.available);
-
-        if balance.available < amount {
-            debug!(
-                "Vault: InsufficientBalance: {} < {}",
-                balance.available, amount
-            );
-            panic!("InsufficientBalance");
-        }
-
-        balance.available = balance.available.checked_sub(amount).expect("MathOverflow");
-        balance.reserved = balance.reserved.checked_add(amount).expect("MathOverflow");
-
-        self.emit_eth_event(Events::FundsReserved {
-            user: actor_eth_bytes(user),
-            token,
-            amount,
-        })
-        .expect("EmitEventFailed");
-        let mut emitter = self.emitter();
-        emitter
-            .emit_event(Events::FundsReserved {
-                user: actor_bytes(user),
-                token,
-                amount,
-            })
-            .expect("EmitEventFailed");
-        reply_ok();
-    }
-
-    #[export]
-    pub fn vault_unlock_funds(&mut self, user: ActorId, token: TokenId, amount: u128) {
-        self.ensure_authorized(None); // Unlock must be from an authorized program
-
-        let mut state = self.get_mut();
-        let user_balances = state.balances.get_mut(&user).expect("UserNotFound");
-        let balance = user_balances.get_mut(&token).expect("TokenNotFound");
-
-        if balance.reserved < amount {
-            panic!("InsufficientBalance");
-        }
-
-        balance.reserved = balance.reserved.checked_sub(amount).expect("MathOverflow");
-        balance.available = balance.available.checked_add(amount).expect("MathOverflow");
-
-        self.emit_eth_event(Events::FundsUnlocked {
-            user: actor_eth_bytes(user),
-            token,
-            amount,
-        })
-        .expect("EmitEventFailed");
-        let mut emitter = self.emitter();
-        emitter
-            .emit_event(Events::FundsUnlocked {
-                user: actor_bytes(user),
-                token,
-                amount,
-            })
-            .expect("EmitEventFailed");
-        reply_ok();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[export]
-    pub fn vault_settle_trade(
-        &mut self,
-        buyer: ActorId,
-        seller: ActorId,
-        base_token: TokenId,
-        quote_token: TokenId,
-        price: u128,
-        quantity: u128, // Base amount
-        fee: u128,      // Quote amount
-        price_scale: u128,
-    ) {
-        self.ensure_authorized(None); // Settle must be from an authorized program
-
-        let cost = mul_div_ceil(price, quantity, price_scale);
-        let mut state = self.get_mut();
-
-        // Verification Phase
-        let buyer_has_funds = state
-            .balances
-            .get(&buyer)
-            .and_then(|m| m.get(&quote_token))
-            .map(|b| b.reserved >= cost)
-            .unwrap_or(false);
-        if !buyer_has_funds {
-            panic!("InsufficientBalance: Buyer");
-        }
-
-        let seller_has_funds = state
-            .balances
-            .get(&seller)
-            .and_then(|m| m.get(&base_token))
-            .map(|b| b.reserved >= quantity)
-            .unwrap_or(false);
-        if !seller_has_funds {
-            panic!("InsufficientBalance: Seller");
-        }
-
-        // Fee Verification
-        let expected_fee = cost.checked_mul(state.fee_rate_bps).expect("MathOverflow") / 10000;
-
-        if fee < expected_fee {
-            panic!("InsufficientFee: Expected {}", expected_fee);
-        }
-
-        if cost < fee {
-            panic!("InsufficientBalance: Fee");
-        }
-        let seller_proceeds = cost.checked_sub(fee).expect("MathOverflow");
-        // Fee Accounting
-        if fee > 0 {
-            let treasury_balance = state.treasury.entry(quote_token).or_default();
-            *treasury_balance = treasury_balance.checked_add(fee).expect("MathOverflow");
-        }
-        // Execution Phase
-        // Buyer Quote: Reserved -= Cost
-        let b_q = state
-            .balances
-            .get_mut(&buyer)
-            .unwrap()
-            .get_mut(&quote_token)
-            .unwrap();
-        b_q.reserved = b_q.reserved.checked_sub(cost).expect("MathOverflow");
-        // Seller Quote: Available += Proceeds
-        let s_q = state
-            .balances
-            .entry(seller)
-            .or_default()
-            .entry(quote_token)
-            .or_default();
-        s_q.available = s_q
-            .available
-            .checked_add(seller_proceeds)
-            .expect("MathOverflow");
-
-        // Seller Base: Reserved -= Quantity
-        let s_b = state
-            .balances
-            .get_mut(&seller)
-            .unwrap()
-            .get_mut(&base_token)
-            .unwrap();
-        s_b.reserved = s_b.reserved.checked_sub(quantity).expect("MathOverflow");
-
-        // Buyer Base: Available += Quantity
-        let b_b = state
-            .balances
-            .entry(buyer)
-            .or_default()
-            .entry(base_token)
-            .or_default();
-        b_b.available = b_b.available.checked_add(quantity).expect("MathOverflow");
-
-        self.emit_eth_event(Events::TradeSettled {
-            buyer: actor_eth_bytes(buyer),
-            seller: actor_eth_bytes(seller),
-            base_token,
-            quote_token,
-            price,
-            quantity,
-            fee,
-        })
-        .expect("EmitEventFailed");
-        let mut emitter = self.emitter();
-        emitter
-            .emit_event(Events::TradeSettled {
-                buyer: actor_bytes(buyer),
-                seller: actor_bytes(seller),
-                base_token,
-                quote_token,
-                price,
-                quantity,
-                fee,
-            })
-            .expect("EmitEventFailed");
         reply_ok();
     }
 
@@ -681,65 +484,72 @@ impl<'a> VaultService<'a> {
     }
 
     #[export]
-    pub fn eth_vault_caller(&self) -> ActorId {
-        self.get()
-            .eth_vault_caller
-            .unwrap_or(ActorId::from([0u8; 32]))
-    }
-
-    #[export]
     pub fn is_authorized(&self, program_id: ActorId) -> bool {
         let state = self.get();
-        state.admin == Some(program_id) || state.authorized_programs.contains(&program_id)
+        state.admin == Some(program_id) || state.registered_orderbooks.contains(&program_id)
     }
 
     #[export]
-    pub fn get_balance(&self, user: ActorId, token: TokenId) -> (u128, u128) {
+    pub fn get_balance(&self, user: ActorId) -> (u128, u128) {
         let state = self.get();
-        debug!(
-            "Vault::get_balance user_raw={:?} normalized={:?} token={:?} existing_keys={}",
-            user,
-            actor_to_eth(user),
-            token,
-            state.balances.len()
-        );
-        state
-            .balances
-            .get(&user)
-            .and_then(|m| m.get(&token))
-            .map(|b| {
-                debug!(
-                    "Vault::get_balance hit user={:?} token={:?} available={} reserved={}",
-                    user, token, b.available, b.reserved
-                );
-                (b.available, b.reserved)
-            })
-            .unwrap_or((0, 0))
+        let available = state.balances.get(&user).copied().unwrap_or(0);
+        let locked = locked_balance_of(&state, user);
+        (available, locked)
     }
 
     #[export]
-    pub fn get_treasury(&self, token: TokenId) -> u128 {
-        let state = self.get();
-        *state.treasury.get(&token).unwrap_or(&0)
+    pub fn get_treasury(&self) -> u128 {
+        self.get().treasury
+    }
+
+    #[export]
+    pub fn debug_mode(&self) -> bool {
+        self.get().debug_mode
     }
 }
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
-
-    use super::*;
-    use vault_client::vault::io::VaultReserveFunds;
+    use super::decode_orderbook_deposit_ack;
+    use sails_rs::prelude::*;
 
     #[test]
-    fn reserve_payload_decodes() {
-        const ROUTE: &[u8; 6] = &[0x14, b'V', b'a', b'u', b'l', b't'];
-        let mut payload = "Vault".encode();
-        payload.extend(VaultReserveFunds::encode_params(
-            ActorId::from(1u64),
-            [12u8; 20],
-            5u128,
-        ));
-        assert!(payload.starts_with(ROUTE));
+    fn decode_ack_accepts_valid_wrapped_tuple() {
+        let reply = (String::from("Orderbook"), String::from("Deposit"), true).encode();
+        assert!(decode_orderbook_deposit_ack(&reply));
+    }
+
+    #[test]
+    fn decode_ack_rejects_wrapped_tuple_with_trailing_bytes() {
+        let mut reply = (String::from("Orderbook"), String::from("Deposit"), true).encode();
+        reply.push(0xAB);
+        assert!(!decode_orderbook_deposit_ack(&reply));
+    }
+
+    #[test]
+    fn decode_ack_rejects_wrong_wrapped_service_or_method() {
+        let wrong_service = (String::from("Vault"), String::from("Deposit"), true).encode();
+        let wrong_method = (String::from("Orderbook"), String::from("Other"), true).encode();
+        assert!(!decode_orderbook_deposit_ack(&wrong_service));
+        assert!(!decode_orderbook_deposit_ack(&wrong_method));
+    }
+
+    #[test]
+    fn decode_ack_accepts_valid_raw_bool() {
+        let reply = true.encode();
+        assert!(decode_orderbook_deposit_ack(&reply));
+    }
+
+    #[test]
+    fn decode_ack_rejects_raw_bool_with_trailing_bytes() {
+        let mut reply = true.encode();
+        reply.push(0x01);
+        assert!(!decode_orderbook_deposit_ack(&reply));
+    }
+
+    #[test]
+    fn decode_ack_rejects_malformed_payload() {
+        let reply = vec![0xFF, 0xAA, 0x10];
+        assert!(!decode_orderbook_deposit_ack(&reply));
     }
 }

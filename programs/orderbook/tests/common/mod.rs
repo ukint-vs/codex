@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use clob_common::TokenId;
+use clob_common::{eth_to_actor, TokenId};
 use orderbook_client::{
     orderbook::*, Orderbook as OrderbookClient, OrderbookCtors, OrderbookProgram,
 };
@@ -96,11 +96,16 @@ pub async fn setup_programs(
 
     let env = GtestEnv::new(system, ADMIN_ID.into());
 
-    // Vault
+    // Vaults (per-token)
     let vault_code_id = env.system().submit_code_file(VAULT_WASM);
-    let vault_program = env
+    let base_vault_program = env
         .deploy::<vault_client::VaultProgram>(vault_code_id, b"salt".to_vec())
-        .create()
+        .create(eth_to_actor(BASE_TOKEN_ID))
+        .await
+        .unwrap();
+    let quote_vault_program = env
+        .deploy::<vault_client::VaultProgram>(vault_code_id, b"quote-salt".to_vec())
+        .create(eth_to_actor(QUOTE_TOKEN_ID))
         .await
         .unwrap();
 
@@ -109,7 +114,8 @@ pub async fn setup_programs(
     let orderbook_program = env
         .deploy::<orderbook_client::OrderbookProgram>(orderbook_code_id, b"salt".to_vec())
         .create(
-            vault_program.id(),
+            base_vault_program.id(),
+            quote_vault_program.id(),
             BASE_TOKEN_ID,
             QUOTE_TOKEN_ID,
             max_trades,
@@ -118,11 +124,17 @@ pub async fn setup_programs(
         .await
         .unwrap();
 
-    // Auth
-    let mut vault = vault_program.vault();
-    vault.add_market(orderbook_program.id()).await.unwrap();
+    // Auth in both vaults
+    let mut base_vault = base_vault_program.vault();
+    base_vault.add_market(orderbook_program.id()).await.unwrap();
+    let mut quote_vault = quote_vault_program.vault();
+    quote_vault
+        .add_market(orderbook_program.id())
+        .await
+        .unwrap();
 
-    (env, orderbook_program, vault_program)
+    // Return quote vault for tests that fund quote side.
+    (env, orderbook_program, quote_vault_program)
 }
 
 pub async fn setup_orderbook(
@@ -145,6 +157,7 @@ pub async fn setup_orderbook(
 
     env.deploy::<orderbook_client::OrderbookProgram>(program_code_id, b"salt".to_vec())
         .create(
+            vault(),
             vault(),
             BASE_TOKEN_ID,
             QUOTE_TOKEN_ID,

@@ -1,5 +1,5 @@
 constructor {
-  Create : (vault_id: actor_id, base_token_id: [u8, 20], quote_token_id: [u8, 20], max_trades: u32, max_preview_scans: u32);
+  Create : (base_vault_id: actor_id, quote_vault_id: actor_id, base_token_id: [u8, 20], quote_token_id: [u8, 20], max_trades: u32, max_preview_scans: u32);
 };
 
 service Orderbook {

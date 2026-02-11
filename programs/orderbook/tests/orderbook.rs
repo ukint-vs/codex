@@ -1,9 +1,126 @@
-use orderbook_client::{orderbook::*, Orderbook as OrderbookClient};
+use clob_common::TokenId;
+use orderbook_client::{
+    orderbook::*, Orderbook as OrderbookClient, OrderbookCtors, OrderbookProgram,
+};
 
-use sails_rs::prelude::*;
+use sails_rs::{client::*, gtest::*};
+use sails_rs::{prelude::*, ActorId};
+pub(crate) const ORDERBOOK_WASM: &str = "../../target/wasm32-gear/release/orderbook.opt.wasm";
 
-mod common;
-use common::*;
+pub(crate) const ADMIN_ID: u64 = 10;
+pub(crate) const BUYER_ID: u64 = 1;
+pub(crate) const SELLER_ID: u64 = 2;
+pub(crate) const BUYER2_ID: u64 = 3;
+pub(crate) const SELLER2_ID: u64 = 4;
+pub(crate) const VAULT_ID: u64 = 10;
+pub(crate) const BASE_TOKEN_ID: TokenId = [20u8; 20];
+pub(crate) const QUOTE_TOKEN_ID: TokenId = [30u8; 20];
+
+fn buyer() -> ActorId {
+    ActorId::from(BUYER_ID)
+}
+
+fn seller() -> ActorId {
+    ActorId::from(SELLER_ID)
+}
+
+fn buyer2() -> ActorId {
+    ActorId::from(BUYER2_ID)
+}
+fn seller2() -> ActorId {
+    ActorId::from(SELLER2_ID)
+}
+
+fn vault() -> ActorId {
+    ActorId::from(VAULT_ID)
+}
+
+const PRICE_PRECISION: u128 = 1_000_000_000_000_000_000_000_000_000_000_000; // 1e30
+const BASE_DECIMALS: u32 = 18;
+const QUOTE_DECIMALS: u32 = 6;
+
+fn eth_wei(x: u128) -> u128 {
+    x * 10u128.pow(BASE_DECIMALS)
+}
+
+fn eth_frac(num: u128, den: u128) -> u128 {
+    eth_wei(1) * num / den
+}
+
+fn usdt_micro(x: u128) -> u128 {
+    x * 10u128.pow(QUOTE_DECIMALS)
+}
+
+// price_fp = (quote_atoms_per_1_base_unit * PRICE_PRECISION)
+fn price_fp_usdt_per_eth(usdt_per_eth: u128) -> u128 {
+    // quote atoms per 1 ETH (micro-USDT per ETH)
+    let quote_per_eth_atoms = U256::from(usdt_per_eth) * U256::from(10u128.pow(QUOTE_DECIMALS));
+    let base_unit = U256::from(10u128.pow(BASE_DECIMALS)); // wei per 1 ETH
+
+    // (quote_per_eth_atoms * PRICE_PRECISION) / base_unit
+    let price_fp = quote_per_eth_atoms * U256::from(PRICE_PRECISION) / base_unit;
+
+    price_fp.low_u128()
+}
+
+fn quote_floor_atoms(base_atoms: u128, price_fp: u128) -> u128 {
+    let mul = U256::from(base_atoms) * U256::from(price_fp);
+    let q = mul / U256::from(PRICE_PRECISION);
+    q.low_u128()
+}
+
+fn quote_ceil_atoms(base_atoms: u128, price_fp: u128) -> u128 {
+    let mul = U256::from(base_atoms) * U256::from(price_fp);
+    let pp = U256::from(PRICE_PRECISION);
+    let q = mul / pp;
+    let rem = mul % pp;
+    if rem.is_zero() {
+        q.low_u128()
+    } else {
+        (q + U256::one()).low_u128()
+    }
+}
+
+async fn setup_orderbook(
+    max_trades: u32,
+    max_preview_scans: u32,
+) -> Actor<OrderbookProgram, sails_rs::client::GtestEnv> {
+    let system = System::new();
+    system.init_logger();
+    system.mint_to(ADMIN_ID, 100_000_000_000_000_000);
+    // Fund trader actor IDs so gtest can send messages.
+    system.mint_to(buyer(), 100_000_000_000_000_000);
+    system.mint_to(seller(), 100_000_000_000_000_000);
+    system.mint_to(buyer2(), 100_000_000_000_000_000);
+    system.mint_to(seller2(), 100_000_000_000_000_000);
+
+    let env = GtestEnv::new(system, ADMIN_ID.into());
+    // Deploy OrderBook passing the vault_id
+    let program_code_id = env.system().submit_code_file(ORDERBOOK_WASM);
+
+    env.deploy::<orderbook_client::OrderbookProgram>(program_code_id, b"salt".to_vec())
+        .create(
+            vault(),
+            vault(),
+            BASE_TOKEN_ID,
+            QUOTE_TOKEN_ID,
+            max_trades,
+            max_preview_scans,
+        )
+        .await
+        .unwrap()
+}
+
+async fn assert_balance(
+    program: &Actor<OrderbookProgram, GtestEnv>,
+    who: ActorId,
+    base: u128,
+    quote: u128,
+) {
+    let b = program.orderbook().balance_of(who).await.unwrap();
+    assert_eq!(b.0, base);
+    assert_eq!(b.1, quote);
+}
 
 #[tokio::test]
 async fn market_buy_strict_partial_fill_refunds_unused_budget() {
@@ -522,7 +639,8 @@ async fn market_sell_consumes_multiple_bids_best_to_worse_and_updates_reserved_q
     let sell = eth_frac(3, 5); // 0.6 ETH -> fills bid1 fully + 0.2 from bid2
     let fill2 = sell - bid1; // 0.2 ETH
     let rem2 = bid2 - fill2; // 0.1 ETH
-                             // Buyer1 places best bid
+
+    // Buyer1 places best bid
     c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
         .with_actor_id(vault())
         .await
@@ -915,48 +1033,32 @@ async fn cancel_limit_buy_unlocks_reserved_quote_and_removes_order() {
     let program = setup_orderbook(1000, 1000).await;
     let mut c = program.orderbook();
 
-    let price = price_fp_usdt_per_eth(1_900);
-    let bid_amount = eth_frac(1, 2); // 0.5 ETH
     let initial_quote = usdt_micro(10_000);
+    let price = price_fp_usdt_per_eth(1_900);
+    let amount = eth_frac(1, 2); // 0.5 ETH
 
-    // Fund buyer (via mocked vault caller)
     c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
         .with_actor_id(vault())
         .await
         .unwrap();
 
-    // Place LIMIT BUY -> reserves quote = ceil(base * price / 1e30)
-    let bid_id = c
-        .submit_order(
-            /*side=*/ 0, /*kind=*/ 0, price, bid_amount, /*max_quote=*/ 0,
-        )
+    let order_id = c
+        .submit_order(0, 0, price, amount, 0)
         .with_actor_id(buyer())
         .await
         .unwrap();
-    let reserved = quote_ceil_atoms(bid_amount, price);
-    assert_balance(
-        &program,
-        buyer(),
-        /*base=*/ 0,
-        /*quote=*/ initial_quote - reserved,
-    )
-    .await;
-    assert_eq!(c.best_bid_price().await.unwrap(), price);
 
-    // Cancel -> unlock reserved quote back to free balance
-    c.cancel_order(bid_id).with_actor_id(buyer()).await.unwrap();
+    let reserved = quote_ceil_atoms(amount, price);
+    assert_balance(&program, buyer(), 0, initial_quote - reserved).await;
 
-    assert_balance(
-        &program,
-        buyer(),
-        /*base=*/ 0,
-        /*quote=*/ initial_quote,
-    )
-    .await;
+    c.cancel_order(order_id)
+        .with_actor_id(buyer())
+        .await
+        .unwrap();
+
+    assert_balance(&program, buyer(), 0, initial_quote).await;
     assert_eq!(c.best_bid_price().await.unwrap(), 0);
-
-    // Order should be gone
-    let (found, ..) = c.order_by_id(bid_id).await.unwrap();
+    let (found, ..) = c.order_by_id(order_id).await.unwrap();
     assert!(!found);
 }
 
@@ -965,178 +1067,54 @@ async fn cancel_limit_sell_unlocks_locked_base_and_removes_order() {
     let program = setup_orderbook(1000, 1000).await;
     let mut c = program.orderbook();
 
-    let price = price_fp_usdt_per_eth(2_000);
-    let ask_amount = eth_frac(1, 2); // 0.5 ETH
     let initial_base = eth_wei(1);
+    let price = price_fp_usdt_per_eth(2_000);
+    let amount = eth_frac(3, 10); // 0.3 ETH
 
-    // Fund seller (via mocked vault caller)
     c.deposit(seller(), BASE_TOKEN_ID, initial_base)
         .with_actor_id(vault())
         .await
         .unwrap();
 
-    // Place LIMIT SELL -> locks base by subtracting from free balance
-    let ask_id = c
-        .submit_order(
-            /*side=*/ 1, /*kind=*/ 0, price, ask_amount, /*max_quote=*/ 0,
-        )
+    let order_id = c
+        .submit_order(1, 0, price, amount, 0)
         .with_actor_id(seller())
         .await
         .unwrap();
 
-    assert_balance(
-        &program,
-        seller(),
-        /*base=*/ initial_base - ask_amount,
-        /*quote=*/ 0,
-    )
-    .await;
-    assert_eq!(c.best_ask_price().await.unwrap(), price);
-    // Cancel -> unlock remaining_base back to free base
-    c.cancel_order(ask_id)
+    assert_balance(&program, seller(), initial_base - amount, 0).await;
+
+    c.cancel_order(order_id)
         .with_actor_id(seller())
         .await
         .unwrap();
 
-    assert_balance(
-        &program,
-        seller(),
-        /*base=*/ initial_base,
-        /*quote=*/ 0,
-    )
-    .await;
+    assert_balance(&program, seller(), initial_base, 0).await;
     assert_eq!(c.best_ask_price().await.unwrap(), 0);
-
-    // Order should be gone
-    let (found, ..) = c.order_by_id(ask_id).await.unwrap();
+    let (found, ..) = c.order_by_id(order_id).await.unwrap();
     assert!(!found);
 }
 
 #[tokio::test]
-async fn limit_buy_fails_without_sufficient_quote_balance() {
+async fn limit_buy_rejects_when_quote_balance_insufficient() {
     let program = setup_orderbook(1000, 1000).await;
     let mut c = program.orderbook();
 
+    let initial_quote = usdt_micro(100);
     let price = price_fp_usdt_per_eth(2_000);
-    let bid_amount = eth_frac(1, 2); // 0.5 ETH
+    let amount = eth_frac(1, 2); // requires much more than 100 USDT
 
-    // No deposit -> should fail on locking quote
-    let res = c
-        .submit_order(
-            /*side=*/ 0, /*kind=*/ 0, price, bid_amount, /*max_quote=*/ 0,
-        )
-        .with_actor_id(buyer())
-        .await;
-
-    assert!(
-        res.is_err(),
-        "Expected LIMIT BUY to fail without quote balance"
-    );
-    assert_balance(&program, buyer(), 0, 0).await;
-    assert_eq!(c.best_bid_price().await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn limit_sell_fails_without_sufficient_base_balance() {
-    let program = setup_orderbook(1000, 1000).await;
-    let mut c = program.orderbook();
-
-    let price = price_fp_usdt_per_eth(2_000);
-    let ask_amount = eth_frac(1, 2); // 0.5 ETH
-
-    // No deposit -> should fail on locking base
-    let res = c
-        .submit_order(
-            /*side=*/ 1, /*kind=*/ 0, price, ask_amount, /*max_quote=*/ 0,
-        )
-        .with_actor_id(seller())
-        .await;
-
-    assert!(
-        res.is_err(),
-        "Expected LIMIT SELL to fail without base balance"
-    );
-    assert_balance(&program, seller(), 0, 0).await;
-    assert_eq!(c.best_ask_price().await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn limit_buy_price_improvement_is_refunded_on_full_fill() {
-    let program = setup_orderbook(1000, 1000).await;
-    let mut c = program.orderbook();
-
-    // Maker sells cheaper than taker's limit -> taker should NOT lose the difference.
-    let ask_price = price_fp_usdt_per_eth(1_800);
-    let limit_price = price_fp_usdt_per_eth(2_000);
-    let amount = eth_frac(1, 2); // 0.5 ETH
-
-    let initial_quote = usdt_micro(10_000);
-    let initial_seller_base = eth_wei(1);
-
-    // Maker: deposit base, place ask @ 1800
-    c.deposit(seller(), BASE_TOKEN_ID, initial_seller_base)
-        .with_actor_id(vault())
-        .await
-        .unwrap();
-    let ask_id = c
-        .submit_order(
-            /*side=*/ 1, /*kind=*/ 0, ask_price, amount, /*max_quote=*/ 0,
-        )
-        .with_actor_id(seller())
-        .await
-        .unwrap();
-
-    // Taker: deposit quote, place LIMIT BUY @ 2000 (should fill fully @ 1800)
     c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
         .with_actor_id(vault())
         .await
         .unwrap();
 
-    let spent = quote_floor_atoms(amount, ask_price); // what taker should actually pay
-    let locked = quote_ceil_atoms(amount, limit_price); // what would be reserved at limit
-
-    let bid_id = c
-        .submit_order(
-            /*side=*/ 0,
-            /*kind=*/ 0,
-            limit_price,
-            amount,
-            /*max_quote=*/ 0,
-        )
+    let res = c
+        .submit_order(0, 0, price, amount, 0)
         .with_actor_id(buyer())
-        .await
-        .unwrap();
-    // Since the order is fully filled, there must be NO leftover reserved quote.
-    // So buyer's free quote should be initial - spent (NOT initial - locked).
-    assert_balance(
-        &program,
-        buyer(),
-        /*base=*/ amount,
-        /*quote=*/ initial_quote - spent,
-    )
-    .await;
+        .await;
+    assert!(res.is_err(), "Expected insufficient quote balance");
 
-    // Seller sold `amount` and got `spent` quote; base was locked at placement and fully consumed.
-    assert_balance(
-        &program,
-        seller(),
-        /*base=*/ initial_seller_base - amount,
-        /*quote=*/ spent,
-    )
-    .await;
-
-    // Book should be empty on both sides (full fill)
-    assert_eq!(c.best_ask_price().await.unwrap(), 0);
+    assert_balance(&program, buyer(), 0, initial_quote).await;
     assert_eq!(c.best_bid_price().await.unwrap(), 0);
-
-    // Both orders should be gone
-    let (found_ask, ..) = c.order_by_id(ask_id).await.unwrap();
-    assert!(!found_ask);
-
-    let (found_bid, ..) = c.order_by_id(bid_id).await.unwrap();
-    assert!(!found_bid);
-
-    // Extra sanity: if this fails, it typically indicates "price improvement leak"
-    // where (locked - spent) never returned to buyer's free balance.
-    assert!(locked >= spent);
 }

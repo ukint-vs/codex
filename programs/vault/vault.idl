@@ -1,62 +1,49 @@
 constructor {
-  Create : ();
+  Create : (token_id: actor_id);
 };
 
 service Vault {
   AddMarket : (program_id: actor_id) -> null;
-  ClaimFees : (token: [u8, 20]) -> null;
-  EthDeposit : (payload: vec u8) -> null;
-  EthWithdraw : (payload: vec u8) -> null;
-  SetEthVaultCaller : (program_id: actor_id) -> null;
-  TransferToMarket : (market_id: actor_id, token: [u8, 20], amount: u128) -> null;
+  ClaimFees : () -> null;
+  /// Debug/testing helper to mint balance without requiring market/admin routing.
+  /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
+  DebugDeposit : (user: actor_id, amount: u128) -> null;
+  /// Enable/disable debug minting helpers (intended for test environments).
+  SetDebugMode : (enabled: bool) -> null;
+  SetQuarantinePeriod : (period: u64) -> null;
+  TransferToMarket : (market_id: actor_id, amount: u128) -> null;
   UpdateFeeRate : (new_rate: u128) -> null;
-  VaultDeposit : (user: actor_id, token: [u8, 20], amount: u128) -> null;
-  VaultForceExit : (user: actor_id, token: [u8, 20], amount: u128) -> null;
-  VaultReserveFunds : (user: actor_id, token: [u8, 20], amount: u128) -> null;
-  VaultSettleTrade : (buyer: actor_id, seller: actor_id, base_token: [u8, 20], quote_token: [u8, 20], price: u128, quantity: u128, fee: u128, price_scale: u128) -> null;
-  VaultUnlockFunds : (user: actor_id, token: [u8, 20], amount: u128) -> null;
-  VaultWithdraw : (user: actor_id, token: [u8, 20], amount: u128) -> null;
+  VaultDeposit : (user: actor_id, amount: u128) -> null;
+  VaultForceExit : (user: actor_id, amount: u128) -> null;
+  VaultWithdraw : (user: actor_id, amount: u128) -> null;
   query Admin : () -> actor_id;
-  query EthVaultCaller : () -> actor_id;
-  query GetBalance : (user: actor_id, token: [u8, 20]) -> struct { u128, u128 };
-  query GetTreasury : (token: [u8, 20]) -> u128;
+  query DebugMode : () -> bool;
+  query GetBalance : (user: actor_id) -> struct { u128, u128 };
+  query GetTreasury : () -> u128;
   query IsAuthorized : (program_id: actor_id) -> bool;
 
   events {
     Deposit: struct {
-      user: [u8, 32],
+      user: [u8, 20],
       token: [u8, 20],
       amount: u128,
       balance_after: u128,
     };
     Withdrawal: struct {
-      user: [u8, 32],
+      user: [u8, 20],
       token: [u8, 20],
       amount: u128,
       status: str,
     };
-    FundsReserved: struct {
-      user: [u8, 32],
-      token: [u8, 20],
-      amount: u128,
-    };
-    FundsUnlocked: struct {
-      user: [u8, 32],
-      token: [u8, 20],
-      amount: u128,
-    };
-    TradeSettled: struct {
-      buyer: [u8, 32],
-      seller: [u8, 32],
-      base_token: [u8, 20],
-      quote_token: [u8, 20],
-      price: u128,
-      quantity: u128,
-      fee: u128,
-    };
     FeesClaimed: struct {
       token: [u8, 20],
       amount: u128,
+    };
+    QuarantineReleased: struct {
+      user: [u8, 20],
+      token: [u8, 20],
+      amount: u128,
+      balance_after: u128,
     };
   }
 };

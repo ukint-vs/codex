@@ -47,7 +47,8 @@ pub struct State {
     pub protocol_fee_quote: U256,
     pub base_token_id: TokenId,
     pub quote_token_id: TokenId,
-    pub vault_id: ActorId,
+    pub base_vault_id: ActorId,
+    pub quote_vault_id: ActorId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,7 +59,8 @@ pub enum Asset {
 
 impl State {
     pub fn new(
-        vault_id: ActorId,
+        base_vault_id: ActorId,
+        quote_vault_id: ActorId,
         base_token_id: TokenId,
         quote_token_id: TokenId,
         max_trades: u32,
@@ -75,7 +77,8 @@ impl State {
             protocol_fee_quote: U256::zero(),
             base_token_id,
             quote_token_id,
-            vault_id,
+            base_vault_id,
+            quote_vault_id,
         }
     }
 
