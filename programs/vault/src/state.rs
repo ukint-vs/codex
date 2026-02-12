@@ -44,6 +44,4 @@ pub struct VaultState {
     pub treasury: u128,
     /// Fee rate in BPS
     pub fee_rate_bps: u128,
-    /// Test-only style toggle for debug mint/deposit helpers.
-    pub debug_mode: bool,
 }

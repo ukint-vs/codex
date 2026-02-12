@@ -8,6 +8,9 @@ sails-rs = { workspace = true, features = ["ethexe", "debug"] }
 clob-common = { path = "../../libraries/clob-common" }
 alloy-sol-types = { workspace = true }
 
+[features]
+debug = []
+
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
 

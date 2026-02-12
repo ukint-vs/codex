@@ -79,7 +79,7 @@ impl VaultProgram {
     #[export]
     pub fn create(token_id: ActorId) -> Self {
         let state = VaultState {
-            admin: Some(sails_rs::gstd::msg::source()),
+            admin: Some(msg::source()),
             token: actor_to_eth(token_id),
             ..VaultState::default()
         };
@@ -193,17 +193,6 @@ impl<'a> VaultService<'a> {
         reply_ok();
     }
 
-    /// Enable/disable debug minting helpers (intended for test environments).
-    #[export]
-    pub fn set_debug_mode(&mut self, enabled: bool) {
-        let mut state = self.get_mut();
-        if state.admin != Some(msg::source()) {
-            panic!("Unauthorized: Not Admin");
-        }
-        state.debug_mode = enabled;
-        reply_ok();
-    }
-
     // Admin function to claim accumulated fees
     #[export]
     pub fn claim_fees(&mut self) {
@@ -262,19 +251,23 @@ impl<'a> VaultService<'a> {
     }
 
     /// Debug/testing helper to mint balance without requiring market/admin routing.
-    /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
+    /// Only available when compiled with the `debug` feature.
     #[export]
     pub fn debug_deposit(&mut self, user: ActorId, amount: u128) {
-        let state = self.get();
-        let caller = msg::source();
-        if !state.debug_mode {
-            panic!("DebugModeDisabled");
+        #[cfg(not(feature = "debug"))]
+        {
+            panic!("DebugFeatureDisabled");
         }
-        if state.admin != Some(caller) && caller != user {
-            panic!("UnauthorizedDebugDeposit");
+        #[cfg(feature = "debug")]
+        {
+            let state = self.get();
+            let caller = msg::source();
+            if state.admin != Some(caller) && caller != user {
+                panic!("UnauthorizedDebugDeposit");
+            }
+            drop(state);
+            self.vault_deposit_unchecked(user, amount);
         }
-        drop(state);
-        self.vault_deposit_unchecked(user, amount);
     }
 
     fn vault_deposit_unchecked(&mut self, user: ActorId, amount: u128) {
@@ -500,11 +493,6 @@ impl<'a> VaultService<'a> {
     #[export]
     pub fn get_treasury(&self) -> u128 {
         self.get().treasury
-    }
-
-    #[export]
-    pub fn debug_mode(&self) -> bool {
-        self.get().debug_mode
     }
 }
 

@@ -111,3 +111,31 @@ kill_port() {
     fi
     return 1
 }
+
+# Update or add environment variable in .env file
+# Usage: update_env_var <env_file> <var_name> <var_value>
+update_env_var() {
+    local env_file="$1"
+    local var_name="$2"
+    local var_value="$3"
+
+    # Create .env file if it doesn't exist
+    if [ ! -f "$env_file" ]; then
+        touch "$env_file"
+    fi
+
+    # Check if variable exists in file
+    if grep -q "^${var_name}=" "$env_file"; then
+        # Update existing variable (macOS/BSD compatible)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s|^${var_name}=.*|${var_name}=${var_value}|" "$env_file"
+        else
+            sed -i "s|^${var_name}=.*|${var_name}=${var_value}|" "$env_file"
+        fi
+        log_info "Updated ${var_name} in .env file"
+    else
+        # Append new variable
+        echo "${var_name}=${var_value}" >> "$env_file"
+        log_info "Added ${var_name} to .env file"
+    fi
+}
