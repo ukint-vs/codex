@@ -84,7 +84,7 @@ fn send_vault(system: &System, from: u64, vault_id: ActorId, method: &str, args:
     assert!(res.succeed.contains(&mid), "Vault call {} failed", method);
 }
 
-fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> (u128, u128) {
+fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> u128 {
     let payload = ("Vault", "GetBalance", (user,)).encode();
     let program = system
         .get_program(vault_id)
@@ -98,9 +98,9 @@ fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> (u128
         .find(|l| l.destination() == ADMIN_ID.into() && l.source() == vault_id)
         .expect("No reply log found");
 
-    match <(String, String, (u128, u128))>::decode(&mut log.payload()) {
-        Ok((_, _, (avail, locked))) => (avail, locked),
-        Err(_) => <(u128, u128)>::decode(&mut log.payload()).expect("Failed to decode balance"),
+    match <(String, String, u128)>::decode(&mut log.payload()) {
+        Ok((_, _, available)) => available,
+        Err(_) => <u128>::decode(&mut log.payload()).expect("Failed to decode balance"),
     }
 }
 
@@ -124,9 +124,8 @@ async fn transfer_to_market_moves_funds_out_of_vault() {
         (orderbook_id, 400u128),
     );
 
-    let (avail, locked) = get_vault_balance(system, quote_vault_id, buyer());
+    let avail = get_vault_balance(system, quote_vault_id, buyer());
     assert_eq!(avail, 600u128);
-    assert_eq!(locked, 0u128);
 }
 
 #[tokio::test]
@@ -160,7 +159,6 @@ async fn second_transfer_respects_reduced_available_balance() {
         "Expected insufficient balance failure"
     );
 
-    let (avail, locked) = get_vault_balance(system, quote_vault_id, buyer());
+    let avail = get_vault_balance(system, quote_vault_id, buyer());
     assert_eq!(avail, 300u128);
-    assert_eq!(locked, 0u128);
 }

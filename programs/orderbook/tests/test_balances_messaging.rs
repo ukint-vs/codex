@@ -118,7 +118,7 @@ fn send_vault_fail(system: &System, from: u64, vault_id: ActorId, method: &str, 
 }
 
 // Helper to query vault balance
-fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> (u128, u128) {
+fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> u128 {
     let payload = ("Vault", "GetBalance", (user,)).encode();
     let program = system
         .get_program(vault_id)
@@ -135,14 +135,12 @@ fn get_vault_balance(system: &System, vault_id: ActorId, user: ActorId) -> (u128
         .expect("No reply log found");
 
     // Try to decode with Service/Method wrapper first
-    if let Ok((_, _, (avail, reserved))) =
-        <(String, String, (u128, u128))>::decode(&mut log.payload())
-    {
-        return (avail, reserved);
+    if let Ok((_, _, available)) = <(String, String, u128)>::decode(&mut log.payload()) {
+        return available;
     }
 
     // Try raw
-    <(u128, u128)>::decode(&mut log.payload()).unwrap_or_else(|_| {
+    <u128>::decode(&mut log.payload()).unwrap_or_else(|_| {
         println!(
             "Failed to decode payload: {:?} (Hex: {})",
             log.payload(),
@@ -239,7 +237,7 @@ async fn test_full_cycle_consistency() {
     );
 
     // Check balances
-    let (v_avail, _) = get_vault_balance(system, quote_vault_id, buyer());
+    let v_avail = get_vault_balance(system, quote_vault_id, buyer());
     let (ob_base, ob_quote) = orderbook_buyer.balance_of(buyer()).await.unwrap();
     assert_eq!(v_avail, 600);
     assert_eq!(ob_base, 0);
@@ -249,7 +247,7 @@ async fn test_full_cycle_consistency() {
     orderbook_buyer.withdraw_quote(150u128).await.unwrap();
 
     // Check balances
-    let (v_avail_after, _) = get_vault_balance(system, quote_vault_id, buyer());
+    let v_avail_after = get_vault_balance(system, quote_vault_id, buyer());
     let (ob_base_after, ob_quote_after) = orderbook_buyer.balance_of(buyer()).await.unwrap();
     assert_eq!(v_avail_after, 750);
     assert_eq!(ob_base_after, 0);
@@ -292,18 +290,17 @@ async fn test_transfer_to_market_rolls_back_when_market_does_not_reply() {
     );
 
     // Async reply handling can land in later blocks; wait until rollback is observed.
-    let mut final_bal = (0u128, 0u128);
+    let mut final_avail = 0u128;
     for _ in 0..20 {
         system.run_next_block();
-        final_bal = get_vault_balance(system, quote_vault_id, buyer());
-        if final_bal == (1000u128, 0u128) {
+        final_avail = get_vault_balance(system, quote_vault_id, buyer());
+        if final_avail == 1000u128 {
             break;
         }
     }
 
     assert_eq!(
-        final_bal,
-        (1000u128, 0u128),
-        "Expected rollback to restore available funds and clear locked funds"
+        final_avail, 1000u128,
+        "Expected rollback to restore available funds"
     );
 }

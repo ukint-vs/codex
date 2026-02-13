@@ -46,9 +46,8 @@ async fn test_deposit_and_get_balance() {
         .await
         .unwrap();
 
-    let (avail, locked) = service_client.get_balance(actor(USER_1)).await.unwrap();
+    let avail = service_client.get_balance(actor(USER_1)).await.unwrap();
     assert_eq!(avail, 1000);
-    assert_eq!(locked, 0);
 }
 
 #[tokio::test]
@@ -72,9 +71,8 @@ async fn test_withdraw_reduces_balance() {
         .await
         .unwrap();
 
-    let (avail, locked) = service_client.get_balance(actor(USER_1)).await.unwrap();
+    let avail = service_client.get_balance(actor(USER_1)).await.unwrap();
     assert_eq!(avail, 800);
-    assert_eq!(locked, 0);
 }
 
 #[tokio::test]
@@ -101,7 +99,7 @@ async fn test_force_exit_sync() {
         .unwrap();
 
     // Verify: Gear balance decreased
-    let (avail, _) = service_client.get_balance(actor(USER_1)).await.unwrap();
+    let avail = service_client.get_balance(actor(USER_1)).await.unwrap();
     assert_eq!(avail, 500);
 }
 
@@ -145,9 +143,8 @@ async fn test_insufficient_withdraw_funds() {
         "Expected withdraw to fail with insufficient funds"
     );
 
-    let (avail, locked) = service_client.get_balance(actor(USER_1)).await.unwrap();
+    let avail = service_client.get_balance(actor(USER_1)).await.unwrap();
     assert_eq!(avail, 500);
-    assert_eq!(locked, 0);
 }
 
 #[tokio::test]
@@ -177,7 +174,6 @@ async fn test_transfer_to_market_requires_registered_market() {
         "Expected transfer_to_market to fail for unregistered market"
     );
 
-    let (avail, locked) = service_client.get_balance(actor(USER_1)).await.unwrap();
+    let avail = service_client.get_balance(actor(USER_1)).await.unwrap();
     assert_eq!(avail, 1000);
-    assert_eq!(locked, 0);
 }

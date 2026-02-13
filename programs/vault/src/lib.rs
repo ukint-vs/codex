@@ -50,16 +50,6 @@ fn actor_addr(actor: ActorId) -> [u8; 20] {
     actor_to_eth(actor)
 }
 
-fn locked_balance_of(state: &VaultState, user: ActorId) -> u128 {
-    let in_transit = state
-        .locked_in_transit
-        .iter()
-        .filter(|((u, _), _)| *u == user)
-        .try_fold(0u128, |acc, (_, amount)| acc.checked_add(*amount))
-        .expect("MathOverflow");
-    in_transit
-}
-
 fn decode_orderbook_deposit_ack(reply: &[u8]) -> bool {
     let mut wrapped = reply;
     if let Ok((service, method, ack)) = <(String, String, bool)>::decode(&mut wrapped) {
@@ -380,11 +370,6 @@ impl<'a> VaultService<'a> {
             }
 
             *balance = balance.checked_sub(amount).expect("MathOverflow");
-            let in_transit = state
-                .locked_in_transit
-                .entry((user, market_id))
-                .or_insert(0);
-            *in_transit = in_transit.checked_add(amount).expect("MathOverflow");
             state.token
         };
 
@@ -406,32 +391,9 @@ impl<'a> VaultService<'a> {
             let balance = state.balances.get_mut(&user).expect("UserNotFound");
             *balance = balance.checked_add(amount).expect("MathOverflow");
 
-            let key = (user, market_id);
-            let in_transit = state
-                .locked_in_transit
-                .get_mut(&key)
-                .expect("TransitMissing");
-            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
-            if *in_transit == 0 {
-                state.locked_in_transit.remove(&key);
-            }
-
             debug!("OrderbookDepositFailed");
             reply_ok();
             return;
-        }
-
-        {
-            let mut state = self.get_mut();
-            let key = (user, market_id);
-            let in_transit = state
-                .locked_in_transit
-                .get_mut(&key)
-                .expect("TransitMissing");
-            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
-            if *in_transit == 0 {
-                state.locked_in_transit.remove(&key);
-            }
         }
 
         reply_ok();
@@ -483,11 +445,9 @@ impl<'a> VaultService<'a> {
     }
 
     #[export]
-    pub fn get_balance(&self, user: ActorId) -> (u128, u128) {
+    pub fn get_balance(&self, user: ActorId) -> u128 {
         let state = self.get();
-        let available = state.balances.get(&user).copied().unwrap_or(0);
-        let locked = locked_balance_of(&state, user);
-        (available, locked)
+        state.balances.get(&user).copied().unwrap_or(0)
     }
 
     #[export]

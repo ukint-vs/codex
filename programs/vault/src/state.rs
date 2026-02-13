@@ -30,8 +30,6 @@ pub struct VaultState {
     pub balances: BTreeMap<ActorId, u128>,
     /// Deposits waiting for quarantine period
     pub quarantined_deposits: Vec<QuarantinedDeposit>,
-    /// Funds currently moving between Vault and Orderbook
-    pub locked_in_transit: BTreeMap<(ActorId, ActorId), u128>,
     /// Authorized Orderbook programs
     pub registered_orderbooks: BTreeSet<ActorId>,
     /// Pending withdrawal requests

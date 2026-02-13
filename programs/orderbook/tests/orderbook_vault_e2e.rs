@@ -31,6 +31,6 @@ async fn e2e_withdraw_quote_goes_back_to_vault() {
 
     assert_balance(&orderbook_program, buyer(), 0, usdt_micro(9_000)).await;
 
-    let (avail, _reserved) = vault.get_balance(buyer()).await.unwrap();
+    let avail = vault.get_balance(buyer()).await.unwrap();
     assert_eq!(avail, usdt_micro(1_000));
 }

@@ -15,7 +15,7 @@ service Vault {
   VaultForceExit : (user: actor_id, amount: u128) -> null;
   VaultWithdraw : (user: actor_id, amount: u128) -> null;
   query Admin : () -> actor_id;
-  query GetBalance : (user: actor_id) -> struct { u128, u128 };
+  query GetBalance : (user: actor_id) -> u128;
   query GetTreasury : () -> u128;
   query IsAuthorized : (program_id: actor_id) -> bool;
 
@@ -44,4 +44,3 @@ service Vault {
     };
   }
 };
-
