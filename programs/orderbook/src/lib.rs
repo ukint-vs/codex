@@ -193,6 +193,62 @@ impl<'a> Orderbook<'a> {
             o.reserved_quote.low_u128(),
         )
     }
+
+    #[export]
+    pub fn orders(&self, offset: u32, count: u32) -> Vec<(u64, ActorId, u16, u128, u128, u128)> {
+        let state = self.get();
+
+        state
+            .book
+            .orders(offset, count)
+            .into_iter()
+            .map(|order| {
+                let side_io: u16 = match order.side {
+                    Side::Buy => 0,
+                    Side::Sell => 1,
+                };
+
+                (
+                    order.id,
+                    order.owner,
+                    side_io,
+                    order.price.low_u128(),
+                    order.remaining_base.low_u128(),
+                    order.reserved_quote.low_u128(),
+                )
+            })
+            .collect()
+    }
+
+    #[export]
+    pub fn orders_reverse(
+        &self,
+        offset: u32,
+        count: u32,
+    ) -> Vec<(u64, ActorId, u16, u128, u128, u128)> {
+        let state = self.get();
+
+        state
+            .book
+            .orders_reverse(offset, count)
+            .into_iter()
+            .map(|order| {
+                let side_io: u16 = match order.side {
+                    Side::Buy => 0,
+                    Side::Sell => 1,
+                };
+
+                (
+                    order.id,
+                    order.owner,
+                    side_io,
+                    order.price.low_u128(),
+                    order.remaining_base.low_u128(),
+                    order.reserved_quote.low_u128(),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]

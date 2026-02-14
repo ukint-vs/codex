@@ -97,22 +97,22 @@ impl OrderBook {
         Some(node.value)
     }
 
-    pub fn orders(&self, offset: usize, count: usize) -> Vec<MakerView> {
+    pub fn orders(&self, offset: u32, count: u32) -> Vec<MakerView> {
         self.collect(offset, count, self.by_id.values().copied())
     }
 
-    pub fn orders_reverse(&self, offset: usize, count: usize) -> Vec<MakerView> {
+    pub fn orders_reverse(&self, offset: u32, count: u32) -> Vec<MakerView> {
         self.collect(offset, count, self.by_id.values().rev().copied())
     }
 
     fn collect(
         &self,
-        offset: usize,
-        count: usize,
+        offset: u32,
+        count: u32,
         iter: impl Iterator<Item = Index>,
     ) -> Vec<MakerView> {
-        iter.skip(offset)
-            .take(count)
+        iter.skip(offset as _)
+            .take(count as _)
             .map(|index| self.arena.get(index).map(|node| node.value))
             .flatten()
             .collect::<Vec<_>>()
