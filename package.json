@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "showcase": "tsx scripts/showcase/main.ts"
+    "showcase": "tsx scripts/showcase/main.ts",
+    "demo:ui": "tsx scripts/demo-ui/server.ts"
   },
   "keywords": [],
   "author": "",

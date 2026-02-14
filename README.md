@@ -61,6 +61,26 @@ If `releaseFunds` reverts on Ethereum (e.g., daily limit reached), Gear balances
 - **Solidity:** `forge test`
 - **Gear Programs:** `cargo test -p vault-app`
 
+## Demo UI
+- Start the live dashboard: `pnpm demo:ui`
+- Open in browser: `http://127.0.0.1:4180`
+- Source: live reads from configured orderbook/vault contracts via `@vara-eth/api`
+- CEX-style features:
+  - Aggregated bid/ask ladder (click a level to prefill limit form)
+  - Limit order entry (`Place Limit`)
+  - Market order entry (`Send Market`)
+  - `Take` on a resting order id
+  - Live trade tape + execution price chart with `Ticks`/`Candles` modes
+- `Recent Orders` shows resting/open orders only. Executions appear in `Trade Tape`.
+
+Optional env:
+- `DEMO_UI_PORT` (default: `4180`)
+- `DEMO_UI_REFRESH_MS` (default: `1500`)
+- `DEMO_UI_SCAN_MAX_ORDER_ID` (default: `450`)
+- `DEMO_UI_ORDERS_PER_MARKET` (default: `20`)
+- `DEMO_UI_DEPTH_LEVELS` (default: `20`)
+- `DEMO_UI_OPEN_ORDERS_SCAN_COUNT` (default: `220`)
+
 ## Deployment (Hoodi Testnet)
 
 The system is deployed on the Hoodi Testnet (Ethereum-compatible) and linked to the Vara Testnet.

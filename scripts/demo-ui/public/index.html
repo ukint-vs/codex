@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gear CLOB Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow bg-glow-a"></div>
+    <div class="bg-glow bg-glow-b"></div>
+
+    <main class="layout">
+      <header class="header">
+        <div class="eyebrow">Live Contract Data</div>
+        <h1>Gear CLOB Demo Board</h1>
+        <p class="sub">
+          Real orderbook reads via Vara API. Refreshes automatically.
+        </p>
+        <div id="meta" class="meta"></div>
+      </header>
+
+      <section id="warnings"></section>
+      <section id="market-tabs" class="market-tabs"></section>
+      <section id="markets" class="markets"></section>
+    </main>
+
+    <template id="market-card-template">
+      <article class="card">
+        <div class="card-head">
+          <h2></h2>
+          <span class="chip"></span>
+        </div>
+        <div class="market-addresses"></div>
+        <div class="stats"></div>
+        <div class="cex-grid">
+          <section class="ladder-panel">
+            <div class="ladder-head">
+              <h3>Orderbook</h3>
+              <span class="muted">click a level to prefill</span>
+            </div>
+            <div class="ladder-columns">
+              <div>
+                <h4 class="ask-title">Asks</h4>
+                <div class="table-wrap compact">
+                  <table class="asks-table">
+                    <thead>
+                      <tr>
+                        <th>Price</th>
+                        <th>Size</th>
+                        <th>Total</th>
+                      </tr>
+                    </thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h4 class="bid-title">Bids</h4>
+                <div class="table-wrap compact">
+                  <table class="bids-table">
+                    <thead>
+                      <tr>
+                        <th>Price</th>
+                        <th>Size</th>
+                        <th>Total</th>
+                      </tr>
+                    </thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="order-entry-panel">
+            <h3>Order Entry</h3>
+            <form class="limit-form">
+              <label>
+                Side
+                <select name="side">
+                  <option value="buy">Buy Limit</option>
+                  <option value="sell">Sell Limit</option>
+                </select>
+              </label>
+              <label>
+                Price
+                <input type="number" name="priceQuotePerBase" min="0.000001" step="0.000001" />
+              </label>
+              <label>
+                Amount (base)
+                <input type="number" name="amountBase" min="1" step="1" value="5" />
+              </label>
+              <button type="submit">Place Limit</button>
+            </form>
+
+            <div class="trade-panel">
+              <h3>Quick Market</h3>
+              <form class="trade-form">
+                <label>
+                  Side
+                  <select name="side">
+                    <option value="buy">Buy</option>
+                    <option value="sell">Sell</option>
+                  </select>
+                </label>
+                <label>
+                  Amount (base)
+                  <input type="number" name="amountBase" min="1" step="1" value="5" />
+                </label>
+                <label>
+                  Max quote (buy only)
+                  <input type="number" name="maxQuote" min="1" step="1" value="15" />
+                </label>
+                <button type="submit">Send Market</button>
+              </form>
+              <div class="trade-status muted"></div>
+            </div>
+          </section>
+        </div>
+        <div class="chart-wrap">
+          <div class="chart-head">
+            <h3>Live Price Chart</h3>
+            <div class="chart-controls">
+              <button type="button" class="mini-btn active" data-chart-mode="tick">Ticks</button>
+              <button type="button" class="mini-btn" data-chart-mode="candle">Candles</button>
+            </div>
+          </div>
+          <div class="price-chart" data-price-chart></div>
+          <div class="legend">
+            <span><i class="dot trade"></i> execution price</span>
+            <span class="muted" data-exec-chart-range></span>
+          </div>
+        </div>
+        <div class="tables">
+          <div>
+            <h3>Recent Orders</h3>
+            <div class="table-wrap">
+              <table class="orders-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Side</th>
+                    <th>Price</th>
+                    <th>Remain Base</th>
+                    <th>Owner</th>
+                    <th>Take</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>Trade Tape</h3>
+            <div class="table-wrap">
+              <table class="actions-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Side</th>
+                    <th>Type</th>
+                    <th>Details</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
