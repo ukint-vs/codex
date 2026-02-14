@@ -5,6 +5,7 @@ constructor {
 service Orderbook {
   CancelOrder : (order_id: u64) -> null;
   Deposit : (account: actor_id, token: [u8, 20], amount: u128) -> bool;
+  PopulateDemoOrders : (seed: u64, levels: u16, orders_per_level: u16, mid_price: u128, tick_bps: u16, min_amount_base: u128, max_amount_base: u128) -> struct { u32, u32, u64, u64 };
   /// Submits an order and immediately matches against the book.
   /// Limit remainder is placed as resting order inside the book.
   SubmitOrder : (side: u16, kind: u16, limit_price: u128, amount_base: u128, max_quote: u128) -> u64;

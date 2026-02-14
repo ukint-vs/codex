@@ -1,12 +1,19 @@
 #![no_std]
 use clob_common::TokenId;
-use matching_engine::{Book, IncomingOrder, MatchError, OrderId, Side};
+use matching_engine::{Book, IncomingOrder, MatchError, OrderId, OrderKind, Side};
 use sails_rs::{cell::RefCell, gstd::msg, prelude::*};
 
 use crate::state::{kind_from_io, side_from_io, Asset, OrderKindIO, SideIO};
 use vault_client::vault::io as vault_io;
 mod orderbook;
 mod state;
+
+#[cfg(feature = "debug")]
+const DEMO_MAX_TOTAL_ORDERS: u32 = 2_000;
+#[cfg(feature = "debug")]
+const BPS_SCALE: u32 = 10_000;
+#[cfg(feature = "debug")]
+const DEMO_SEED_FALLBACK: u64 = 0x9E37_79B9_7F4A_7C15;
 
 pub struct Orderbook<'a> {
     state: &'a RefCell<state::State>,
@@ -25,6 +32,101 @@ impl<'a> Orderbook<'a> {
     #[inline]
     pub fn get(&self) -> sails_rs::cell::Ref<'_, state::State> {
         self.state.borrow()
+    }
+
+    fn submit_order_for_owner(
+        st: &mut state::State,
+        owner: ActorId,
+        side: Side,
+        kind: OrderKind,
+        limit_price: u128,
+        amount_base: u128,
+        max_quote: u128,
+    ) -> Result<OrderId, MatchError> {
+        let order_id = st.alloc_order_id();
+        let incoming = IncomingOrder {
+            id: order_id,
+            owner,
+            side,
+            kind,
+            limit_price: U256::from(limit_price),
+            amount_base: U256::from(amount_base),
+            max_quote: U256::from(max_quote),
+        };
+
+        let (locked_base, locked_quote) = st.lock_taker_funds(&incoming);
+        let limits = st.limits;
+        let report = matching_engine::execute(&mut st.book, &incoming, limits)?;
+        st.settle_execution(&incoming, &report, locked_base, locked_quote);
+        Ok(order_id)
+    }
+
+    #[cfg(feature = "debug")]
+    fn next_rng_u64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        if x == 0 {
+            x = DEMO_SEED_FALLBACK;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[cfg(feature = "debug")]
+    fn next_rng_u128(state: &mut u64) -> u128 {
+        (u128::from(Self::next_rng_u64(state)) << 64) | u128::from(Self::next_rng_u64(state))
+    }
+
+    #[cfg(feature = "debug")]
+    fn seeded_actor(seed: u64, side: Side, level: u16, index: u16) -> ActorId {
+        let side_salt = match side {
+            Side::Buy => 0xA5A5_5A5A_F0F0_0F0F,
+            Side::Sell => 0x5A5A_A5A5_0F0F_F0F0,
+        };
+
+        let mut s = seed
+            ^ side_salt
+            ^ (u64::from(level) << 16)
+            ^ (u64::from(index) << 40)
+            ^ 0xD1B5_4A32_C9E8_761F;
+        if s == 0 {
+            s = DEMO_SEED_FALLBACK;
+        }
+
+        let mut out = [0u8; 32];
+        for chunk in out.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&Self::next_rng_u64(&mut s).to_le_bytes());
+        }
+        ActorId::from(out)
+    }
+
+    #[cfg(feature = "debug")]
+    fn seeded_amount(state: &mut u64, min_amount_base: u128, max_amount_base: u128) -> u128 {
+        let span = max_amount_base
+            .checked_sub(min_amount_base)
+            .and_then(|x| x.checked_add(1))
+            .expect("InvalidAmountRange");
+
+        let rnd = Self::next_rng_u128(state) % span;
+        min_amount_base + rnd
+    }
+
+    #[cfg(feature = "debug")]
+    fn level_prices(mid_price: u128, tick_bps: u16, level: u16) -> (u128, u128) {
+        let offset = u32::from(tick_bps)
+            .checked_mul(u32::from(level))
+            .expect("TickOverflow");
+
+        let ask_factor = BPS_SCALE.checked_add(offset).expect("TickOverflow");
+        let bid_factor = BPS_SCALE.checked_sub(offset).expect("TickTooWide");
+
+        let mid = U256::from(mid_price);
+        let ask = (mid * U256::from(ask_factor)) / U256::from(BPS_SCALE);
+        let bid = (mid * U256::from(bid_factor)) / U256::from(BPS_SCALE);
+
+        (bid.low_u128(), ask.low_u128())
     }
 }
 
@@ -101,22 +203,147 @@ impl<'a> Orderbook<'a> {
     ) -> Result<OrderId, MatchError> {
         let caller = sails_rs::gstd::msg::source();
         let mut st = self.get_mut();
-        let order_id = st.alloc_order_id();
+        Orderbook::submit_order_for_owner(
+            &mut st,
+            caller,
+            side_from_io(side),
+            kind_from_io(kind),
+            limit_price,
+            amount_base,
+            max_quote,
+        )
+    }
 
-        let incoming = IncomingOrder {
-            id: order_id,
-            owner: caller,
-            side: side_from_io(side),
-            kind: kind_from_io(kind),
-            limit_price: U256::from(limit_price),
-            amount_base: U256::from(amount_base),
-            max_quote: U256::from(max_quote),
-        };
-        let (locked_base, locked_quote) = st.lock_taker_funds(&incoming);
-        let limits = st.limits;
-        let report = matching_engine::execute(&mut st.book, &incoming, limits)?;
-        st.settle_execution(&incoming, &report, locked_base, locked_quote);
-        Ok(order_id)
+    #[export]
+    pub fn populate_demo_orders(
+        &mut self,
+        seed: u64,
+        levels: u16,
+        orders_per_level: u16,
+        mid_price: u128,
+        tick_bps: u16,
+        min_amount_base: u128,
+        max_amount_base: u128,
+    ) -> (u32, u32, u64, u64) {
+        #[cfg(not(feature = "debug"))]
+        {
+            let _ = (
+                seed,
+                levels,
+                orders_per_level,
+                mid_price,
+                tick_bps,
+                min_amount_base,
+                max_amount_base,
+            );
+            panic!("DebugFeatureDisabled");
+        }
+
+        #[cfg(feature = "debug")]
+        {
+            if levels == 0 || orders_per_level == 0 {
+                panic!("InvalidPopulateShape");
+            }
+            if mid_price == 0 || tick_bps == 0 {
+                panic!("InvalidPopulatePricing");
+            }
+            if min_amount_base == 0 || min_amount_base > max_amount_base {
+                panic!("InvalidPopulateAmountRange");
+            }
+
+            let per_side = u32::from(levels)
+                .checked_mul(u32::from(orders_per_level))
+                .expect("TooManyOrders");
+            let total = per_side.checked_mul(2).expect("TooManyOrders");
+            if total > DEMO_MAX_TOTAL_ORDERS {
+                panic!("TooManyOrders");
+            }
+
+            let caller = msg::source();
+            {
+                let st = self.get();
+                if st.admin != Some(caller) {
+                    panic!("UnauthorizedPopulateDemo");
+                }
+                if st.book.best_price(Side::Buy).is_some()
+                    || st.book.best_price(Side::Sell).is_some()
+                {
+                    panic!("MarketNotEmpty");
+                }
+            }
+
+            let mut rng_state = if seed == 0 { DEMO_SEED_FALLBACK } else { seed };
+            let mut bids_inserted = 0u32;
+            let mut asks_inserted = 0u32;
+            let mut first_order_id = 0u64;
+            let mut last_order_id = 0u64;
+
+            for level in 1..=levels {
+                let (bid_price, ask_price) = Orderbook::level_prices(mid_price, tick_bps, level);
+                if bid_price == 0 || ask_price == 0 || ask_price <= bid_price {
+                    panic!("InvalidPopulatePriceLevel");
+                }
+
+                for i in 0..orders_per_level {
+                    let owner = Orderbook::seeded_actor(seed, Side::Sell, level, i);
+                    let amount_base =
+                        Orderbook::seeded_amount(&mut rng_state, min_amount_base, max_amount_base);
+
+                    let mut st = self.get_mut();
+                    st.deposit(owner, Asset::Base, U256::from(amount_base));
+                    let order_id = Orderbook::submit_order_for_owner(
+                        &mut st,
+                        owner,
+                        Side::Sell,
+                        OrderKind::Limit,
+                        ask_price,
+                        amount_base,
+                        0,
+                    )
+                    .expect("PopulateOrderFailed");
+                    drop(st);
+
+                    if first_order_id == 0 {
+                        first_order_id = order_id;
+                    }
+                    last_order_id = order_id;
+                    asks_inserted = asks_inserted.saturating_add(1);
+                }
+
+                for i in 0..orders_per_level {
+                    let owner = Orderbook::seeded_actor(seed, Side::Buy, level, i);
+                    let amount_base =
+                        Orderbook::seeded_amount(&mut rng_state, min_amount_base, max_amount_base);
+                    let quote_to_lock = matching_engine::calc_quote_ceil(
+                        U256::from(amount_base),
+                        U256::from(bid_price),
+                    )
+                    .expect("PopulateMathError");
+
+                    let mut st = self.get_mut();
+                    st.deposit(owner, Asset::Quote, quote_to_lock);
+                    let order_id = Orderbook::submit_order_for_owner(
+                        &mut st,
+                        owner,
+                        Side::Buy,
+                        OrderKind::Limit,
+                        bid_price,
+                        amount_base,
+                        0,
+                    )
+                    .expect("PopulateOrderFailed");
+                    drop(st);
+
+                    if first_order_id == 0 {
+                        first_order_id = order_id;
+                    }
+                    last_order_id = order_id;
+                    bids_inserted = bids_inserted.saturating_add(1);
+                }
+            }
+
+            (bids_inserted, asks_inserted, first_order_id, last_order_id)
+        }
     }
 
     #[export]
@@ -212,6 +439,7 @@ impl OrderBookProgram {
     ) -> Self {
         Self {
             state: RefCell::new(state::State::new(
+                msg::source(),
                 base_vault_id,
                 quote_vault_id,
                 base_token_id,

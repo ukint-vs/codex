@@ -10,6 +10,9 @@ vault-client = { path = "../vault/client" }
 intrusive_arena = { path = "../../libraries/intrusive_arena" }
 matching_engine = { path = "../../libraries/matching_engine" }
 
+[features]
+debug = []
+
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
 

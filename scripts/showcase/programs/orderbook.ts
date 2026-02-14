@@ -8,7 +8,6 @@ import { Address, hexToBytes, PublicClient } from "viem";
 
 import type { Codec } from "../codec.js";
 import { BaseProgram } from "./base.js";
-import { config } from "../config.js";
 import { logger } from "../logger.js";
 import { addressToActorId } from "./util.js";
 
@@ -23,6 +22,7 @@ const SERVICE = "Orderbook";
 
 enum MessageMethod {
   SubmitOrder = "SubmitOrder",
+  PopulateDemoOrders = "PopulateDemoOrders",
   CancelOrder = "CancelOrder",
   WithdrawBase = "WithdrawBase",
   WithdrawQuote = "WithdrawQuote",
@@ -45,12 +45,13 @@ export class Orderbook extends BaseProgram {
     codec: Codec,
     varaEthApi: VaraEthApi,
     pc: PublicClient,
+    address: Address,
     private baseDecimals: number,
     private quoteDecimals: number,
   ) {
     super(codec, varaEthApi, pc);
     this.client = getMirrorClient({
-      address: config.contracts.orderbook,
+      address,
       publicClient: pc,
     });
   }
@@ -83,6 +84,70 @@ export class Orderbook extends BaseProgram {
     const state = await this.readState(payload);
 
     return [BigInt(state[0]), BigInt(state[1])];
+  }
+
+  async populateDemoOrders(args: {
+    seed: bigint;
+    levels: number;
+    ordersPerLevel: number;
+    midPrice: bigint;
+    tickBps: number;
+    minAmountBase: bigint;
+    maxAmountBase: bigint;
+  }): Promise<{
+    bidsInserted: number;
+    asksInserted: number;
+    firstOrderId: bigint;
+    lastOrderId: bigint;
+  }> {
+    const payload = this.codec.encodeMessageFn(SERVICE, MessageMethod.PopulateDemoOrders, [
+      args.seed,
+      args.levels,
+      args.ordersPerLevel,
+      args.midPrice,
+      args.tickBps,
+      args.minAmountBase,
+      args.maxAmountBase,
+    ]);
+
+    const txData: IInjectedTransaction = {
+      payload,
+      destination: this.client.address,
+    };
+
+    const tx = await this.varaEthApi.createInjectedTransaction(txData);
+    const start = Date.now();
+
+    logger.info("Sending Populate Demo Orders message", {
+      messageId: tx.messageId,
+      seed: args.seed.toString(),
+      levels: args.levels,
+      ordersPerLevel: args.ordersPerLevel,
+    });
+
+    await tx.sign(this.signer);
+    const promise = await tx.sendAndWaitForPromise();
+    const promiseReceivedTime = Date.now();
+
+    if (promise.code.startsWith("0x01")) {
+      const errorData = new TextDecoder().decode(hexToBytes(promise.payload));
+      logger.error("Failed to populate demo orders", {
+        messageId: tx.messageId,
+        duration: `${(promiseReceivedTime - start) / 1000}s`,
+        data: errorData,
+      });
+      throw new Error(`Failed to populate demo orders: ${errorData}`);
+    }
+
+    const [bidsInserted, asksInserted, firstOrderId, lastOrderId] =
+      this.codec.decodeMsgReply(promise.payload);
+
+    return {
+      bidsInserted: Number(bidsInserted),
+      asksInserted: Number(asksInserted),
+      firstOrderId: BigInt(firstOrderId),
+      lastOrderId: BigInt(lastOrderId),
+    };
   }
 
   private async waitUntilOrderFulfilled(
@@ -235,13 +300,14 @@ export class Orderbook extends BaseProgram {
     const promiseReceivedTime = Date.now();
 
     if (promise.code.startsWith("0x01")) {
+      const errorData = new TextDecoder().decode(hexToBytes(promise.payload));
       logger.error(`Failed to place ${orderDescription}`, {
         id,
         messageId: tx.messageId,
         duration: `${(promiseReceivedTime - start) / 1000}s`,
-        data: new TextDecoder().decode(hexToBytes(promise.payload)),
+        data: errorData,
       });
-      throw new Error(`Failed to place ${orderDescription}`);
+      throw new Error(`Failed to place ${orderDescription}: ${errorData}`);
     } else {
       const orderId = BigInt(this.codec.decodeMsgReply(promise.payload));
       logger.info(`Promise received for ${orderDescription}`, {
@@ -269,6 +335,7 @@ export class Orderbook extends BaseProgram {
   async placeBuyMarketOrder(
     amountBase: number,
     maxQuoteAmount: number,
+    waitForFulfillment: boolean = true,
   ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
     const _maxQuote = BigInt(maxQuoteAmount) * BigInt(10 ** this.quoteDecimals);
@@ -280,10 +347,14 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       _maxQuote,
       "Buy Market Order",
+      waitForFulfillment,
     );
   }
 
-  async placeSellMarketOrder(amountBase: number): Promise<bigint> {
+  async placeSellMarketOrder(
+    amountBase: number,
+    waitForFulfillment: boolean = true,
+  ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
 
     return this.submitOrder(
@@ -293,12 +364,14 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       BigInt(0),
       "Sell Market Order",
+      waitForFulfillment,
     );
   }
 
   async placeBuyLimitOrder(
     amountBase: number,
     priceInQuotePerBase: number,
+    waitForFulfillment: boolean = true,
   ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
     const limitPrice = this.calculateLimitPrice(priceInQuotePerBase);
@@ -310,12 +383,14 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       BigInt(0),
       "Buy Limit Order",
+      waitForFulfillment,
     );
   }
 
   async placeSellLimitOrder(
     amountBase: number,
     priceInQuotePerBase: number,
+    waitForFulfillment: boolean = true,
   ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
     const limitPrice = this.calculateLimitPrice(priceInQuotePerBase);
@@ -327,6 +402,7 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       BigInt(0),
       "Sell Limit Order",
+      waitForFulfillment,
     );
   }
 
@@ -367,6 +443,7 @@ export class Orderbook extends BaseProgram {
   async placeBuyImmediateOrCancelOrder(
     amountBase: number,
     priceInQuotePerBase: number,
+    waitForFulfillment: boolean = true,
   ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
     const limitPrice = this.calculateLimitPrice(priceInQuotePerBase);
@@ -378,12 +455,14 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       BigInt(0),
       "Buy ImmediateOrCancel Order",
+      waitForFulfillment,
     );
   }
 
   async placeSellImmediateOrCancelOrder(
     amountBase: number,
     priceInQuotePerBase: number,
+    waitForFulfillment: boolean = true,
   ): Promise<bigint> {
     const _amountBase = BigInt(amountBase) * BigInt(10 ** this.baseDecimals);
     const limitPrice = this.calculateLimitPrice(priceInQuotePerBase);
@@ -395,6 +474,7 @@ export class Orderbook extends BaseProgram {
       _amountBase,
       BigInt(0),
       "Sell ImmediateOrCancel Order",
+      waitForFulfillment,
     );
   }
 

@@ -40,6 +40,7 @@ pub struct AccountBalances {
 
 #[derive(Default, Debug)]
 pub struct State {
+    pub admin: Option<ActorId>,
     pub next_order_id: OrderId,
     pub limits: EngineLimits,
     pub book: OrderBook,
@@ -59,6 +60,7 @@ pub enum Asset {
 
 impl State {
     pub fn new(
+        admin: ActorId,
         base_vault_id: ActorId,
         quote_vault_id: ActorId,
         base_token_id: TokenId,
@@ -67,6 +69,7 @@ impl State {
         max_preview_scans: u32,
     ) -> Self {
         Self {
+            admin: Some(admin),
             next_order_id: 1,
             limits: EngineLimits {
                 max_trades,

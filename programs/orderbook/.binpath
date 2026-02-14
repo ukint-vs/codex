@@ -1,1 +1,1 @@
-../../target/wasm32-gear/debug/orderbook
+../../target/wasm32-gear/release/orderbook

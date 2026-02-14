@@ -41,7 +41,7 @@ export class Vault extends BaseProgram {
     });
   }
 
-  async getBalance(address: Address): Promise<[bigint, bigint]> {
+  async getBalance(address: Address): Promise<bigint> {
     const addr = addressToActorId(address);
 
     logger.info(`Getting balance for address`, { addr });
@@ -51,9 +51,9 @@ export class Vault extends BaseProgram {
 
     const state = await this.readState(payload);
 
-    logger.info(`Balance retrieved`, { value: state[0] });
+    logger.info(`Balance retrieved`, { value: state });
 
-    return [BigInt(state[0]), BigInt(state[1])];
+    return BigInt(state);
   }
 
   async queryAdmin(): Promise<Address> {

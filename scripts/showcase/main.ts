@@ -3,15 +3,17 @@ import {
   Address,
   createPublicClient,
   createWalletClient,
+  formatUnits,
+  toHex,
   webSocket,
 } from "viem";
 import {
-  EthereumClient,
   ISigner,
   VaraEthApi,
   WsVaraEthProvider,
+  getRouterClient,
 } from "@vara-eth/api";
-import { walletClientToSigner } from "@vara-eth/api/signer";
+import { privateKeyToAccount } from "viem/accounts";
 
 import {
   accountsBaseTokensFunded,
@@ -20,55 +22,259 @@ import {
 } from "./accounts.js";
 import { initCodec, orderbookCodec, vaultCodec } from "./codec.js";
 import { Orderbook, Vault } from "./programs/index.js";
+import { actorIdToAddress } from "./programs/util.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 
-const TARGET_BALANCE = BigInt(1000 * 1e6);
-const BASE_PRICE = 1.0; // base price in quote tokens per base token
+const TARGET_BALANCE = BigInt(1_000 * 1e6);
+const BASE_PRICE = 1.0;
+const MARKETS_DEFAULT_SEED = 1_000n;
 
-// Randomization helpers
-const randInt = (min: number, max: number) =>
-  Math.floor(Math.random() * (max - min + 1)) + min;
-const randFloat = (min: number, max: number) =>
-  Math.round((Math.random() * (max - min) + min) * 100) / 100;
-const shuffle = <T>(arr: T[]): T[] =>
-  arr
-    .map((v) => ({ v, sort: Math.random() }))
-    .sort((a, b) => a.sort - b.sort)
-    .map(({ v }) => v);
+const POPULATE_LEVELS = 10;
+const POPULATE_ORDERS_PER_LEVEL = 10;
+const POPULATE_TICK_BPS = 50;
+const POPULATE_MIN_BASE = BigInt(2 * 1e6);
+const POPULATE_MAX_BASE = BigInt(20 * 1e6);
+
+const TRANSFER_PER_MARKET = 200;
+const MARKET_TAKER_AMOUNT = 25;
+const MARKET_TAKER_MAX_QUOTE = 150;
+
+const SETTLE_TIMEOUT_MS = 60_000;
+const LOCAL_VALIDATOR_FALLBACK =
+  "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
+const TOKEN_DECIMALS = 6;
+
+const formatToken = (amount: bigint, decimals: number = TOKEN_DECIMALS): string =>
+  `${formatUnits(amount, decimals)} (${amount.toString()} atoms)`;
+
+type DemoParticipant = {
+  role: string;
+  address: Address;
+  derivationPath: string;
+  privateKey: string;
+};
+
+type TakerExecution = {
+  label: string;
+  address: Address;
+  status: "fulfilled" | "timed_out" | "failed";
+  orderId?: string;
+  reason?: string;
+};
+
+type MarketSummaryRow = {
+  market: number;
+  orderbook: Address;
+  baseVault: Address;
+  quoteVault: Address;
+  baseTokenId: string;
+  seed: string;
+  bidsSeeded: number;
+  asksSeeded: number;
+  firstOrderId: string;
+  lastOrderId: string;
+  bestBidBefore: string;
+  bestAskBefore: string;
+  bestBidAfter: string;
+  bestAskAfter: string;
+  takersFulfilled: number;
+  takersTimedOut: number;
+  takersFailed: number;
+  buyerAddress: Address;
+  sellerAddress: Address;
+  buyerBaseBefore: string;
+  buyerQuoteBefore: string;
+  buyerBaseAfter: string;
+  buyerQuoteAfter: string;
+  sellerBaseBefore: string;
+  sellerQuoteBefore: string;
+  sellerBaseAfter: string;
+  sellerQuoteAfter: string;
+  takerExecutions: TakerExecution[];
+};
+
+const timeout = (ms: number) =>
+  new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("timeout")), ms),
+  );
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([promise, timeout(ms)]);
+}
+
+class CompatEthereumClient {
+  public router: Pick<ReturnType<typeof getRouterClient>, "validators">;
+  private routerClient: ReturnType<typeof getRouterClient>;
+  private fallbackValidators: Address[];
+  private signerRef?: ISigner;
+  private chainId = 31337;
+
+  constructor(
+    private publicClient: ReturnType<typeof createPublicClient>,
+    routerAddress: Address,
+    fallbackValidators: Address[],
+    signer?: ISigner,
+  ) {
+    this.signerRef = signer;
+    this.routerClient = getRouterClient({
+      address: routerAddress,
+      signer,
+      publicClient,
+    });
+    this.fallbackValidators = fallbackValidators.map(
+      (address) => address.toLowerCase() as Address,
+    );
+    this.router = {
+      validators: async () => {
+        try {
+          return await this.routerClient.validators();
+        } catch (error) {
+          if (this.fallbackValidators.length === 0) {
+            throw error;
+          }
+
+          logger.warn(
+            "router.validators() unavailable; using fallback validator list",
+            {
+              error: String(error),
+              fallbackValidators: this.fallbackValidators,
+            },
+          );
+          return this.fallbackValidators;
+        }
+      },
+    };
+  }
+
+  async waitForInitialization() {
+    this.chainId = await this.publicClient.getChainId();
+    return true;
+  }
+
+  setSigner(signer: ISigner) {
+    this.signerRef = signer;
+    this.routerClient.setSigner(signer);
+    return this;
+  }
+
+  get signer(): ISigner {
+    if (!this.signerRef) {
+      throw new Error("Signer not set");
+    }
+    return this.signerRef;
+  }
+
+  async getBlockNumber() {
+    return Number(await this.publicClient.getBlockNumber());
+  }
+
+  getBlock(blockNumber: number) {
+    return this.publicClient.getBlock({ blockNumber: BigInt(blockNumber) });
+  }
+
+  async getLatestBlockTimestamp() {
+    const block = await this.publicClient.getBlock({ blockTag: "latest" });
+    return Number(block.timestamp);
+  }
+
+  get blockDuration() {
+    if (this.chainId === 31337) return 1;
+    if (this.chainId === 1 || this.chainId === 560048) return 12;
+    return 1;
+  }
+}
 
 async function main() {
   await initCodec();
   await initAccounts(20);
 
-  const ethTransport = webSocket("ws://127.0.0.1:8545");
+  const ethTransport = webSocket(config.transports.ethereumWs);
 
   const publicClient = createPublicClient({
     transport: ethTransport,
   });
 
-  const ethClient = new EthereumClient(publicClient, config.contracts.router);
+  const fallbackValidators =
+    config.contracts.validators.length > 0
+      ? config.contracts.validators
+      : [LOCAL_VALIDATOR_FALLBACK];
+
+  const ethClient = new CompatEthereumClient(
+    publicClient,
+    config.contracts.router,
+    fallbackValidators,
+  );
+  await ethClient.waitForInitialization();
 
   const varaEthApi = new VaraEthApi(
-    new WsVaraEthProvider("ws://127.0.0.1:9944"),
-    ethClient,
+    new WsVaraEthProvider(config.transports.varaEthWsRpc),
+    ethClient as any,
   );
 
-  const orderbook = new Orderbook(
-    orderbookCodec,
-    varaEthApi,
-    publicClient,
-    6,
-    6,
-  );
+  const makeSigner = (account: Account): ISigner => {
+    const wc = createWalletClient({ account, transport: ethTransport });
+    const signerAccount = wc.account ?? account;
 
-  const baseVault = new Vault(
-    vaultCodec,
-    varaEthApi,
-    publicClient,
-    config.contracts.baseTokenVault,
-    6,
+    return {
+      getAddress: async () => signerAccount.address,
+      signMessage: async (message: Uint8Array | string) => {
+        if (typeof message === "string") {
+          if (message.startsWith("0x")) {
+            return wc.signMessage({
+              account: signerAccount,
+              message: { raw: message as `0x${string}` },
+            });
+          }
+          return wc.signMessage({
+            account: signerAccount,
+            message,
+          });
+        }
+
+        return wc.signMessage({
+          account: signerAccount,
+          message: { raw: message },
+        });
+      },
+    };
+  };
+
+  const fallbackAdminAccount = privateKeyToAccount(
+    config.accounts.privateKey as `0x${string}`,
   );
+  const fallbackAdminSigner = makeSigner(fallbackAdminAccount);
+
+  const allAccounts = [
+    ...accountsBaseTokensFunded.values(),
+    ...accountsQuoteTokensFunded.values(),
+  ];
+
+  const privateKeyForAccount = (account: Account): string => {
+    const hdKeyGetter = (account as { getHdKey?: () => { privateKey: Uint8Array } }).getHdKey;
+    if (!hdKeyGetter) return "(private key unavailable)";
+    return toHex(hdKeyGetter().privateKey);
+  };
+
+  const signerByAddress = new Map<string, ISigner>();
+
+  const getSignerForAddress = (address: Address): ISigner => {
+    const key = address.toLowerCase();
+    const cached = signerByAddress.get(key);
+    if (cached) return cached;
+
+    const account = allAccounts.find(
+      (candidate) => candidate.address.toLowerCase() === key,
+    );
+
+    const signer = account ? makeSigner(account) : fallbackAdminSigner;
+    signerByAddress.set(key, signer);
+    if (!account) {
+      logger.warn("Using PRIVATE_KEY signer fallback for address", { address });
+    }
+    return signer;
+  };
+
   const quoteVault = new Vault(
     vaultCodec,
     varaEthApi,
@@ -77,199 +283,420 @@ async function main() {
     6,
   );
 
-  // Helper: create a signer from an account
-  const makeSigner = (account: Account): ISigner => {
-    const wc = createWalletClient({ account, transport: ethTransport });
-    return walletClientToSigner(wc);
+  const resolveAdminSigner = async (vault: Vault): Promise<ISigner> => {
+    const adminActorId = await vault.queryAdmin();
+    const adminAddress = actorIdToAddress(adminActorId);
+    logger.info("Resolved admin signer", { adminActorId, adminAddress });
+    return getSignerForAddress(adminAddress);
   };
 
-  await baseVault.queryAdmin();
-  await quoteVault.queryAdmin();
+  const marketContexts = config.contracts.markets.map((market, index) => ({
+    index,
+    orderbook: new Orderbook(
+      orderbookCodec,
+      varaEthApi,
+      publicClient,
+      market.orderbook,
+      6,
+      6,
+    ),
+    baseVault: new Vault(vaultCodec, varaEthApi, publicClient, market.baseTokenVault, 6),
+    orderbookAddress: market.orderbook,
+    baseVaultAddress: market.baseTokenVault,
+    baseTokenId: market.baseTokenId,
+    adminSigner: fallbackAdminSigner,
+  }));
 
-  // ── Step 1: Fund accounts ──────────────────────────────────────────────
-  logger.info("Step 1: Funding accounts in vaults");
+  logger.info("Markets detected", {
+    count: marketContexts.length,
+    orderbooks: marketContexts.map((m) => m.orderbookAddress),
+  });
+
+  // Step 1: fund vault balances.
+  logger.info("Step 1: Funding account balances in vaults");
 
   const fundAccounts = async (
     accounts: Map<Address, Account>,
     vault: Vault,
+    adminSigner: ISigner,
   ) => {
     for (const [address, account] of accounts.entries()) {
       const signer = makeSigner(account);
-      const [available] = await vault.withSigner(signer).getBalance(address);
-
+      const available = await vault.withSigner(signer).getBalance(address);
       if (available < TARGET_BALANCE) {
-        await vault.vaultDeposit(address, TARGET_BALANCE - available);
+        await vault
+          .withSigner(adminSigner)
+          .vaultDeposit(address, TARGET_BALANCE - available);
       }
     }
   };
 
-  await fundAccounts(accountsBaseTokensFunded, baseVault);
-  await fundAccounts(accountsQuoteTokensFunded, quoteVault);
-
-  // ── Step 2: Transfer to market ─────────────────────────────────────────
-  logger.info("Step 2: Transferring funds from vaults to orderbook market");
-
-  const transferToMarket = async (
-    accounts: Map<Address, Account>,
+  const authorizeMarket = async (
     vault: Vault,
+    adminSigner: ISigner,
+    marketAddress: Address,
+    label: string,
   ) => {
-    for (const [address, account] of accounts.entries()) {
-      const signer = makeSigner(account);
-      const amount = randInt(200, 800); // random 200–800 tokens
-      await vault
-        .withSigner(signer)
-        .transferToMarket(config.contracts.orderbook, amount);
-      logger.info("Transferred to market", { address, amount });
-    }
+    await vault.withSigner(adminSigner).addMarket(marketAddress);
+    logger.info("Market authorized in vault", {
+      label,
+      marketAddress,
+    });
   };
 
-  await transferToMarket(accountsBaseTokensFunded, baseVault);
-  await transferToMarket(accountsQuoteTokensFunded, quoteVault);
+  const quoteAdminSigner = await resolveAdminSigner(quoteVault);
 
-  // ── Step 3: Place orders ───────────────────────────────────────────────
-  logger.info("Step 3: Placing orders on the orderbook");
-
-  // Pick a random subset of sellers and buyers to participate
-  const allSellers = shuffle([...accountsBaseTokensFunded.entries()]);
-  const allBuyers = shuffle([...accountsQuoteTokensFunded.entries()]);
-
-  const activeSellers = allSellers.slice(0, randInt(3, allSellers.length));
-  const activeBuyers = allBuyers.slice(0, randInt(3, allBuyers.length));
-
-  logger.info("Active participants", {
-    sellers: activeSellers.length,
-    buyers: activeBuyers.length,
-  });
-
-  const orderPromises: Promise<bigint>[] = [];
-  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-  // Sellers place sell limit orders at randomized prices above BASE_PRICE
-  for (const [address, account] of activeSellers) {
-    const signer = makeSigner(account);
-    const price = randFloat(BASE_PRICE + 0.01, BASE_PRICE + 0.15);
-    const amount = randInt(10, 100);
-
-    logger.info("Placing sell limit order", { address, price, amount });
-    orderPromises.push(
-      orderbook.withSigner(signer).placeSellLimitOrder(amount, price),
-    );
-    await delay(100);
+  for (const market of marketContexts) {
+    market.adminSigner = await resolveAdminSigner(market.baseVault);
+    await fundAccounts(accountsBaseTokensFunded, market.baseVault, market.adminSigner);
   }
 
-  // Buyers place buy limit orders at randomized prices below BASE_PRICE
-  for (const [address, account] of activeBuyers) {
-    const signer = makeSigner(account);
-    const price = randFloat(BASE_PRICE - 0.15, BASE_PRICE - 0.01);
-    const amount = randInt(10, 100);
+  await fundAccounts(accountsQuoteTokensFunded, quoteVault, quoteAdminSigner);
 
-    logger.info("Placing buy limit order", { address, price, amount });
-    orderPromises.push(
-      orderbook.withSigner(signer).placeBuyLimitOrder(amount, price),
+  for (const market of marketContexts) {
+    await authorizeMarket(
+      market.baseVault,
+      market.adminSigner,
+      market.orderbookAddress,
+      `base-${market.index}`,
     );
-    await delay(100);
+    await authorizeMarket(
+      quoteVault,
+      quoteAdminSigner,
+      market.orderbookAddress,
+      `quote-${market.index}`,
+    );
   }
 
-  // Place crossing market orders to trigger matches
-  {
-    const [address, account] = activeSellers[0];
-    const signer = makeSigner(account);
-    const amount = randInt(5, 30);
-    logger.info("Placing sell market order to trigger matches", {
+  const baseParticipants = [...accountsBaseTokensFunded.entries()]
+    .map(([address, account], index) => ({
       address,
-      amount,
-    });
-    orderPromises.push(
-      orderbook.withSigner(signer).placeSellMarketOrder(amount),
-    );
-    await delay(100);
-  }
-
-  {
-    const [address, account] = activeBuyers[0];
-    const signer = makeSigner(account);
-    const amount = randInt(5, 30);
-    const maxQuote = amount * 2; // generous slippage
-    logger.info("Placing buy market order to trigger matches", {
+      account,
+      derivationPath: `m/44'/60'/0'/0/${index * 2}`,
+      role: `base-maker-${index}`,
+      privateKey: privateKeyForAccount(account),
+    }))
+    .slice(0, 4);
+  const quoteParticipants = [...accountsQuoteTokensFunded.entries()]
+    .map(([address, account], index) => ({
       address,
-      amount,
+      account,
+      derivationPath: `m/44'/60'/0'/0/${index * 2 + 1}`,
+      role: `quote-maker-${index}`,
+      privateKey: privateKeyForAccount(account),
+    }))
+    .slice(0, 4);
+
+  const participantSummary: DemoParticipant[] = [
+    ...baseParticipants.map((participant) => ({
+      role: participant.role,
+      address: participant.address,
+      derivationPath: participant.derivationPath,
+      privateKey: participant.privateKey,
+    })),
+    ...quoteParticipants.map((participant) => ({
+      role: participant.role,
+      address: participant.address,
+      derivationPath: participant.derivationPath,
+      privateKey: participant.privateKey,
+    })),
+  ];
+
+  // Step 2+: run each market: transfer funds, seed depth, submit takers.
+  const perMarketSummary: MarketSummaryRow[] = [];
+
+  for (const market of marketContexts) {
+    logger.info("Preparing market", {
+      market: market.index,
+      orderbook: market.orderbookAddress,
+      baseVault: market.baseVaultAddress,
+      baseTokenId: market.baseTokenId,
     });
-    orderPromises.push(
-      orderbook.withSigner(signer).placeBuyMarketOrder(amount, maxQuote),
+
+    for (const { address, account } of baseParticipants) {
+      await market
+        .baseVault
+        .withSigner(makeSigner(account))
+        .transferToMarket(market.orderbookAddress, TRANSFER_PER_MARKET);
+      logger.info("Base transferred to market", { market: market.index, address });
+    }
+
+    for (const { address, account } of quoteParticipants) {
+      await quoteVault
+        .withSigner(makeSigner(account))
+        .transferToMarket(market.orderbookAddress, TRANSFER_PER_MARKET);
+      logger.info("Quote transferred to market", { market: market.index, address });
+    }
+
+    const bestBidPreSeed = BigInt(await market.orderbook.bestBidPrice());
+    const bestAskPreSeed = BigInt(await market.orderbook.bestAskPrice());
+    const marketAlreadySeeded = bestBidPreSeed > 0n || bestAskPreSeed > 0n;
+
+    let seedResult: {
+      bidsInserted: number;
+      asksInserted: number;
+      firstOrderId: bigint;
+      lastOrderId: bigint;
+    } = {
+      bidsInserted: 0,
+      asksInserted: 0,
+      firstOrderId: 0n,
+      lastOrderId: 0n,
+    };
+
+    if (marketAlreadySeeded) {
+      logger.warn("Market already has depth, skipping Populate Demo Orders", {
+        market: market.index,
+        orderbook: market.orderbookAddress,
+        bestBid: bestBidPreSeed.toString(),
+        bestAsk: bestAskPreSeed.toString(),
+      });
+    } else {
+      const midPrice = market.orderbook.calculateLimitPrice(BASE_PRICE);
+      seedResult = await market
+        .orderbook
+        .withSigner(market.adminSigner)
+        .populateDemoOrders({
+          seed: MARKETS_DEFAULT_SEED + BigInt(market.index),
+          levels: POPULATE_LEVELS,
+          ordersPerLevel: POPULATE_ORDERS_PER_LEVEL,
+          midPrice,
+          tickBps: POPULATE_TICK_BPS,
+          minAmountBase: POPULATE_MIN_BASE,
+          maxAmountBase: POPULATE_MAX_BASE,
+        });
+    }
+
+    const bestBidBefore = BigInt(await market.orderbook.bestBidPrice());
+    const bestAskBefore = BigInt(await market.orderbook.bestAskPrice());
+
+    const buyer = quoteParticipants[0];
+    const seller = baseParticipants[0];
+    const sellerBackup = baseParticipants[1];
+    if (!buyer || !seller || !sellerBackup) {
+      throw new Error("Not enough demo participants configured");
+    }
+
+    const buyerAddress = buyer.address;
+    const sellerAddress = seller.address;
+
+    const [buyerBaseBefore, buyerQuoteBefore] = await market.orderbook.balanceOf(
+      buyerAddress,
     );
-  }
-
-  // Wait for all orders with a timeout
-  const SETTLE_TIMEOUT_MS = 60_000;
-  logger.info(
-    `Waiting for all orders to settle (timeout: ${SETTLE_TIMEOUT_MS / 1000}s)...`,
-  );
-
-  const timeout = (ms: number) =>
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("timeout")), ms),
+    const [sellerBaseBefore, sellerQuoteBefore] = await market.orderbook.balanceOf(
+      sellerAddress,
     );
 
-  const results = await Promise.allSettled(
-    orderPromises.map((p) => Promise.race([p, timeout(SETTLE_TIMEOUT_MS)])),
-  );
+    const maxQuoteUnitsFromBalance = Number(
+      buyerQuoteBefore / BigInt(10 ** TOKEN_DECIMALS),
+    );
+    const buyMaxQuoteUnits = Math.min(MARKET_TAKER_MAX_QUOTE, maxQuoteUnitsFromBalance);
 
-  const fulfilled = results.filter((r) => r.status === "fulfilled");
-  const timedOut = results.filter(
-    (r) => r.status === "rejected" && r.reason?.message === "timeout",
-  );
-  const failed = results.filter(
-    (r) => r.status === "rejected" && r.reason?.message !== "timeout",
-  );
+    const takerRequests: Array<{
+      label: string;
+      address: Address;
+      submit: () => Promise<bigint>;
+    }> = [
+      {
+        label: "sell-market-1",
+        address: sellerAddress,
+        submit: () =>
+          market
+            .orderbook
+            .withSigner(makeSigner(seller.account))
+            .placeSellMarketOrder(MARKET_TAKER_AMOUNT),
+      },
+    ];
 
-  // ── Summary ────────────────────────────────────────────────────────────
-  console.log("\n" + "=".repeat(72));
-  console.log("  ORDER SUMMARY");
-  console.log("=".repeat(72));
-  console.log(`  Total orders:     ${results.length}`);
-  console.log(`  Fulfilled:        ${fulfilled.length}`);
-  console.log(`  Timed out:        ${timedOut.length}`);
-  console.log(`  Failed:           ${failed.length}`);
+    if (buyMaxQuoteUnits > 0) {
+      takerRequests.push({
+        label: "buy-market-1",
+        address: buyerAddress,
+        submit: () =>
+          market
+            .orderbook
+            .withSigner(makeSigner(buyer.account))
+            .placeBuyMarketOrder(MARKET_TAKER_AMOUNT, buyMaxQuoteUnits),
+      });
+    } else {
+      logger.warn("Skipping buy taker due to zero quote balance in market", {
+        market: market.index,
+        buyer: buyerAddress,
+      });
+      takerRequests.push({
+        label: "sell-market-2-fallback",
+        address: sellerBackup.address,
+        submit: () =>
+          market
+            .orderbook
+            .withSigner(makeSigner(sellerBackup.account))
+            .placeSellMarketOrder(MARKET_TAKER_AMOUNT),
+      });
+    }
 
-  if (failed.length > 0) {
-    console.log("\n  Failures:");
-    for (const r of failed) {
-      if (r.status === "rejected") {
-        console.log(`    - ${r.reason?.message ?? r.reason}`);
+    const takerExecutions: TakerExecution[] = [];
+    for (const request of takerRequests) {
+      try {
+        const orderId = await withTimeout(request.submit(), SETTLE_TIMEOUT_MS);
+        takerExecutions.push({
+          label: request.label,
+          address: request.address,
+          status: "fulfilled",
+          orderId: orderId.toString(),
+        });
+      } catch (error) {
+        const reason = (error as Error)?.message ?? String(error);
+        takerExecutions.push({
+          label: request.label,
+          address: request.address,
+          status: reason === "timeout" ? "timed_out" : "failed",
+          reason,
+        });
       }
     }
+
+    const takersFulfilled = takerExecutions.filter(
+      (x) => x.status === "fulfilled",
+    ).length;
+    const takersTimedOut = takerExecutions.filter(
+      (x) => x.status === "timed_out",
+    ).length;
+    const takersFailed = takerExecutions.filter(
+      (x) => x.status === "failed",
+    ).length;
+
+    const bestBidAfter = BigInt(await market.orderbook.bestBidPrice());
+    const bestAskAfter = BigInt(await market.orderbook.bestAskPrice());
+    const [buyerBaseAfter, buyerQuoteAfter] = await market.orderbook.balanceOf(
+      buyerAddress,
+    );
+    const [sellerBaseAfter, sellerQuoteAfter] = await market.orderbook.balanceOf(
+      sellerAddress,
+    );
+
+    logger.info("Market execution summary", {
+      market: market.index,
+      bidsSeeded: seedResult.bidsInserted,
+      asksSeeded: seedResult.asksInserted,
+      firstOrderId: seedResult.firstOrderId.toString(),
+      lastOrderId: seedResult.lastOrderId.toString(),
+      bestBidBefore: bestBidBefore.toString(),
+      bestAskBefore: bestAskBefore.toString(),
+      bestBidAfter: bestBidAfter.toString(),
+      bestAskAfter: bestAskAfter.toString(),
+      takersFulfilled,
+      takersTimedOut,
+      takersFailed,
+      buyer: buyerAddress,
+      seller: sellerAddress,
+      takerExecutions,
+    });
+
+    perMarketSummary.push({
+      market: market.index,
+      orderbook: market.orderbookAddress,
+      baseVault: market.baseVaultAddress,
+      quoteVault: config.contracts.quoteTokenVault,
+      baseTokenId: market.baseTokenId,
+      seed: (MARKETS_DEFAULT_SEED + BigInt(market.index)).toString(),
+      bidsSeeded: seedResult.bidsInserted,
+      asksSeeded: seedResult.asksInserted,
+      firstOrderId: seedResult.firstOrderId.toString(),
+      lastOrderId: seedResult.lastOrderId.toString(),
+      bestBidBefore: bestBidBefore.toString(),
+      bestAskBefore: bestAskBefore.toString(),
+      bestBidAfter: bestBidAfter.toString(),
+      bestAskAfter: bestAskAfter.toString(),
+      takersFulfilled,
+      takersTimedOut,
+      takersFailed,
+      buyerAddress,
+      sellerAddress,
+      buyerBaseBefore: buyerBaseBefore.toString(),
+      buyerQuoteBefore: buyerQuoteBefore.toString(),
+      buyerBaseAfter: buyerBaseAfter.toString(),
+      buyerQuoteAfter: buyerQuoteAfter.toString(),
+      sellerBaseBefore: sellerBaseBefore.toString(),
+      sellerQuoteBefore: sellerQuoteBefore.toString(),
+      sellerBaseAfter: sellerBaseAfter.toString(),
+      sellerQuoteAfter: sellerQuoteAfter.toString(),
+      takerExecutions,
+    });
   }
 
-  console.log("\n" + "-".repeat(72));
-  console.log("  ORDERBOOK STATE");
-  console.log("-".repeat(72));
-
-  const bestAsk = await orderbook.bestAskPrice();
-  const bestBid = await orderbook.bestBidPrice();
-  console.log(`  Best bid:         ${bestBid?.toString() ?? "none"}`);
-  console.log(`  Best ask:         ${bestAsk?.toString() ?? "none"}`);
-
-  console.log("\n" + "-".repeat(72));
-  console.log("  SELLER BALANCES (on orderbook)");
-  console.log("-".repeat(72));
-  for (const [address] of accountsBaseTokensFunded.entries()) {
-    const [base, quote] = await orderbook.balanceOf(address);
+  console.log("\n" + "=".repeat(88));
+  console.log("  MULTI-MARKET SHOWCASE SUMMARY");
+  console.log("=".repeat(88));
+  console.log("\n  Access");
+  console.log(
+    `    Admin fallback signer (PRIVATE_KEY): ${fallbackAdminAccount.address} | ${config.accounts.privateKey}`,
+  );
+  console.log("    Funded participants are derived from mnemonic:");
+  console.log(`      ${config.accounts.mnemonicForAccountDerivation}`);
+  console.log("\n  Accounts Used (funding + takers)");
+  for (const participant of participantSummary) {
     console.log(
-      `  ${address}  base=${base.toString().padStart(12)}  quote=${quote.toString().padStart(12)}`,
+      `    ${participant.role} | ${participant.address} | ${participant.derivationPath} | ${participant.privateKey}`,
     );
   }
 
-  console.log("\n" + "-".repeat(72));
-  console.log("  BUYER BALANCES (on orderbook)");
-  console.log("-".repeat(72));
-  for (const [address] of accountsQuoteTokensFunded.entries()) {
-    const [base, quote] = await orderbook.balanceOf(address);
-    console.log(
-      `  ${address}  base=${base.toString().padStart(12)}  quote=${quote.toString().padStart(12)}`,
-    );
-  }
+  console.log("\n  Demo Parameters");
+  console.log(`    Markets: ${marketContexts.length}`);
+  console.log(`    Target vault balance per user: ${formatToken(TARGET_BALANCE)}`);
+  console.log(
+    `    Transfer to each market per participant: ${TRANSFER_PER_MARKET} units`,
+  );
+  console.log(
+    `    Seed depth per market: levels=${POPULATE_LEVELS}, orders_per_level=${POPULATE_ORDERS_PER_LEVEL}, tick_bps=${POPULATE_TICK_BPS}`,
+  );
+  console.log(
+    `    Seed base amount range: ${formatToken(POPULATE_MIN_BASE)} .. ${formatToken(POPULATE_MAX_BASE)}`,
+  );
+  console.log(
+    `    Taker flow: sell=${MARKET_TAKER_AMOUNT} base units, buy=${MARKET_TAKER_AMOUNT} base units (max quote=${MARKET_TAKER_MAX_QUOTE})`,
+  );
 
-  console.log("=".repeat(72) + "\n");
+  for (const row of perMarketSummary) {
+    console.log(`\n  Market #${row.market}`);
+    console.log(`    Orderbook: ${row.orderbook}`);
+    console.log(`    Base vault: ${row.baseVault}`);
+    console.log(`    Quote vault: ${row.quoteVault}`);
+    console.log(`    Base token id: ${row.baseTokenId}`);
+    console.log(`    Seed used: ${row.seed}`);
+    console.log(`    Seeded bids/asks: ${row.bidsSeeded}/${row.asksSeeded}`);
+    console.log(`    Seed order id range: ${row.firstOrderId} -> ${row.lastOrderId}`);
+    console.log(
+      `    Best bid/ask before: ${row.bestBidBefore}/${row.bestAskBefore}`,
+    );
+    console.log(
+      `    Best bid/ask after:  ${row.bestBidAfter}/${row.bestAskAfter}`,
+    );
+    console.log(
+      `    Takers fulfilled/timed out/failed: ${row.takersFulfilled}/${row.takersTimedOut}/${row.takersFailed}`,
+    );
+    for (const execution of row.takerExecutions) {
+      const suffix = execution.orderId
+        ? `order_id=${execution.orderId}`
+        : `reason=${execution.reason ?? "unknown"}`;
+      console.log(
+        `      ${execution.label} | ${execution.address} | ${execution.status} | ${suffix}`,
+      );
+    }
+    console.log(
+      `    Buyer balance (base): ${formatToken(BigInt(row.buyerBaseBefore))} -> ${formatToken(BigInt(row.buyerBaseAfter))}`,
+    );
+    console.log(
+      `    Buyer balance (quote): ${formatToken(BigInt(row.buyerQuoteBefore))} -> ${formatToken(BigInt(row.buyerQuoteAfter))}`,
+    );
+    console.log(
+      `    Seller balance (base): ${formatToken(BigInt(row.sellerBaseBefore))} -> ${formatToken(BigInt(row.sellerBaseAfter))}`,
+    );
+    console.log(
+      `    Seller balance (quote): ${formatToken(BigInt(row.sellerQuoteBefore))} -> ${formatToken(BigInt(row.sellerQuoteAfter))}`,
+    );
+    console.log(`    Buyer/Seller: ${row.buyerAddress} / ${row.sellerAddress}`);
+  }
+  console.log("\n" + "=".repeat(88) + "\n");
 
   return 0;
 }

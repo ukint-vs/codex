@@ -1118,3 +1118,203 @@ async fn limit_buy_rejects_when_quote_balance_insufficient() {
     assert_balance(&program, buyer(), 0, initial_quote).await;
     assert_eq!(c.best_bid_price().await.unwrap(), 0);
 }
+
+#[cfg(feature = "debug")]
+#[tokio::test]
+async fn populate_demo_orders_rejects_unauthorized_caller() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let res = c
+        .populate_demo_orders(
+            /*seed=*/ 42,
+            /*levels=*/ 2,
+            /*orders_per_level=*/ 2,
+            /*mid_price=*/ price_fp_usdt_per_eth(2_000),
+            /*tick_bps=*/ 100,
+            /*min_amount_base=*/ eth_frac(1, 100),
+            /*max_amount_base=*/ eth_frac(1, 50),
+        )
+        .with_actor_id(buyer())
+        .await;
+
+    assert!(res.is_err(), "Expected unauthorized populate to fail");
+}
+
+#[cfg(feature = "debug")]
+#[tokio::test]
+async fn populate_demo_orders_rejects_when_market_not_empty() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let price = price_fp_usdt_per_eth(2_000);
+    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+    c.submit_order(1, 0, price, eth_frac(1, 10), 0)
+        .with_actor_id(seller())
+        .await
+        .unwrap();
+
+    let res = c
+        .populate_demo_orders(
+            7,
+            2,
+            2,
+            price_fp_usdt_per_eth(2_000),
+            100,
+            eth_frac(1, 100),
+            eth_frac(1, 50),
+        )
+        .with_actor_id(ActorId::from(ADMIN_ID))
+        .await;
+
+    assert!(
+        res.is_err(),
+        "Expected populate to fail on non-empty market"
+    );
+}
+
+#[cfg(feature = "debug")]
+#[tokio::test]
+async fn populate_demo_orders_is_reproducible_for_same_seed() {
+    let params = (
+        99u64,
+        3u16,
+        4u16,
+        price_fp_usdt_per_eth(2_000),
+        100u16,
+        eth_frac(1, 100),
+        eth_frac(1, 50),
+    );
+
+    let (out_a, bid_a, ask_a) = {
+        let program = setup_orderbook(1000, 1000).await;
+        let mut c = program.orderbook();
+        let out = c
+            .populate_demo_orders(
+                params.0, params.1, params.2, params.3, params.4, params.5, params.6,
+            )
+            .with_actor_id(ActorId::from(ADMIN_ID))
+            .await
+            .unwrap();
+        let bid = c.best_bid_price().await.unwrap();
+        let ask = c.best_ask_price().await.unwrap();
+        (out, bid, ask)
+    };
+
+    let (out_b, bid_b, ask_b) = {
+        let program = setup_orderbook(1000, 1000).await;
+        let mut c = program.orderbook();
+        let out = c
+            .populate_demo_orders(
+                params.0, params.1, params.2, params.3, params.4, params.5, params.6,
+            )
+            .with_actor_id(ActorId::from(ADMIN_ID))
+            .await
+            .unwrap();
+        let bid = c.best_bid_price().await.unwrap();
+        let ask = c.best_ask_price().await.unwrap();
+        (out, bid, ask)
+    };
+
+    assert_eq!(out_a, out_b);
+    assert_eq!(bid_a, bid_b);
+    assert_eq!(ask_a, ask_b);
+}
+
+#[cfg(feature = "debug")]
+#[tokio::test]
+async fn populate_demo_orders_creates_expected_top_of_book() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let mid = price_fp_usdt_per_eth(2_000);
+    let (bids, asks, first_id, last_id) = c
+        .populate_demo_orders(
+            /*seed=*/ 123,
+            /*levels=*/ 4,
+            /*orders_per_level=*/ 3,
+            /*mid_price=*/ mid,
+            /*tick_bps=*/ 100,
+            /*min_amount_base=*/ eth_frac(1, 20),
+            /*max_amount_base=*/ eth_frac(1, 20),
+        )
+        .with_actor_id(ActorId::from(ADMIN_ID))
+        .await
+        .unwrap();
+
+    assert_eq!(bids, 12);
+    assert_eq!(asks, 12);
+    assert_eq!(first_id, 1);
+    assert_eq!(last_id, 24);
+
+    let expected_best_bid =
+        ((U256::from(mid) * U256::from(9_900u32)) / U256::from(10_000u32)).low_u128();
+    let expected_best_ask =
+        ((U256::from(mid) * U256::from(10_100u32)) / U256::from(10_000u32)).low_u128();
+    assert_eq!(c.best_bid_price().await.unwrap(), expected_best_bid);
+    assert_eq!(c.best_ask_price().await.unwrap(), expected_best_ask);
+
+    let (found_first, ..) = c.order_by_id(first_id).await.unwrap();
+    let (found_last, ..) = c.order_by_id(last_id).await.unwrap();
+    assert!(found_first);
+    assert!(found_last);
+}
+
+#[cfg(feature = "debug")]
+#[tokio::test]
+async fn populate_demo_orders_seeded_depth_executes_real_market_order() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let (.., first_order_id, _last_order_id) = c
+        .populate_demo_orders(
+            /*seed=*/ 777,
+            /*levels=*/ 2,
+            /*orders_per_level=*/ 2,
+            /*mid_price=*/ price_fp_usdt_per_eth(2_000),
+            /*tick_bps=*/ 100,
+            /*min_amount_base=*/ eth_frac(1, 10),
+            /*max_amount_base=*/ eth_frac(1, 10),
+        )
+        .with_actor_id(ActorId::from(ADMIN_ID))
+        .await
+        .unwrap();
+
+    let best_ask_before = c.best_ask_price().await.unwrap();
+
+    let initial_quote = usdt_micro(1_000_000);
+    c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+
+    c.submit_order(
+        /*side=*/ 0, // BUY
+        /*kind=*/ 1, // MARKET
+        /*limit_price=*/ 0, // ignored
+        /*amount_base=*/ eth_frac(21, 100),
+        /*max_quote=*/ initial_quote,
+    )
+    .with_actor_id(buyer())
+    .await
+    .unwrap();
+
+    let best_ask_after = c.best_ask_price().await.unwrap();
+    assert!(
+        best_ask_after > best_ask_before,
+        "Expected level-1 ask to be consumed"
+    );
+
+    let (buyer_base, buyer_quote) = c.balance_of(buyer()).await.unwrap();
+    assert!(buyer_base > 0);
+    assert!(buyer_quote < initial_quote);
+
+    let (found_first, ..) = c.order_by_id(first_order_id).await.unwrap();
+    assert!(
+        !found_first,
+        "Expected first seeded ask to be fully consumed"
+    );
+}
