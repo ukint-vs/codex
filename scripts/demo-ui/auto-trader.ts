@@ -61,7 +61,18 @@ const PER_MARKET_DELAY_MS = Math.max(
   Number(process.env.ORDER_RUNNER_PER_MARKET_DELAY_MS ?? 180),
 );
 const CHART_WIDTH = Math.max(16, Number(process.env.ORDER_RUNNER_CHART_WIDTH ?? 44));
-const MAKER_OFFSET_BPS = Math.max(1, Number(process.env.ORDER_RUNNER_MAKER_OFFSET_BPS ?? 8));
+const MAKER_OFFSET_BPS = Math.max(1, Number(process.env.ORDER_RUNNER_MAKER_OFFSET_BPS ?? 5));
+const MAKER_LEVELS = Math.max(2, Number(process.env.ORDER_RUNNER_MAKER_LEVELS ?? 4));
+const TRADES_PER_MARKET_MIN = Math.max(
+  2,
+  Number(process.env.ORDER_RUNNER_TRADES_MIN ?? 3),
+);
+const TRADES_PER_MARKET_MAX = Math.max(
+  TRADES_PER_MARKET_MIN,
+  Number(process.env.ORDER_RUNNER_TRADES_MAX ?? 6),
+);
+const DRIFT_STEP_BPS = Math.max(4, Number(process.env.ORDER_RUNNER_DRIFT_STEP_BPS ?? 64));
+const DRIFT_MAX_BPS = Math.max(150, Number(process.env.ORDER_RUNNER_DRIFT_MAX_BPS ?? 2400));
 const MARKETS_FILTER = new Set(
   (process.env.ORDER_RUNNER_MARKETS ?? "")
     .split(",")
@@ -112,7 +123,19 @@ const pickAmountBase = (mid: number): number => {
 };
 
 const estimateMaxQuote = (mid: number, amountBase: number): number =>
-  Math.max(1, Math.ceil(mid * amountBase * 1.8));
+  Math.max(1, Math.ceil(mid * amountBase * 2.8));
+
+const randInt = (min: number, max: number): number => {
+  const lo = Math.ceil(Math.min(min, max));
+  const hi = Math.floor(Math.max(min, max));
+  return Math.floor(Math.random() * (hi - lo + 1)) + lo;
+};
+
+const randFloat = (min: number, max: number): number =>
+  Math.random() * (Math.max(min, max) - Math.min(min, max)) + Math.min(min, max);
+
+const clampNumber = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
 
 const sparkline = (values: number[], width: number): string => {
   const bars = "▁▂▃▄▅▆▇█";
@@ -204,7 +227,7 @@ async function main() {
   );
   console.log("Press Ctrl+C to stop.\n");
 
-  const makerSideByMarket = new Map<number, "buy" | "sell">();
+  const driftByMarket = new Map<number, number>();
   let loops = 0;
 
   while (LOOP_LIMIT === 0 || loops < LOOP_LIMIT) {
@@ -223,55 +246,97 @@ async function main() {
       for (const market of markets) {
         try {
           const pair = `${(market.baseSymbol ?? "BASE").toUpperCase()}/${(market.quoteSymbol ?? "QUOTE").toUpperCase()}`;
-          const bestBid = toNum(market.bestBid);
-          const bestAsk = toNum(market.bestAsk);
           const mid = estimateMid(market);
-          const takerAmountBase = pickAmountBase(mid);
-          const makerAmountBase = Math.max(1, Math.floor(takerAmountBase / 2));
-          const offset = MAKER_OFFSET_BPS / 10_000;
+          const bestAsk = toNum(market.bestAsk);
+          const previousDrift = driftByMarket.get(market.index) ?? 0;
+          let drift = clampNumber(
+            previousDrift
+            - previousDrift * 0.16
+            + randInt(-DRIFT_STEP_BPS, DRIFT_STEP_BPS)
+            + randInt(-DRIFT_STEP_BPS, DRIFT_STEP_BPS) * 0.4
+            + (Math.random() < 0.2 ? randInt(-120, 120) : 0),
+            -DRIFT_MAX_BPS,
+            DRIFT_MAX_BPS,
+          );
+          driftByMarket.set(market.index, drift);
+          const fairMid = clampNumber(mid * (1 + drift / 10_000), mid * 0.35, mid * 2.6);
+          const takerAmountBase = pickAmountBase(fairMid);
+          const makerAmountBase = Math.max(1, Math.floor(takerAmountBase * randFloat(0.35, 0.75)));
 
-          const previousMakerSide = makerSideByMarket.get(market.index) ?? "sell";
-          const makerSide: "buy" | "sell" =
-            previousMakerSide === "buy" ? "sell" : "buy";
-          makerSideByMarket.set(market.index, makerSide);
-
-          const makerPrice =
-            makerSide === "buy"
-              ? Math.max(0.000000000001, (bestBid > 0 ? bestBid : mid) * (1 - offset))
-              : Math.max(0.000000000001, (bestAsk > 0 ? bestAsk : mid) * (1 + offset));
-
-          const makerActorRole =
-            makerSide === "buy"
-              ? `quote-maker-${market.index % 2}`
-              : `base-maker-${market.index % 2}`;
-
-          const makerResult = await submitLimitOrder({
-            market: market.index,
-            side: makerSide,
-            amountBase: makerAmountBase,
-            priceQuotePerBase: makerPrice,
-            actorRole: makerActorRole,
-          });
+          let makerPlaced = 0;
+          for (let level = 1; level <= MAKER_LEVELS; level += 1) {
+            const levelOffset = (MAKER_OFFSET_BPS + (level - 1) * 18) / 10_000;
+            for (const makerSide of ["buy", "sell"] as const) {
+              const rawPrice = makerSide === "buy"
+                ? fairMid * (1 - levelOffset)
+                : fairMid * (1 + levelOffset);
+              const makerPrice = clampNumber(rawPrice, mid * 0.35, mid * 2.6);
+              const makerActorRole =
+                makerSide === "buy"
+                  ? `quote-maker-${(market.index + level) % 4}`
+                  : `base-maker-${(market.index + level) % 4}`;
+              try {
+                await submitLimitOrder({
+                  market: market.index,
+                  side: makerSide,
+                  amountBase: Math.max(1, Math.floor(makerAmountBase * randFloat(0.7, 1.45))),
+                  priceQuotePerBase: makerPrice,
+                  actorRole: makerActorRole,
+                });
+                makerPlaced += 1;
+              } catch {
+                // keep running to sustain activity
+              }
+            }
+          }
 
           await sleep(PER_MARKET_DELAY_MS);
 
-          const takerSide: "buy" | "sell" = makerSide === "buy" ? "sell" : "buy";
-          const takerActorRole =
-            takerSide === "buy"
-              ? `quote-maker-${(market.index + 1) % 2}`
-              : `base-maker-${(market.index + 1) % 2}`;
-          const takerMaxQuote =
-            takerSide === "buy"
-              ? estimateMaxQuote(Math.max(bestAsk, mid, makerPrice), takerAmountBase)
-              : undefined;
+          const tradesTarget = randInt(TRADES_PER_MARKET_MIN, TRADES_PER_MARKET_MAX);
+          let tradesDone = 0;
+          let tradeAttempts = 0;
+          let lastTrigger: TriggerResult | undefined;
 
-          const takerResult = await triggerOrder({
-            market: market.index,
-            side: takerSide,
-            amountBase: takerAmountBase,
-            maxQuote: takerMaxQuote,
-            actorRole: takerActorRole,
-          });
+          while (tradesDone < tradesTarget && tradeAttempts < tradesTarget * 7) {
+            tradeAttempts += 1;
+            const takerSide: "buy" | "sell" = Math.random() < (drift >= 0 ? 0.6 : 0.4)
+              ? "buy"
+              : "sell";
+            const actorRole =
+              takerSide === "buy"
+                ? `quote-maker-${(market.index + tradesDone + 1) % 4}`
+                : `base-maker-${(market.index + tradesDone + 1) % 4}`;
+            const amountBase = Math.max(
+              1,
+              Math.floor(takerAmountBase * randFloat(0.65, 1.9)),
+            );
+            const maxQuoteRef = Math.max(fairMid, mid, bestAsk);
+            const maxQuote = takerSide === "buy"
+              ? estimateMaxQuote(maxQuoteRef, amountBase)
+              : undefined;
+            try {
+              const takerResult = await triggerOrder({
+                market: market.index,
+                side: takerSide,
+                amountBase,
+                maxQuote,
+                actorRole,
+              });
+              lastTrigger = takerResult;
+              if (takerResult.executed) {
+                tradesDone += 1;
+                drift = clampNumber(
+                  drift + (takerSide === "buy" ? randInt(8, 30) : -randInt(8, 30)),
+                  -DRIFT_MAX_BPS,
+                  DRIFT_MAX_BPS,
+                );
+                driftByMarket.set(market.index, drift);
+              }
+            } catch {
+              // continue selecting another side/size; liquidity can be transient
+            }
+            await sleep(Math.max(50, Math.floor(PER_MARKET_DELAY_MS / 2)));
+          }
 
           await sleep(80);
           const postSnapshot = await fetchSnapshot();
@@ -280,19 +345,16 @@ async function main() {
 
           const latestPx =
             prices[prices.length - 1]
-            ?? deriveExecutionPrice(takerResult.baseDelta, takerResult.quoteDelta)
-            ?? deriveExecutionPrice(makerResult.baseDelta, makerResult.quoteDelta)
-            ?? mid;
+            ?? deriveExecutionPrice(lastTrigger?.baseDelta, lastTrigger?.quoteDelta)
+            ?? fairMid;
 
           const chart = sparkline(prices.length > 0 ? prices : [latestPx], CHART_WIDTH);
-          const makerMark = makerResult.executed ? "exec" : "book";
-          const takerMark = takerResult.executed ? "exec" : "subm";
-
           console.log(
             [
               `[m${market.index} ${pair}]`,
-              `maker:${makerSide}@${formatPriceAdaptive(makerPrice)} amt=${makerAmountBase} ${makerMark}`,
-              `| taker:${takerSide} amt=${takerAmountBase}${takerMaxQuote ? ` maxQ=${takerMaxQuote}` : ""} ${takerMark}`,
+              `fair=${formatPriceAdaptive(fairMid)} drift=${Math.round(drift)}bps`,
+              `| makers=${makerPlaced}`,
+              `| trades=${tradesDone}/${tradesTarget}`,
               `| px~${formatPriceAdaptive(latestPx)}`,
               `| bid=${formatPriceAdaptive(toNum(postMarket.bestBid))} ask=${formatPriceAdaptive(toNum(postMarket.bestAsk))}`,
               chart,

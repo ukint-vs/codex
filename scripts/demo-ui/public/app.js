@@ -6,23 +6,35 @@ const marketCardTemplate = document.getElementById("market-card-template");
 
 const EXEC_CHART_MAX_POINTS = 500;
 const EXEC_CHART_HISTORY_MAX_POINTS = 3000;
-const CANDLE_BUCKET_MS = 60_000;
-const CANDLE_BUCKET_LABEL = "1m";
+const EXEC_CHART_LOOKBACK_MS = 75 * 60_000;
+const EXEC_CHART_RETAIN_MS = 4 * 60 * 60_000;
+const EXEC_CANDLE_MAX_POINTS = 240;
+const CANDLE_BUCKET_MS = 15_000;
+const CANDLE_BUCKET_LABEL = "15s";
 const PRICE_CHART_HEIGHT = 300;
 const POLL_INTERVAL_MS = 5000;
 const MIN_POLL_INTERVAL_MS = 1000;
-const AUTO_TRADE_INTERVAL_MS = 2200;
+const AUTO_TRADE_INTERVAL_MS = 1700;
 const AUTO_TRADE_STEP_DELAY_MS = 120;
-const AUTO_MAKER_OFFSET_BPS = 8;
-const AUTO_MAKER_LEVELS = 2;
-const AUTO_MAKER_ORDERS_PER_LEVEL = 1;
-const AUTO_MIN_RESTING_PER_SIDE = 4;
+const AUTO_MAKER_BASE_OFFSET_BPS = 5;
+const AUTO_MAKER_LEVEL_SPACING_BPS = 20;
+const AUTO_MAKER_LEVELS = 6;
+const AUTO_MAKER_ORDERS_PER_LEVEL = 2;
+const AUTO_MIN_RESTING_PER_SIDE = 8;
 const AUTO_REPLENISH_MAX_PASSES = 3;
-const AUTO_TRADE_ATTEMPT_FACTOR = 10;
-const AUTO_PICK_WINDOW = 16;
+const AUTO_TRADE_ATTEMPT_FACTOR = 8;
+const AUTO_PICK_WINDOW = 40;
 const AUTO_ROLE_SLOTS = 4;
-const AUTO_TRADES_PER_TICK_MIN = 3;
-const AUTO_TRADES_PER_TICK_MAX = 5;
+const AUTO_TRADES_PER_TICK_MIN = 7;
+const AUTO_TRADES_PER_TICK_MAX = 14;
+const AUTO_SWEEP_PER_TICK_MIN = 2;
+const AUTO_SWEEP_PER_TICK_MAX = 5;
+const AUTO_DRIFT_STEP_BPS = 70;
+const AUTO_DRIFT_JUMP_BPS = 460;
+const AUTO_DRIFT_JUMP_PROB = 0.28;
+const AUTO_DRIFT_MEAN_REVERT = 0.13;
+const AUTO_DRIFT_MAX_BPS = 2800;
+const AUTO_EXEC_TARGET_JITTER_BPS = 240;
 
 const chartLib = window.LightweightCharts;
 const marketCards = new Map();
@@ -55,6 +67,13 @@ const formatPriceAdaptive = (value) => {
   return n.toPrecision(10).replace(/\.?0+$/, "");
 };
 
+const formatPriceForInput = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1) return n.toFixed(10).replace(/\.?0+$/, "");
+  return n.toFixed(14).replace(/\.?0+$/, "");
+};
+
 const parsePositiveNumber = (value) => {
   const parsed = Number.parseFloat(String(value ?? ""));
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -65,6 +84,15 @@ const normalizeTradesForChart = (trades) =>
     .filter((trade) => Number.isFinite(trade.price) && trade.price > 0)
     .map((trade, index) => ({ ...trade, _index: index }))
     .sort((a, b) => (a.ts - b.ts) || (a._index - b._index));
+
+const selectChartTrades = (trades) => {
+  const list = Array.isArray(trades) ? trades : [];
+  if (list.length === 0) return [];
+  const cutoff = Date.now() - EXEC_CHART_LOOKBACK_MS;
+  const recent = list.filter((trade) => Number(trade.ts) >= cutoff);
+  const picked = recent.length > 0 ? recent : list.slice(-EXEC_CHART_MAX_POINTS);
+  return picked.slice(-EXEC_CHART_HISTORY_MAX_POINTS);
+};
 
 const buildTickSeries = (trades) => {
   const normalized = normalizeTradesForChart(trades);
@@ -85,7 +113,6 @@ const buildCandles = (trades, bucketMs) => {
   const normalized = normalizeTradesForChart(trades);
   if (!normalized.length) return [];
 
-  const bucketSecSize = Math.max(1, Math.floor(bucketMs / 1000));
   const buckets = new Map();
   for (const trade of normalized) {
     const bucketMsStart = Math.floor(trade.ts / bucketMs) * bucketMs;
@@ -107,29 +134,7 @@ const buildCandles = (trades, bucketMs) => {
   }
 
   const sortedBuckets = [...buckets.values()].sort((a, b) => a.time - b.time);
-  const filled = [];
-  let previous = null;
-  for (const candle of sortedBuckets) {
-    if (previous) {
-      for (
-        let gap = previous.time + bucketSecSize;
-        gap < candle.time;
-        gap += bucketSecSize
-      ) {
-        filled.push({
-          time: gap,
-          open: previous.close,
-          high: previous.close,
-          low: previous.close,
-          close: previous.close,
-        });
-      }
-    }
-    filled.push(candle);
-    previous = candle;
-  }
-
-  return filled.slice(-200);
+  return sortedBuckets.slice(-EXEC_CANDLE_MAX_POINTS);
 };
 
 const renderTabs = (markets) => {
@@ -388,7 +393,8 @@ const renderPriceChart = (cardState) => {
     return;
   }
 
-  const trades = cardState.execTrades.slice(-EXEC_CHART_MAX_POINTS);
+  const modeChanged = cardState.lastRenderedChartMode !== cardState.execChartMode;
+  const trades = selectChartTrades(cardState.execTrades);
   const tickData = buildTickSeries(trades);
   const candleData = buildCandles(trades, CANDLE_BUCKET_MS);
   const latestPrice = trades.length > 0
@@ -412,9 +418,10 @@ const renderPriceChart = (cardState) => {
     cardState.candleSeries.setData([]);
   }
 
-  if (!cardState.chartDidInitialFit) {
+  if (!cardState.chartDidInitialFit || modeChanged) {
     cardState.priceChartApi.timeScale().fitContent();
     cardState.chartDidInitialFit = true;
+    cardState.lastRenderedChartMode = cardState.execChartMode;
   } else {
     cardState.priceChartApi.timeScale().scrollToRealTime();
   }
@@ -439,9 +446,9 @@ const renderPriceChart = (cardState) => {
 };
 
 const isExecutionPricePlausible = (price, market) => {
-  const mid = estimateMidPrice(market);
+  const mid = referenceMidForMarket(market);
   if (!Number.isFinite(mid) || mid <= 0) return true;
-  return price >= mid * 0.2 && price <= mid * 5;
+  return price >= mid * 0.05 && price <= mid * 20;
 };
 
 const appendExecutionTrades = (cardState, actions, market) => {
@@ -473,6 +480,13 @@ const appendExecutionTrades = (cardState, actions, market) => {
   }
 
   while (cardState.execTrades.length > EXEC_CHART_HISTORY_MAX_POINTS) {
+    const removed = cardState.execTrades.shift();
+    if (removed?.key) {
+      cardState.execTradeKeys.delete(removed.key);
+    }
+  }
+  const minTs = Date.now() - EXEC_CHART_RETAIN_MS;
+  while (cardState.execTrades.length > 0 && Number(cardState.execTrades[0]?.ts) < minTs) {
     const removed = cardState.execTrades.shift();
     if (removed?.key) {
       cardState.execTradeKeys.delete(removed.key);
@@ -576,14 +590,29 @@ const fallbackMidByPair = new Map([
   ["USDC/USDC", 1],
 ]);
 
+const marketPairKey = (market) =>
+  `${(market?.baseSymbol ?? "BASE").toUpperCase()}/${(market?.quoteSymbol ?? "QUOTE").toUpperCase()}`;
+
+const fallbackMidForMarket = (market) => fallbackMidByPair.get(marketPairKey(market)) ?? 0;
+
 const estimateMidPrice = (market) => {
   const bestBid = parsePositiveNumber(market?.bestBid);
   const bestAsk = parsePositiveNumber(market?.bestAsk);
   if (bestBid > 0 && bestAsk > 0 && bestAsk >= bestBid) {
     return (bestBid + bestAsk) / 2;
   }
-  const pair = `${(market?.baseSymbol ?? "BASE").toUpperCase()}/${(market?.quoteSymbol ?? "QUOTE").toUpperCase()}`;
-  return fallbackMidByPair.get(pair) ?? 1;
+  return fallbackMidForMarket(market) || 1;
+};
+
+const referenceMidForMarket = (market) => {
+  const observed = estimateMidPrice(market);
+  const fallback = fallbackMidForMarket(market);
+  if (fallback > 0 && observed > 0) {
+    if (observed < fallback / 20 || observed > fallback * 20) {
+      return fallback;
+    }
+  }
+  return observed > 0 ? observed : (fallback > 0 ? fallback : 1);
 };
 
 const pickAutoAmountBase = (mid) => {
@@ -595,12 +624,56 @@ const pickAutoAmountBase = (mid) => {
 };
 
 const estimateAutoMaxQuote = (mid, amountBase) =>
-  Math.max(1, Math.ceil(mid * amountBase * 1.8));
+  Math.max(1, Math.ceil(mid * amountBase * 2.6));
 
 const randInt = (min, max) => {
   const lo = Math.ceil(Math.min(min, max));
   const hi = Math.floor(Math.max(min, max));
   return Math.floor(Math.random() * (hi - lo + 1)) + lo;
+};
+
+const randFloat = (min, max) =>
+  Math.random() * (Math.max(min, max) - Math.min(min, max)) + Math.min(min, max);
+
+const clampNumber = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const priceBoundsForReference = (referenceMid) => ({
+  low: Math.max(0.000000000001, referenceMid * 0.35),
+  high: Math.max(0.000000000002, referenceMid * 2.6),
+});
+
+const clampPriceAroundReference = (price, referenceMid) => {
+  const bounds = priceBoundsForReference(referenceMid);
+  return clampNumber(price, bounds.low, bounds.high);
+};
+
+const normalizeObservedMid = (observedMid, referenceMid) => {
+  if (!Number.isFinite(observedMid) || observedMid <= 0) return referenceMid;
+  const bounds = priceBoundsForReference(referenceMid);
+  if (observedMid < bounds.low || observedMid > bounds.high) {
+    return referenceMid;
+  }
+  return observedMid;
+};
+
+const selectByWeightedWindow = (rows, targetPrice, window) => {
+  if (!rows.length) return null;
+  const ranked = [...rows].sort((a, b) => {
+    const aPx = parsePositiveNumber(a.priceQuotePerBase);
+    const bPx = parsePositiveNumber(b.priceQuotePerBase);
+    return Math.abs(aPx - targetPrice) - Math.abs(bPx - targetPrice);
+  });
+  const pickWindow = Math.max(1, Math.min(ranked.length, window));
+  let totalWeight = 0;
+  for (let i = 0; i < pickWindow; i += 1) {
+    totalWeight += pickWindow - i;
+  }
+  let roll = Math.random() * totalWeight;
+  for (let i = 0; i < pickWindow; i += 1) {
+    roll -= pickWindow - i;
+    if (roll <= 0) return ranked[i];
+  }
+  return ranked[pickWindow - 1];
 };
 
 const estimateQuoteForAmount = (priceQuotePerBase, amountBase) =>
@@ -708,6 +781,8 @@ const updateAutoTradeUi = (cardState) => {
 const stopAutoTrade = (cardState, reason = "auto: stopped") => {
   cardState.autoRunning = false;
   cardState.autoInFlight = false;
+  cardState.autoMidDriftBps = 0;
+  cardState.autoFairMid = 0;
   cardState.autoStatusText = reason;
   if (cardState.autoTimer) {
     clearInterval(cardState.autoTimer);
@@ -740,31 +815,60 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
     }
 
     let liveMarket = market;
-    const mid = estimateMidPrice(liveMarket);
-    const makerOffsetBps = AUTO_MAKER_OFFSET_BPS / 10_000;
-    const takerAmountBase = pickAutoAmountBase(mid);
-    const makerBaseAmount = Math.max(1, Math.floor(takerAmountBase * 0.4));
+    const referenceMid = referenceMidForMarket(liveMarket);
+    const observedMid = normalizeObservedMid(estimateMidPrice(liveMarket), referenceMid);
+    const previousDrift = Number(cardState.autoMidDriftBps ?? 0);
+    const noiseBps =
+      randInt(-AUTO_DRIFT_STEP_BPS, AUTO_DRIFT_STEP_BPS)
+      + randInt(-AUTO_DRIFT_STEP_BPS, AUTO_DRIFT_STEP_BPS) * 0.5;
+    const jumpBps = Math.random() < AUTO_DRIFT_JUMP_PROB
+      ? randInt(-AUTO_DRIFT_JUMP_BPS, AUTO_DRIFT_JUMP_BPS)
+      : 0;
+    const observedPullBps = clampNumber(
+      ((observedMid / referenceMid) - 1) * 10_000 * 0.35,
+      -260,
+      260,
+    );
+    let nextDrift = clampNumber(
+      previousDrift
+      - previousDrift * AUTO_DRIFT_MEAN_REVERT
+      + noiseBps
+      + jumpBps
+      + observedPullBps,
+      -AUTO_DRIFT_MAX_BPS,
+      AUTO_DRIFT_MAX_BPS,
+    );
+    cardState.autoMidDriftBps = Math.round(nextDrift);
+    let fairMid = clampPriceAroundReference(
+      referenceMid * (1 + nextDrift / 10_000),
+      referenceMid,
+    );
+    cardState.autoFairMid = fairMid;
+    const takerAmountBase = pickAutoAmountBase(fairMid);
+    const makerBaseAmount = Math.max(
+      1,
+      Math.floor(takerAmountBase * randFloat(0.35, 0.75)),
+    );
     let makerPlaced = 0;
     let makerFailed = 0;
     let liquidityMisses = 0;
     let lastMakerLabel = "-";
 
-    const makerPriceAtLevel = (snapshot, side, level = 1) => {
-      const bestBid = parsePositiveNumber(snapshot?.bestBid);
-      const bestAsk = parsePositiveNumber(snapshot?.bestAsk);
-      const levelOffset = makerOffsetBps * level;
-      const anchor = side === "buy"
-        ? (bestBid > 0 ? bestBid : mid)
-        : (bestAsk > 0 ? bestAsk : mid);
-      return side === "buy"
-        ? Math.max(0.000000000001, anchor * (1 - levelOffset))
-        : Math.max(0.000000000001, anchor * (1 + levelOffset));
+    const makerPriceAtLevel = (side, level = 1) => {
+      const driftSkewBps = clampNumber(nextDrift * 0.07, -18, 18);
+      const sideSkew = side === "buy" ? -driftSkewBps : driftSkewBps;
+      const baseOffset = AUTO_MAKER_BASE_OFFSET_BPS + AUTO_MAKER_LEVEL_SPACING_BPS * (level - 1);
+      const jitter = randFloat(-2.5, 4.5);
+      const offsetBps = Math.max(1, baseOffset + sideSkew + jitter);
+      const rawPrice = side === "buy"
+        ? fairMid * (1 - offsetBps / 10_000)
+        : fairMid * (1 + offsetBps / 10_000);
+      return clampPriceAroundReference(rawPrice, referenceMid);
     };
 
     const placeMakerOrder = async (snapshot, side, level = 1) => {
-      const price = makerPriceAtLevel(snapshot, side, level);
-      const jitter = 0.8 + Math.random() * 0.6;
-      const amountBase = Math.max(1, Math.floor(makerBaseAmount * jitter));
+      const price = makerPriceAtLevel(side, level);
+      const amountBase = Math.max(1, Math.floor(makerBaseAmount * randFloat(0.7, 1.4)));
       const cursor = cardState.autoActorCursor;
       cardState.autoActorCursor += 1;
       const actorRole = pickActorRoleForSide(
@@ -798,8 +902,10 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
 
     const seedMakerBands = async (snapshot) => {
       for (let level = 1; level <= AUTO_MAKER_LEVELS; level += 1) {
+        if (level >= 4 && Math.random() < 0.45) continue;
         for (const makerSide of ["buy", "sell"]) {
-          for (let i = 0; i < AUTO_MAKER_ORDERS_PER_LEVEL; i += 1) {
+          const ordersAtLevel = level <= 2 ? AUTO_MAKER_ORDERS_PER_LEVEL : 1;
+          for (let i = 0; i < ordersAtLevel; i += 1) {
             await placeMakerOrder(snapshot, makerSide, level);
           }
         }
@@ -840,9 +946,11 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
     await replenishBookIfThin();
 
     const tradesTarget = randInt(AUTO_TRADES_PER_TICK_MIN, AUTO_TRADES_PER_TICK_MAX);
+    const sweepsTarget = randInt(AUTO_SWEEP_PER_TICK_MIN, AUTO_SWEEP_PER_TICK_MAX);
     let tradesDone = 0;
+    let sweepsDone = 0;
     let attempts = 0;
-    const maxAttempts = Math.max(8, tradesTarget * AUTO_TRADE_ATTEMPT_FACTOR);
+    const maxAttempts = Math.max(14, tradesTarget * AUTO_TRADE_ATTEMPT_FACTOR);
 
     while (tradesDone < tradesTarget && attempts < maxAttempts) {
       attempts += 1;
@@ -861,14 +969,24 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
       }
 
       const candidates = (liveMarket.orders ?? [])
-        .filter((row) => parsePositiveNumber(row.remainingBase) >= 1);
+        .filter((row) => parsePositiveNumber(row.remainingBase) >= 1)
+        .filter((row) => {
+          const px = parsePositiveNumber(row.priceQuotePerBase);
+          if (px <= 0) return false;
+          const bounds = priceBoundsForReference(referenceMid);
+          return px >= bounds.low && px <= bounds.high;
+        });
       if (candidates.length === 0) {
         await wait(Math.max(80, AUTO_TRADE_STEP_DELAY_MS));
         continue;
       }
 
-      const pickWindow = Math.max(1, Math.min(candidates.length, AUTO_PICK_WINDOW));
-      const picked = candidates[randInt(0, pickWindow - 1)];
+      fairMid = clampPriceAroundReference(referenceMid * (1 + nextDrift / 10_000), referenceMid);
+      const targetPrice = clampPriceAroundReference(
+        fairMid * (1 + randInt(-AUTO_EXEC_TARGET_JITTER_BPS, AUTO_EXEC_TARGET_JITTER_BPS) / 10_000),
+        referenceMid,
+      );
+      const picked = selectByWeightedWindow(candidates, targetPrice, AUTO_PICK_WINDOW);
       if (!picked) continue;
 
       const orderId = Number(picked.id);
@@ -879,12 +997,12 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
 
       const suggested = Math.max(
         1,
-        Math.floor(takerAmountBase * (0.45 + Math.random() * 0.75)),
+        Math.floor(takerAmountBase * randFloat(0.4, 1.45)),
       );
       const amountBase = Math.min(remainingUnits, suggested);
       const makerIsBuy = String(picked.side).toLowerCase() === "buy";
       const takerSide = makerIsBuy ? "sell" : "buy";
-      const pickPrice = parsePositiveNumber(picked.priceQuotePerBase) || mid;
+      const pickPrice = parsePositiveNumber(picked.priceQuotePerBase) || fairMid;
       const cursor = cardState.autoActorCursor;
       cardState.autoActorCursor += 1;
       const takerActorRole = pickActorRoleForSide(
@@ -905,6 +1023,15 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
 
         if (result.selectedAffected || result.executed) {
           tradesDone += 1;
+          const impulse = takerSide === "buy"
+            ? randInt(7, 34)
+            : -randInt(7, 34);
+          nextDrift = clampNumber(
+            nextDrift + impulse,
+            -AUTO_DRIFT_MAX_BPS,
+            AUTO_DRIFT_MAX_BPS,
+          );
+          cardState.autoMidDriftBps = Math.round(nextDrift);
         }
       } catch (error) {
         const message = String(error?.message ?? error ?? "");
@@ -920,10 +1047,74 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
       await wait(Math.max(50, AUTO_TRADE_STEP_DELAY_MS - 40));
     }
 
+    const observedMidForSweep = estimateMidPrice(liveMarket);
+    const canSweepMarketOrders =
+      observedMidForSweep >= referenceMid * 0.2
+      && observedMidForSweep <= referenceMid * 5;
+
+    while (canSweepMarketOrders && sweepsDone < sweepsTarget) {
+      fairMid = clampPriceAroundReference(referenceMid * (1 + nextDrift / 10_000), referenceMid);
+      const buyBias = nextDrift >= 0 ? 0.62 : 0.38;
+      const sweepSide = Math.random() < buyBias ? "buy" : "sell";
+      const amountBase = Math.max(
+        1,
+        Math.floor(takerAmountBase * randFloat(0.8, 2.2)),
+      );
+      const cursor = cardState.autoActorCursor;
+      cardState.autoActorCursor += 1;
+      const actorRole = pickActorRoleForSide(
+        liveMarket?.balances ?? [],
+        sweepSide,
+        amountBase,
+        fairMid,
+        cursor,
+      );
+
+      try {
+        const bestAskNow = parsePositiveNumber(liveMarket?.bestAsk);
+        const maxQuoteRef = Math.max(fairMid, referenceMid, bestAskNow);
+        const result = await callJson("/api/trigger-order", {
+          market: marketIndex,
+          side: sweepSide,
+          amountBase,
+          maxQuote: sweepSide === "buy"
+            ? estimateAutoMaxQuote(maxQuoteRef, amountBase)
+            : undefined,
+          actorRole,
+        });
+        if (result.executed) {
+          sweepsDone += 1;
+          const impulse = sweepSide === "buy"
+            ? randInt(10, 42)
+            : -randInt(10, 42);
+          nextDrift = clampNumber(
+            nextDrift + impulse,
+            -AUTO_DRIFT_MAX_BPS,
+            AUTO_DRIFT_MAX_BPS,
+          );
+          cardState.autoMidDriftBps = Math.round(nextDrift);
+        }
+      } catch (error) {
+        const message = String(error?.message ?? error ?? "");
+        if (
+          message.includes("InsufficientLiquidity")
+          || message.includes("insufficient")
+        ) {
+          liquidityMisses += 1;
+        }
+        break;
+      }
+      await wait(Math.max(50, AUTO_TRADE_STEP_DELAY_MS - 30));
+    }
+
+    fairMid = clampPriceAroundReference(referenceMid * (1 + nextDrift / 10_000), referenceMid);
+    cardState.autoFairMid = fairMid;
     cardState.autoStatusText = [
       "auto: running",
+      `ref=${formatPriceAdaptive(referenceMid)} fair=${formatPriceAdaptive(fairMid)} drift=${Math.round(nextDrift)}bps`,
       `makers=${makerPlaced}/${makerPlaced + makerFailed}`,
       `trades=${tradesDone}/${tradesTarget}`,
+      `sweeps=${sweepsDone}/${sweepsTarget}`,
       `attempts=${attempts}`,
       `liqErr=${liquidityMisses}`,
       `| ${lastMakerLabel}`,
@@ -944,6 +1135,8 @@ const startAutoTrade = (cardState, marketIndex) => {
   cardState.autoRunning = true;
   cardState.autoStatusText = `auto: running every ${(AUTO_TRADE_INTERVAL_MS / 1000).toFixed(1)}s`;
   cardState.autoActorCursor = 0;
+  cardState.autoMidDriftBps = 0;
+  cardState.autoFairMid = 0;
   updateAutoTradeUi(cardState);
   void runAutoTradeStep(cardState, marketIndex);
   cardState.autoTimer = setInterval(() => {
@@ -995,12 +1188,20 @@ const createMarketCard = (market) => {
     const sideSelect = refs.limitForm.querySelector("select[name='side']");
     const priceInput = refs.limitForm.querySelector("input[name='priceQuotePerBase']");
     const amountInput = refs.limitForm.querySelector("input[name='amountBase']");
-    priceInput.value = level.priceQuotePerBase;
+    const parsedPrice = parsePositiveNumber(level.priceQuotePerBase);
+    priceInput.value = parsedPrice > 0
+      ? formatPriceForInput(parsedPrice)
+      : "";
+    priceInput.setCustomValidity("");
     amountInput.value = Math.max(1, Math.floor(Number.parseFloat(level.sizeBase) || 1));
     sideSelect.value = side === "ask" ? "buy" : "sell";
     refs.tradeStatus.className = "trade-status muted";
-    refs.tradeStatus.textContent = `Prefilled ${side} level ${level.priceQuotePerBase}`;
+    refs.tradeStatus.textContent = `Prefilled ${side} level ${priceInput.value || level.priceQuotePerBase}`;
   };
+  const limitPriceInput = refs.limitForm.querySelector("input[name='priceQuotePerBase']");
+  limitPriceInput?.addEventListener("input", () => {
+    limitPriceInput.setCustomValidity("");
+  });
 
   refs.limitForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1057,9 +1258,13 @@ const createMarketCard = (market) => {
     chartPricePrecision: null,
     chartPriceMinMove: null,
     chartDidInitialFit: false,
+    lastRenderedChartMode: null,
     autoRunning: false,
     autoInFlight: false,
     autoMakerSide: "sell",
+    autoActorCursor: 0,
+    autoMidDriftBps: 0,
+    autoFairMid: 0,
     autoStatusText: "auto: stopped",
     autoTimer: null,
     latestMarket: market,
