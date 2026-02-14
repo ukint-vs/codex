@@ -1,11 +1,73 @@
-BASE_TOKEN_ID="0000000000000000000000000000000000000010"
-QUOTE_TOKEN_ID="0000000000000000000000000000000000000001"
+VARA_TOKEN_ID="0000000000000000000000000000000000000010"
+USDC_TOKEN_ID="0000000000000000000000000000000000000001"
+ETH_TOKEN_ID="0000000000000000000000000000000000000011"
+
+BASE_TOKEN_ID="$VARA_TOKEN_ID"
+QUOTE_TOKEN_ID="$USDC_TOKEN_ID"
+
+get_market_count() {
+    echo "3"
+    return 0
+}
+
+get_market_base_token_id() {
+    local idx="${1:-0}"
+    case "$idx" in
+        0) echo "$VARA_TOKEN_ID" ;;
+        1) echo "$ETH_TOKEN_ID" ;;
+        2) echo "$USDC_TOKEN_ID" ;;
+        *) echo "$VARA_TOKEN_ID" ;;
+    esac
+    return 0
+}
+
+get_market_quote_token_id() {
+    local idx="${1:-0}"
+    case "$idx" in
+        0) echo "$USDC_TOKEN_ID" ;; # VARA/USDC
+        1) echo "$USDC_TOKEN_ID" ;; # ETH/USDC
+        2) echo "$VARA_TOKEN_ID" ;; # USDC/VARA
+        *) echo "$USDC_TOKEN_ID" ;;
+    esac
+    return 0
+}
+
+get_market_base_symbol() {
+    local idx="${1:-0}"
+    case "$idx" in
+        0) echo "VARA" ;;
+        1) echo "ETH" ;;
+        2) echo "USDC" ;;
+        *) echo "VARA" ;;
+    esac
+    return 0
+}
+
+get_market_quote_symbol() {
+    local idx="${1:-0}"
+    case "$idx" in
+        0) echo "USDC" ;;
+        1) echo "USDC" ;;
+        2) echo "VARA" ;;
+        *) echo "USDC" ;;
+    esac
+    return 0
+}
+
+get_market_mid_price() {
+    local idx="${1:-0}"
+    case "$idx" in
+        0) echo "0.001165" ;;
+        1) echo "2055" ;;
+        2) echo "858.3690987124464" ;;
+        *) echo "1" ;;
+    esac
+    return 0
+}
 
 get_base_token_id() {
     local idx="${1:-0}"
-    local value=$((16 + idx))
-    printf "%040x" "$value"
-    return 0
+    get_market_base_token_id "$idx"
 }
 
 create_orderbook_init_payload() {

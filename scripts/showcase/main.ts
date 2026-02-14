@@ -26,8 +26,7 @@ import { actorIdToAddress } from "./programs/util.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 
-const TARGET_BALANCE = BigInt(1_000 * 1e6);
-const BASE_PRICE = 1.0;
+const TARGET_BALANCE = BigInt(25_000 * 1e6);
 const MARKETS_DEFAULT_SEED = 1_000n;
 
 const POPULATE_LEVELS = 10;
@@ -36,14 +35,11 @@ const POPULATE_TICK_BPS = 50;
 const POPULATE_MIN_BASE = BigInt(2 * 1e6);
 const POPULATE_MAX_BASE = BigInt(20 * 1e6);
 
-const TRANSFER_PER_MARKET = 200;
-const MARKET_TAKER_AMOUNT = 25;
-const MARKET_TAKER_MAX_QUOTE = 150;
-
 const SETTLE_TIMEOUT_MS = 60_000;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
 const TOKEN_DECIMALS = 6;
+const MIN_REPRESENTABLE_PRICE = 0.000001;
 
 const formatToken = (amount: bigint, decimals: number = TOKEN_DECIMALS): string =>
   `${formatUnits(amount, decimals)} (${amount.toString()} atoms)`;
@@ -69,6 +65,14 @@ type MarketSummaryRow = {
   baseVault: Address;
   quoteVault: Address;
   baseTokenId: string;
+  quoteTokenId: string;
+  baseSymbol: string;
+  quoteSymbol: string;
+  midPriceQuotePerBase: string;
+  transferBase: number;
+  transferQuote: number;
+  takerAmountBase: number;
+  takerMaxQuote: number;
   seed: string;
   bidsSeeded: number;
   asksSeeded: number;
@@ -92,6 +96,70 @@ type MarketSummaryRow = {
   sellerBaseAfter: string;
   sellerQuoteAfter: string;
   takerExecutions: TakerExecution[];
+};
+
+type MarketRuntimeConfig = {
+  midPriceQuotePerBase: number;
+  transferBase: number;
+  transferQuote: number;
+  takerAmountBase: number;
+  takerMaxQuote: number;
+};
+
+const fallbackMidPriceByPair = new Map<string, number>([
+  ["VARA/USDC", 0.001165],
+  ["ETH/USDC", 2055],
+  ["USDC/VARA", 1 / 0.001165],
+  ["USDC/USDC", 1],
+  ["VARA/VARA", 1],
+  ["ETH/ETH", 1],
+]);
+
+const normalizeMidPrice = (value: number): number =>
+  Math.max(value, MIN_REPRESENTABLE_PRICE);
+
+const fallbackMidPrice = (baseSymbol: string, quoteSymbol: string): number => {
+  const key = `${baseSymbol.toUpperCase()}/${quoteSymbol.toUpperCase()}`;
+  return normalizeMidPrice(fallbackMidPriceByPair.get(key) ?? 1);
+};
+
+const deriveMarketRuntime = (
+  explicitMidPrice: number | undefined,
+  baseSymbol: string,
+  quoteSymbol: string,
+): MarketRuntimeConfig => {
+  const midPriceQuotePerBase = normalizeMidPrice(
+    explicitMidPrice && explicitMidPrice > 0
+      ? explicitMidPrice
+      : fallbackMidPrice(baseSymbol, quoteSymbol),
+  );
+
+  const takerAmountBase =
+    midPriceQuotePerBase >= 1_000
+      ? 1
+      : midPriceQuotePerBase >= 100
+        ? 2
+        : midPriceQuotePerBase >= 1
+          ? 10
+          : midPriceQuotePerBase >= 0.01
+            ? 50
+            : 250;
+
+  const requiredQuote = Math.max(
+    1,
+    Math.ceil(midPriceQuotePerBase * takerAmountBase * 1.5),
+  );
+  const takerMaxQuote = Math.max(250, requiredQuote);
+  const transferQuote = Math.max(500, Math.ceil(requiredQuote * 2.25));
+  const transferBase = Math.max(500, takerAmountBase * 20);
+
+  return {
+    midPriceQuotePerBase,
+    transferBase,
+    transferQuote,
+    takerAmountBase,
+    takerMaxQuote,
+  };
 };
 
 const timeout = (ms: number) =>
@@ -275,14 +343,6 @@ async function main() {
     return signer;
   };
 
-  const quoteVault = new Vault(
-    vaultCodec,
-    varaEthApi,
-    publicClient,
-    config.contracts.quoteTokenVault,
-    6,
-  );
-
   const resolveAdminSigner = async (vault: Vault): Promise<ISigner> => {
     const adminActorId = await vault.queryAdmin();
     const adminAddress = actorIdToAddress(adminActorId);
@@ -290,25 +350,43 @@ async function main() {
     return getSignerForAddress(adminAddress);
   };
 
-  const marketContexts = config.contracts.markets.map((market, index) => ({
-    index,
-    orderbook: new Orderbook(
-      orderbookCodec,
-      varaEthApi,
-      publicClient,
-      market.orderbook,
-      6,
-      6,
-    ),
-    baseVault: new Vault(vaultCodec, varaEthApi, publicClient, market.baseTokenVault, 6),
-    orderbookAddress: market.orderbook,
-    baseVaultAddress: market.baseTokenVault,
-    baseTokenId: market.baseTokenId,
-    adminSigner: fallbackAdminSigner,
-  }));
+  const marketContexts = config.contracts.markets.map((market, index) => {
+    const baseSymbol = (market.baseSymbol ?? `BASE${index}`).toUpperCase();
+    const quoteSymbol = (market.quoteSymbol ?? "USDC").toUpperCase();
+    const runtime = deriveMarketRuntime(
+      market.midPriceQuotePerBase,
+      baseSymbol,
+      quoteSymbol,
+    );
+
+    return {
+      index,
+      orderbook: new Orderbook(
+        orderbookCodec,
+        varaEthApi,
+        publicClient,
+        market.orderbook,
+        6,
+        6,
+      ),
+      baseVault: new Vault(vaultCodec, varaEthApi, publicClient, market.baseTokenVault, 6),
+      quoteVault: new Vault(vaultCodec, varaEthApi, publicClient, market.quoteTokenVault, 6),
+      orderbookAddress: market.orderbook,
+      baseVaultAddress: market.baseTokenVault,
+      quoteVaultAddress: market.quoteTokenVault,
+      baseTokenId: market.baseTokenId,
+      quoteTokenId: market.quoteTokenId,
+      baseSymbol,
+      quoteSymbol,
+      ...runtime,
+      adminSigner: fallbackAdminSigner,
+      quoteAdminSigner: fallbackAdminSigner,
+    };
+  });
 
   logger.info("Markets detected", {
     count: marketContexts.length,
+    pairs: marketContexts.map((m) => `${m.baseSymbol}/${m.quoteSymbol}`),
     orderbooks: marketContexts.map((m) => m.orderbookAddress),
   });
 
@@ -344,14 +422,28 @@ async function main() {
     });
   };
 
-  const quoteAdminSigner = await resolveAdminSigner(quoteVault);
+  const fundedVaults = new Set<string>();
 
   for (const market of marketContexts) {
     market.adminSigner = await resolveAdminSigner(market.baseVault);
-    await fundAccounts(accountsBaseTokensFunded, market.baseVault, market.adminSigner);
-  }
+    market.quoteAdminSigner = await resolveAdminSigner(market.quoteVault);
 
-  await fundAccounts(accountsQuoteTokensFunded, quoteVault, quoteAdminSigner);
+    const baseVaultKey = market.baseVaultAddress.toLowerCase();
+    if (!fundedVaults.has(baseVaultKey)) {
+      await fundAccounts(accountsBaseTokensFunded, market.baseVault, market.adminSigner);
+      fundedVaults.add(baseVaultKey);
+    }
+
+    const quoteVaultKey = market.quoteVaultAddress.toLowerCase();
+    if (!fundedVaults.has(quoteVaultKey)) {
+      await fundAccounts(
+        accountsQuoteTokensFunded,
+        market.quoteVault,
+        market.quoteAdminSigner,
+      );
+      fundedVaults.add(quoteVaultKey);
+    }
+  }
 
   for (const market of marketContexts) {
     await authorizeMarket(
@@ -361,8 +453,8 @@ async function main() {
       `base-${market.index}`,
     );
     await authorizeMarket(
-      quoteVault,
-      quoteAdminSigner,
+      market.quoteVault,
+      market.quoteAdminSigner,
       market.orderbookAddress,
       `quote-${market.index}`,
     );
@@ -408,23 +500,32 @@ async function main() {
   for (const market of marketContexts) {
     logger.info("Preparing market", {
       market: market.index,
+      pair: `${market.baseSymbol}/${market.quoteSymbol}`,
       orderbook: market.orderbookAddress,
       baseVault: market.baseVaultAddress,
+      quoteVault: market.quoteVaultAddress,
       baseTokenId: market.baseTokenId,
+      quoteTokenId: market.quoteTokenId,
+      midPriceQuotePerBase: market.midPriceQuotePerBase,
+      transferBase: market.transferBase,
+      transferQuote: market.transferQuote,
+      takerAmountBase: market.takerAmountBase,
+      takerMaxQuote: market.takerMaxQuote,
     });
 
     for (const { address, account } of baseParticipants) {
       await market
         .baseVault
         .withSigner(makeSigner(account))
-        .transferToMarket(market.orderbookAddress, TRANSFER_PER_MARKET);
+        .transferToMarket(market.orderbookAddress, market.transferBase);
       logger.info("Base transferred to market", { market: market.index, address });
     }
 
     for (const { address, account } of quoteParticipants) {
-      await quoteVault
+      await market
+        .quoteVault
         .withSigner(makeSigner(account))
-        .transferToMarket(market.orderbookAddress, TRANSFER_PER_MARKET);
+        .transferToMarket(market.orderbookAddress, market.transferQuote);
       logger.info("Quote transferred to market", { market: market.index, address });
     }
 
@@ -452,7 +553,9 @@ async function main() {
         bestAsk: bestAskPreSeed.toString(),
       });
     } else {
-      const midPrice = market.orderbook.calculateLimitPrice(BASE_PRICE);
+      const midPrice = market.orderbook.calculateLimitPrice(
+        market.midPriceQuotePerBase,
+      );
       seedResult = await market
         .orderbook
         .withSigner(market.adminSigner)
@@ -490,7 +593,10 @@ async function main() {
     const maxQuoteUnitsFromBalance = Number(
       buyerQuoteBefore / BigInt(10 ** TOKEN_DECIMALS),
     );
-    const buyMaxQuoteUnits = Math.min(MARKET_TAKER_MAX_QUOTE, maxQuoteUnitsFromBalance);
+    const buyMaxQuoteUnits = Math.min(
+      market.takerMaxQuote,
+      maxQuoteUnitsFromBalance,
+    );
 
     const takerRequests: Array<{
       label: string;
@@ -504,7 +610,7 @@ async function main() {
           market
             .orderbook
             .withSigner(makeSigner(seller.account))
-            .placeSellMarketOrder(MARKET_TAKER_AMOUNT),
+            .placeSellMarketOrder(market.takerAmountBase),
       },
     ];
 
@@ -516,11 +622,12 @@ async function main() {
           market
             .orderbook
             .withSigner(makeSigner(buyer.account))
-            .placeBuyMarketOrder(MARKET_TAKER_AMOUNT, buyMaxQuoteUnits),
+            .placeBuyMarketOrder(market.takerAmountBase, buyMaxQuoteUnits),
       });
     } else {
       logger.warn("Skipping buy taker due to zero quote balance in market", {
         market: market.index,
+        pair: `${market.baseSymbol}/${market.quoteSymbol}`,
         buyer: buyerAddress,
       });
       takerRequests.push({
@@ -530,7 +637,7 @@ async function main() {
           market
             .orderbook
             .withSigner(makeSigner(sellerBackup.account))
-            .placeSellMarketOrder(MARKET_TAKER_AMOUNT),
+            .placeSellMarketOrder(market.takerAmountBase),
       });
     }
 
@@ -576,6 +683,7 @@ async function main() {
 
     logger.info("Market execution summary", {
       market: market.index,
+      pair: `${market.baseSymbol}/${market.quoteSymbol}`,
       bidsSeeded: seedResult.bidsInserted,
       asksSeeded: seedResult.asksInserted,
       firstOrderId: seedResult.firstOrderId.toString(),
@@ -596,8 +704,16 @@ async function main() {
       market: market.index,
       orderbook: market.orderbookAddress,
       baseVault: market.baseVaultAddress,
-      quoteVault: config.contracts.quoteTokenVault,
+      quoteVault: market.quoteVaultAddress,
       baseTokenId: market.baseTokenId,
+      quoteTokenId: market.quoteTokenId,
+      baseSymbol: market.baseSymbol,
+      quoteSymbol: market.quoteSymbol,
+      midPriceQuotePerBase: market.midPriceQuotePerBase.toString(),
+      transferBase: market.transferBase,
+      transferQuote: market.transferQuote,
+      takerAmountBase: market.takerAmountBase,
+      takerMaxQuote: market.takerMaxQuote,
       seed: (MARKETS_DEFAULT_SEED + BigInt(market.index)).toString(),
       bidsSeeded: seedResult.bidsInserted,
       asksSeeded: seedResult.asksInserted,
@@ -644,7 +760,7 @@ async function main() {
   console.log(`    Markets: ${marketContexts.length}`);
   console.log(`    Target vault balance per user: ${formatToken(TARGET_BALANCE)}`);
   console.log(
-    `    Transfer to each market per participant: ${TRANSFER_PER_MARKET} units`,
+    "    Transfers and taker sizing are dynamic per market based on target mid price.",
   );
   console.log(
     `    Seed depth per market: levels=${POPULATE_LEVELS}, orders_per_level=${POPULATE_ORDERS_PER_LEVEL}, tick_bps=${POPULATE_TICK_BPS}`,
@@ -652,16 +768,18 @@ async function main() {
   console.log(
     `    Seed base amount range: ${formatToken(POPULATE_MIN_BASE)} .. ${formatToken(POPULATE_MAX_BASE)}`,
   );
-  console.log(
-    `    Taker flow: sell=${MARKET_TAKER_AMOUNT} base units, buy=${MARKET_TAKER_AMOUNT} base units (max quote=${MARKET_TAKER_MAX_QUOTE})`,
-  );
 
   for (const row of perMarketSummary) {
-    console.log(`\n  Market #${row.market}`);
+    console.log(`\n  Market #${row.market} (${row.baseSymbol}/${row.quoteSymbol})`);
     console.log(`    Orderbook: ${row.orderbook}`);
     console.log(`    Base vault: ${row.baseVault}`);
     console.log(`    Quote vault: ${row.quoteVault}`);
     console.log(`    Base token id: ${row.baseTokenId}`);
+    console.log(`    Quote token id: ${row.quoteTokenId}`);
+    console.log(`    Mid price (${row.quoteSymbol} per ${row.baseSymbol}): ${row.midPriceQuotePerBase}`);
+    console.log(
+      `    Transfer/taker: base=${row.transferBase}, quote=${row.transferQuote}, taker_base=${row.takerAmountBase}, taker_max_quote=${row.takerMaxQuote}`,
+    );
     console.log(`    Seed used: ${row.seed}`);
     console.log(`    Seeded bids/asks: ${row.bidsSeeded}/${row.asksSeeded}`);
     console.log(`    Seed order id range: ${row.firstOrderId} -> ${row.lastOrderId}`);

@@ -202,8 +202,7 @@ code {
 
 .ladder-columns {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 6px;
 }
 
 .ask-title,
@@ -220,8 +219,72 @@ code {
   color: #9ae3d4;
 }
 
+.orderbook-head-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 0 10px;
+  font-size: 0.72rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #b7d0e4;
+}
+
+.orderbook-head-row span {
+  text-align: right;
+}
+
 .table-wrap.compact table {
   min-width: 260px;
+}
+
+.table-wrap.compact .orderbook-table {
+  min-width: 0;
+}
+
+.orderbook-wrap {
+  max-height: 320px;
+}
+
+.orderbook-table {
+  table-layout: fixed;
+}
+
+.orderbook-table td {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ob-price {
+  font-weight: 600;
+}
+
+.ask-price {
+  color: #ffbca1;
+}
+
+.bid-price {
+  color: #95f2dd;
+}
+
+.depth-divider {
+  border: 1px solid #7ca3c035;
+  border-radius: 8px;
+  background: #10283fa3;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.depth-divider > div {
+  display: grid;
+  gap: 3px;
+}
+
+.depth-divider b {
+  font-size: 0.92rem;
+  color: #e4f2ff;
 }
 
 .limit-form {
@@ -229,6 +292,24 @@ code {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   align-items: end;
+}
+
+.actor-label {
+  display: grid;
+  gap: 4px;
+  color: #c9e0f4;
+  font-size: 0.8rem;
+  margin-bottom: 10px;
+}
+
+.actor-label select {
+  width: 100%;
+  background: #081321;
+  color: var(--text);
+  border: 1px solid #6f95b340;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 0.84rem;
 }
 
 .limit-form label {
@@ -315,6 +396,8 @@ code {
 
 .chart-controls {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -324,10 +407,31 @@ code {
   color: #e6f7ff;
 }
 
+.chart-controls .mini-btn.auto-toggle.running {
+  border-color: #ffb484;
+  background: #5a2b12;
+  color: #ffe5cf;
+}
+
+.auto-state {
+  font-size: 0.78rem;
+  padding-left: 4px;
+}
+
 .trade-panel {
   margin-top: 14px;
   border-top: 1px solid #7ba2c120;
   padding-top: 12px;
+}
+
+.balances-panel {
+  margin-top: 14px;
+  border-top: 1px solid #7ba2c120;
+  padding-top: 12px;
+}
+
+.balances-table .selected-balance {
+  background: #1d3f5f66;
 }
 
 .trade-form {
@@ -459,10 +563,36 @@ tbody tr:hover {
 }
 
 .orderbook-row {
+  position: relative;
   cursor: pointer;
 }
 
-.orderbook-row:hover {
+.orderbook-row td {
+  position: relative;
+  z-index: 1;
+}
+
+.orderbook-row::before {
+  content: "";
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  width: var(--depth-pct, 0%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.orderbook-row.ask::before {
+  right: 0;
+  background: linear-gradient(90deg, transparent, #6d3a3a80);
+}
+
+.orderbook-row.bid::before {
+  left: 0;
+  background: linear-gradient(90deg, #1c5f4f80, transparent);
+}
+
+.orderbook-row:hover td {
   background: #1f3f5f6b;
 }
 

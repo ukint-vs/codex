@@ -1,5 +1,5 @@
 import http from "node:http";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,12 +32,15 @@ const DEFAULT_POLL_SCAN_MAX_ORDER_ID = 450;
 const DEFAULT_ORDERS_PER_MARKET = 20;
 const DEFAULT_DEPTH_LEVELS = 20;
 const DEFAULT_OPEN_ORDERS_SCAN_COUNT = 220;
+const DEFAULT_SCAN_AHEAD_ORDER_ID = 300;
+const DEFAULT_ACTION_HISTORY_LIMIT = 2_000;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
+const defaultHistoryFilePath = path.join(__dirname, "data", "recent-actions.json");
 
 type Participant = {
   role: string;
@@ -89,6 +92,9 @@ type MarketSnapshot = {
   baseVault: Address;
   quoteVault: Address;
   baseTokenId: string;
+  quoteTokenId: string;
+  baseSymbol: string;
+  quoteSymbol: string;
   bestBid: string;
   bestAsk: string;
   spreadBps: string | null;
@@ -111,6 +117,12 @@ type Snapshot = {
   participants: Participant[];
   markets: MarketSnapshot[];
   warning?: string;
+};
+
+type PersistedActionsV1 = {
+  version: 1;
+  savedAt: string;
+  entries: Record<string, ActionRow[]>;
 };
 
 type TriggerOrderBody = {
@@ -233,8 +245,19 @@ const depthLevels = Number(
 const openOrdersScanCount = Number(
   process.env.DEMO_UI_OPEN_ORDERS_SCAN_COUNT ?? DEFAULT_OPEN_ORDERS_SCAN_COUNT,
 );
+const scanAheadOrderId = Number(
+  process.env.DEMO_UI_SCAN_AHEAD_ORDER_ID ?? DEFAULT_SCAN_AHEAD_ORDER_ID,
+);
 const refreshMs = Number(process.env.DEMO_UI_REFRESH_MS ?? DEFAULT_REFRESH_MS);
 const port = Number(process.env.DEMO_UI_PORT ?? 4180);
+const actionHistoryLimit = Number(
+  process.env.DEMO_UI_ACTION_HISTORY_LIMIT ?? DEFAULT_ACTION_HISTORY_LIMIT,
+);
+const historyFilePath =
+  process.env.DEMO_UI_HISTORY_FILE?.trim() || defaultHistoryFilePath;
+
+const marketActionKey = (marketIndex: number, orderbookAddress: Address): string =>
+  `${marketIndex}:${orderbookAddress.toLowerCase()}`;
 
 const buildParticipants = (): Participant[] => {
   const base = [...accountsBaseTokensFunded.keys()].slice(0, 4).map((address, i) => ({
@@ -361,6 +384,20 @@ const readJsonBody = async <T>(req: http.IncomingMessage): Promise<T> => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const formatPriceAdaptive = (value: number): string => {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value >= 1000) return value.toFixed(2);
+  if (value >= 1) return value.toFixed(6).replace(/\.?0+$/, "");
+  if (value >= 0.01) return value.toFixed(8).replace(/\.?0+$/, "");
+  if (value >= 0.0001) return value.toFixed(10).replace(/\.?0+$/, "");
+  return value.toPrecision(10).replace(/\.?0+$/, "");
+};
+
+const parsePositiveNumber = (value: unknown): number => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
 const executionPriceFromDeltas = (
   baseDelta: bigint,
   quoteDelta: bigint,
@@ -369,7 +406,25 @@ const executionPriceFromDeltas = (
   const base = Number(baseDelta < 0n ? -baseDelta : baseDelta) / 10 ** TOKEN_DECIMALS;
   const quote = Number(quoteDelta < 0n ? -quoteDelta : quoteDelta) / 10 ** TOKEN_DECIMALS;
   if (!Number.isFinite(base) || base <= 0) return undefined;
-  return (quote / base).toFixed(6);
+  return formatPriceAdaptive(quote / base);
+};
+
+const resolveExecutionPriceApprox = (args: {
+  referencePrice?: number;
+  deltaPrice?: string;
+}): string | undefined => {
+  const ref = parsePositiveNumber(args.referencePrice);
+  const delta = parsePositiveNumber(args.deltaPrice);
+  if (ref > 0 && delta > 0) {
+    const ratio = delta / ref;
+    if (ratio >= 0.2 && ratio <= 5) {
+      return formatPriceAdaptive(delta);
+    }
+    return formatPriceAdaptive(ref);
+  }
+  if (ref > 0) return formatPriceAdaptive(ref);
+  if (delta > 0) return formatPriceAdaptive(delta);
+  return undefined;
 };
 
 async function main() {
@@ -442,7 +497,11 @@ async function main() {
     index,
     orderbookAddress: market.orderbook,
     baseVaultAddress: market.baseTokenVault,
+    quoteVaultAddress: market.quoteTokenVault,
     baseTokenId: market.baseTokenId,
+    quoteTokenId: market.quoteTokenId,
+    baseSymbol: (market.baseSymbol ?? `BASE${index}`).toUpperCase(),
+    quoteSymbol: (market.quoteSymbol ?? "USDC").toUpperCase(),
     orderbook: new Orderbook(
       orderbookCodec,
       varaEthApi,
@@ -453,14 +512,144 @@ async function main() {
     ),
   }));
 
-  const recentActionsByMarket = new Map<number, ActionRow[]>();
+  const recentActionsByMarket = new Map<string, ActionRow[]>();
+  const latestSeenOrderIdByMarket = new Map<number, number>();
 
-  const pushRecentAction = (marketIndex: number, action: ActionRow) => {
-    const current = recentActionsByMarket.get(marketIndex) ?? [];
-    current.unshift(action);
-    if (current.length > 300) current.length = 300;
-    recentActionsByMarket.set(marketIndex, current);
+  const parseOrderIdNumber = (value: unknown): number | undefined => {
+    if (typeof value === "bigint") {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      const n = Number(value.trim());
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    }
+    return undefined;
   };
+
+  const trackSeenOrderId = (marketIndex: number, orderIdLike: unknown): void => {
+    const orderId = parseOrderIdNumber(orderIdLike);
+    if (!Number.isFinite(orderId)) return;
+    const current = latestSeenOrderIdByMarket.get(marketIndex) ?? 0;
+    if (orderId > current) {
+      latestSeenOrderIdByMarket.set(marketIndex, orderId);
+    }
+  };
+
+  const scanUpperBoundForMarket = (marketIndex: number): number => {
+    const seen = latestSeenOrderIdByMarket.get(marketIndex) ?? 0;
+    const scanBase = Number.isFinite(scanMaxOrderId) ? Math.max(1, Math.floor(scanMaxOrderId)) : 1;
+    const ahead = Number.isFinite(scanAheadOrderId) ? Math.max(50, Math.floor(scanAheadOrderId)) : 300;
+    return Math.max(scanBase, seen + ahead);
+  };
+
+  const loadPersistedActions = async (): Promise<void> => {
+    try {
+      const raw = await readFile(historyFilePath, "utf8");
+      const parsed = JSON.parse(raw) as Partial<PersistedActionsV1>;
+      const entries = parsed.entries ?? {};
+
+      for (const [key, value] of Object.entries(entries)) {
+        if (!Array.isArray(value)) continue;
+        const normalized = value
+          .filter((row) => row && typeof row.ts === "string" && typeof row.kind === "string")
+          .slice(0, actionHistoryLimit);
+        const marketIndex = Number.parseInt(key.split(":")[0] ?? "", 10);
+        if (Number.isFinite(marketIndex)) {
+          for (const row of normalized) {
+            trackSeenOrderId(marketIndex, row.orderId);
+            trackSeenOrderId(marketIndex, row.selectedOrderId);
+          }
+        }
+        if (normalized.length > 0) {
+          recentActionsByMarket.set(key, normalized);
+        }
+      }
+
+      logger.info("Loaded persisted demo UI actions", {
+        historyFilePath,
+        marketsWithHistory: recentActionsByMarket.size,
+      });
+    } catch (error) {
+      const message = String(error);
+      if (message.includes("ENOENT")) {
+        logger.info("No persisted demo UI actions found", { historyFilePath });
+        return;
+      }
+      logger.warn("Failed to load persisted demo UI actions", {
+        historyFilePath,
+        error: message,
+      });
+    }
+  };
+
+  let persistInFlight = false;
+  let persistTimer: NodeJS.Timeout | null = null;
+
+  const persistActions = async (): Promise<void> => {
+    if (persistInFlight) return;
+    persistInFlight = true;
+    try {
+      await mkdir(path.dirname(historyFilePath), { recursive: true });
+      const payload: PersistedActionsV1 = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        entries: Object.fromEntries(recentActionsByMarket.entries()),
+      };
+      const tempPath = `${historyFilePath}.tmp`;
+      await writeFile(tempPath, JSON.stringify(payload, null, 2), "utf8");
+      await rename(tempPath, historyFilePath);
+    } catch (error) {
+      logger.warn("Failed to persist demo UI actions", {
+        historyFilePath,
+        error: String(error),
+      });
+    } finally {
+      persistInFlight = false;
+    }
+  };
+
+  const schedulePersistActions = (): void => {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      void persistActions();
+    }, 700);
+  };
+
+  const getRecentActions = (marketIndex: number, orderbookAddress: Address): ActionRow[] => {
+    const key = marketActionKey(marketIndex, orderbookAddress);
+    const direct = recentActionsByMarket.get(key);
+    if (direct) return direct;
+
+    const legacy = recentActionsByMarket.get(String(marketIndex));
+    if (!legacy) return [];
+
+    recentActionsByMarket.set(key, legacy);
+    recentActionsByMarket.delete(String(marketIndex));
+    schedulePersistActions();
+    return legacy;
+  };
+
+  const pushRecentAction = (
+    marketIndex: number,
+    orderbookAddress: Address,
+    action: ActionRow,
+  ) => {
+    const key = marketActionKey(marketIndex, orderbookAddress);
+    const current = recentActionsByMarket.get(key) ?? [];
+    current.unshift(action);
+    if (current.length > actionHistoryLimit) current.length = actionHistoryLimit;
+    recentActionsByMarket.set(key, current);
+    trackSeenOrderId(marketIndex, action.orderId);
+    trackSeenOrderId(marketIndex, action.selectedOrderId);
+    schedulePersistActions();
+  };
+
+  await loadPersistedActions();
 
   const observeExecution = async (
     orderbook: Orderbook,
@@ -515,12 +704,13 @@ async function main() {
   const collectSnapshot = async (): Promise<Snapshot> => {
     const marketRows = await Promise.all(
       markets.map(async (market) => {
+        const scanUpperBound = scanUpperBoundForMarket(market.index);
         const [bestBidRaw, bestAskRaw, openOrders, balances] = await Promise.all([
           market.orderbook.bestBidPrice().then((x) => BigInt(x)),
           market.orderbook.bestAskPrice().then((x) => BigInt(x)),
           scanOpenOrders(
             market.orderbook,
-            scanMaxOrderId,
+            scanUpperBound,
             Math.max(openOrdersScanCount, ordersPerMarket),
           ),
           Promise.all(
@@ -535,20 +725,26 @@ async function main() {
             }),
           ),
         ]);
+        for (const order of openOrders) {
+          trackSeenOrderId(market.index, order.id);
+        }
 
         return {
           index: market.index,
           orderbook: market.orderbookAddress,
           baseVault: market.baseVaultAddress,
-          quoteVault: config.contracts.quoteTokenVault,
+          quoteVault: market.quoteVaultAddress,
           baseTokenId: market.baseTokenId,
+          quoteTokenId: market.quoteTokenId,
+          baseSymbol: market.baseSymbol,
+          quoteSymbol: market.quoteSymbol,
           bestBid: asPrice(bestBidRaw),
           bestAsk: asPrice(bestAskRaw),
           spreadBps: computeSpreadBps(bestBidRaw, bestAskRaw),
           orders: toOrderRows(openOrders, ordersPerMarket),
           depth: buildDepth(openOrders, depthLevels),
           balances,
-          recentActions: recentActionsByMarket.get(market.index) ?? [],
+          recentActions: getRecentActions(market.index, market.orderbookAddress),
         } satisfies MarketSnapshot;
       }),
     );
@@ -632,6 +828,11 @@ async function main() {
           TOKEN_DECIMALS,
         ).withSigner(makeSigner(actorAccount));
 
+        const [bestBidBefore, bestAskBefore] = await Promise.all([
+          market.orderbook.bestBidPrice().then((x) => BigInt(x)),
+          market.orderbook.bestAskPrice().then((x) => BigInt(x)),
+        ]);
+
         const maxQuote =
           side === "buy"
             ? Math.max(amountBase, Number(body.maxQuote ?? amountBase * 2))
@@ -645,8 +846,23 @@ async function main() {
               ? orderbook.placeBuyMarketOrder(amountBase, maxQuote, false)
               : orderbook.placeSellMarketOrder(amountBase, false),
         );
+        trackSeenOrderId(market.index, result.orderId);
 
-        pushRecentAction(market.index, {
+        const deltaExecutionPrice = executionPriceFromDeltas(
+          result.baseDelta,
+          result.quoteDelta,
+        );
+        const bookExecutionReference = side === "buy"
+          ? fpPriceToNumber(bestAskBefore)
+          : fpPriceToNumber(bestBidBefore);
+        const executionPriceApprox = result.executed
+          ? resolveExecutionPriceApprox({
+              referencePrice: bookExecutionReference,
+              deltaPrice: deltaExecutionPrice,
+            })
+          : undefined;
+
+        pushRecentAction(market.index, market.orderbookAddress, {
           ts: new Date().toISOString(),
           kind: "market",
           status: result.executed ? "executed" : "submitted",
@@ -656,10 +872,7 @@ async function main() {
           orderId: result.orderId.toString(),
           baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
           quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
-          executionPriceApprox: executionPriceFromDeltas(
-            result.baseDelta,
-            result.quoteDelta,
-          ),
+          executionPriceApprox,
           note: result.executed
             ? "Balance changed"
             : "Submitted (no immediate balance change observed)",
@@ -703,6 +916,7 @@ async function main() {
         if (!Number.isFinite(orderId) || orderId <= 0) {
           throw new Error("orderId must be a positive number");
         }
+        trackSeenOrderId(market.index, orderId);
 
         const sourceOrder = await market.orderbook.orderById(BigInt(orderId));
         if (!sourceOrder.exists) {
@@ -770,7 +984,7 @@ async function main() {
         const selectedAffected =
           !selectedAfter.exists || selectedRemainingAfter < selectedRemainingBefore;
 
-        pushRecentAction(market.index, {
+        pushRecentAction(market.index, market.orderbookAddress, {
           ts: new Date().toISOString(),
           kind: "take",
           status: selectedAffected
@@ -787,10 +1001,13 @@ async function main() {
           baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
           quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
           executionPriceApprox: result.executed
-            ? (executionPriceFromDeltas(
-                result.baseDelta,
-                result.quoteDelta,
-              ) ?? refPrice.toFixed(6))
+            ? resolveExecutionPriceApprox({
+                referencePrice: refPrice,
+                deltaPrice: executionPriceFromDeltas(
+                  result.baseDelta,
+                  result.quoteDelta,
+                ),
+              })
             : undefined,
           note: selectedAffected
             ? "Selected order was reduced/filled"
@@ -890,10 +1107,11 @@ async function main() {
                   false,
                 ),
         );
+        trackSeenOrderId(market.index, result.orderId);
         const limitMatched =
           side === "buy" ? result.baseDelta > 0n : result.quoteDelta > 0n;
 
-        pushRecentAction(market.index, {
+        pushRecentAction(market.index, market.orderbookAddress, {
           ts: new Date().toISOString(),
           kind: "limit",
           status: limitMatched ? "executed" : "submitted",
@@ -904,7 +1122,13 @@ async function main() {
           baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
           quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
           executionPriceApprox: limitMatched
-            ? executionPriceFromDeltas(result.baseDelta, result.quoteDelta)
+            ? resolveExecutionPriceApprox({
+                referencePrice: priceQuotePerBase,
+                deltaPrice: executionPriceFromDeltas(
+                  result.baseDelta,
+                  result.quoteDelta,
+                ),
+              })
             : undefined,
           note: limitMatched
             ? "Limit matched immediately"
@@ -961,11 +1185,25 @@ async function main() {
     logger.info("Demo UI started", {
       url: `http://127.0.0.1:${port}`,
       refreshMs,
+      actionHistoryLimit,
+      historyFilePath,
       scanMaxOrderId,
+      scanAheadOrderId,
       ordersPerMarket,
       depthLevels,
       openOrdersScanCount,
     });
+  });
+
+  const onExit = () => {
+    void persistActions();
+  };
+  process.on("beforeExit", onExit);
+  process.on("SIGINT", () => {
+    void persistActions().finally(() => process.exit(0));
+  });
+  process.on("SIGTERM", () => {
+    void persistActions().finally(() => process.exit(0));
   });
 }
 

@@ -275,35 +275,44 @@ create_programs() {
 
     log_info "Using ETH_RPC_HTTP: $ETH_RPC_HTTP"
 
-    MARKET_COUNT=${MARKET_COUNT:-3}
-
-    # Create Vault mirror program(s)
     log_info "Creating Vault mirror programs..."
     source "$SCRIPT_DIR/helpers.sh"
 
-    # Creating Quote Token Vault
-    set +e
-    QUOTE_VAULT_INIT_PAYLOAD=$(create_quote_vault_init_payload)
-    log_info "Quote Vault Init Payload: $QUOTE_VAULT_INIT_PAYLOAD"
-    QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS=$(create_mirror_program "$VAULT_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY_FOR_DEPLOY" "$ETH_RPC_HTTP" "$QUOTE_VAULT_INIT_PAYLOAD")
-    program_exit_code=$?
-    set -e
-
-    if [ $program_exit_code -ne 0 ] || [ -z "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS" ]; then
-        log_error "Failed to create Quote Token Vault mirror program"
-        exit 1
+    local required_market_count
+    required_market_count=$(get_market_count)
+    MARKET_COUNT=${MARKET_COUNT:-$required_market_count}
+    if [ "$MARKET_COUNT" -ne "$required_market_count" ]; then
+        log_warn "Overriding MARKET_COUNT=$MARKET_COUNT to required showcase value: $required_market_count"
+        MARKET_COUNT=$required_market_count
     fi
-    log_info "Quote Token Vault Program Address: $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
-    export QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS
 
     local -a BASE_TOKEN_VAULT_PROGRAM_ADDRESSES=()
+    local -a QUOTE_TOKEN_VAULT_PROGRAM_ADDRESSES=()
     local -a ORDERBOOK_PROGRAM_ADDRESSES=()
     local -a MARKET_BASE_TOKEN_IDS_ARRAY=()
+    local -a MARKET_QUOTE_TOKEN_IDS_ARRAY=()
+    local -a MARKET_BASE_SYMBOLS_ARRAY=()
+    local -a MARKET_QUOTE_SYMBOLS_ARRAY=()
+    local -a MARKET_MID_PRICES_ARRAY=()
 
     for ((i=0; i<MARKET_COUNT; i++)); do
         local base_token_id
-        base_token_id=$(get_base_token_id "$i")
+        local quote_token_id
+        local base_symbol
+        local quote_symbol
+        local mid_price
+
+        base_token_id=$(get_market_base_token_id "$i")
+        quote_token_id=$(get_market_quote_token_id "$i")
+        base_symbol=$(get_market_base_symbol "$i")
+        quote_symbol=$(get_market_quote_symbol "$i")
+        mid_price=$(get_market_mid_price "$i")
+
         MARKET_BASE_TOKEN_IDS_ARRAY+=("$base_token_id")
+        MARKET_QUOTE_TOKEN_IDS_ARRAY+=("$quote_token_id")
+        MARKET_BASE_SYMBOLS_ARRAY+=("$base_symbol")
+        MARKET_QUOTE_SYMBOLS_ARRAY+=("$quote_symbol")
+        MARKET_MID_PRICES_ARRAY+=("$mid_price")
 
         set +e
         BASE_VAULT_INIT_PAYLOAD=$(create_base_vault_init_payload "$base_token_id")
@@ -320,7 +329,21 @@ create_programs() {
         log_info "Base Token Vault[$i] Program Address: $base_vault_address"
 
         set +e
-        ORDERBOOK_INIT_PAYLOAD=$(create_orderbook_init_payload "$base_vault_address" "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS" "$base_token_id" "$QUOTE_TOKEN_ID")
+        QUOTE_VAULT_INIT_PAYLOAD=$(create_quote_vault_init_payload "$quote_token_id")
+        log_info "Quote Vault[$i] Init Payload: $QUOTE_VAULT_INIT_PAYLOAD"
+        quote_vault_address=$(create_mirror_program "$VAULT_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY_FOR_DEPLOY" "$ETH_RPC_HTTP" "$QUOTE_VAULT_INIT_PAYLOAD")
+        program_exit_code=$?
+        set -e
+
+        if [ $program_exit_code -ne 0 ] || [ -z "$quote_vault_address" ]; then
+            log_error "Failed to create Quote Token Vault mirror program for market $i"
+            exit 1
+        fi
+        QUOTE_TOKEN_VAULT_PROGRAM_ADDRESSES+=("$quote_vault_address")
+        log_info "Quote Token Vault[$i] Program Address: $quote_vault_address"
+
+        set +e
+        ORDERBOOK_INIT_PAYLOAD=$(create_orderbook_init_payload "$base_vault_address" "$quote_vault_address" "$base_token_id" "$quote_token_id")
         log_info "Orderbook[$i] Init Payload: $ORDERBOOK_INIT_PAYLOAD"
         orderbook_address=$(create_mirror_program "$ORDERBOOK_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY_FOR_DEPLOY" "$ETH_RPC_HTTP" "$ORDERBOOK_INIT_PAYLOAD")
         program_exit_code=$?
@@ -336,23 +359,35 @@ create_programs() {
         payload=$(create_vault_add_market_payload "$orderbook_address")
         send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" "$base_vault_address" \
             "$payload" "$SENDER_ADDRESS" "$KEY_STORE" "$ETH_RPC_HTTP" "$ROUTER_ADDRESS"
-        send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS" \
+        send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" "$quote_vault_address" \
             "$payload" "$SENDER_ADDRESS" "$KEY_STORE" "$ETH_RPC_HTTP" "$ROUTER_ADDRESS"
     done
 
     ORDERBOOK_PROGRAM_ADDRESS="${ORDERBOOK_PROGRAM_ADDRESSES[0]}"
     BASE_TOKEN_VAULT_PROGRAM_ADDRESS="${BASE_TOKEN_VAULT_PROGRAM_ADDRESSES[0]}"
+    QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS="${QUOTE_TOKEN_VAULT_PROGRAM_ADDRESSES[0]}"
     BASE_TOKEN_ID="${MARKET_BASE_TOKEN_IDS_ARRAY[0]}"
 
     ORDERBOOK_MARKET_ADDRESSES=$(IFS=,; echo "${ORDERBOOK_PROGRAM_ADDRESSES[*]}")
     BASE_TOKEN_VAULT_ADDRESSES=$(IFS=,; echo "${BASE_TOKEN_VAULT_PROGRAM_ADDRESSES[*]}")
+    QUOTE_TOKEN_VAULT_ADDRESSES=$(IFS=,; echo "${QUOTE_TOKEN_VAULT_PROGRAM_ADDRESSES[*]}")
     MARKET_BASE_TOKEN_IDS=$(IFS=,; echo "${MARKET_BASE_TOKEN_IDS_ARRAY[*]}")
+    MARKET_QUOTE_TOKEN_IDS=$(IFS=,; echo "${MARKET_QUOTE_TOKEN_IDS_ARRAY[*]}")
+    MARKET_BASE_SYMBOLS=$(IFS=,; echo "${MARKET_BASE_SYMBOLS_ARRAY[*]}")
+    MARKET_QUOTE_SYMBOLS=$(IFS=,; echo "${MARKET_QUOTE_SYMBOLS_ARRAY[*]}")
+    MARKET_MID_PRICES=$(IFS=,; echo "${MARKET_MID_PRICES_ARRAY[*]}")
 
     export ORDERBOOK_PROGRAM_ADDRESS
     export BASE_TOKEN_VAULT_PROGRAM_ADDRESS
+    export QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS
     export ORDERBOOK_MARKET_ADDRESSES
     export BASE_TOKEN_VAULT_ADDRESSES
+    export QUOTE_TOKEN_VAULT_ADDRESSES
     export MARKET_BASE_TOKEN_IDS
+    export MARKET_QUOTE_TOKEN_IDS
+    export MARKET_BASE_SYMBOLS
+    export MARKET_QUOTE_SYMBOLS
+    export MARKET_MID_PRICES
     export BASE_TOKEN_ID
 
     log_info "========================================="
@@ -360,10 +395,15 @@ create_programs() {
     log_info "========================================="
     log_info "Orderbook Program (legacy/market0): $ORDERBOOK_PROGRAM_ADDRESS"
     log_info "Base Token Vault (legacy/market0): $BASE_TOKEN_VAULT_PROGRAM_ADDRESS"
-    log_info "Quote Token Vault Program: $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
+    log_info "Quote Token Vault Program (legacy/market0): $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
     log_info "ORDERBOOK_MARKET_ADDRESSES: $ORDERBOOK_MARKET_ADDRESSES"
     log_info "BASE_TOKEN_VAULT_ADDRESSES: $BASE_TOKEN_VAULT_ADDRESSES"
+    log_info "QUOTE_TOKEN_VAULT_ADDRESSES: $QUOTE_TOKEN_VAULT_ADDRESSES"
     log_info "MARKET_BASE_TOKEN_IDS: $MARKET_BASE_TOKEN_IDS"
+    log_info "MARKET_QUOTE_TOKEN_IDS: $MARKET_QUOTE_TOKEN_IDS"
+    log_info "MARKET_BASE_SYMBOLS: $MARKET_BASE_SYMBOLS"
+    log_info "MARKET_QUOTE_SYMBOLS: $MARKET_QUOTE_SYMBOLS"
+    log_info "MARKET_MID_PRICES: $MARKET_MID_PRICES"
     log_info "========================================="
 }
 
@@ -376,7 +416,12 @@ update_env_var "$ENV_FILE" "BASE_TOKEN_VAULT_ADDRESS" "$BASE_TOKEN_VAULT_PROGRAM
 update_env_var "$ENV_FILE" "QUOTE_TOKEN_VAULT_ADDRESS" "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
 update_env_var "$ENV_FILE" "ORDERBOOK_MARKET_ADDRESSES" "$ORDERBOOK_MARKET_ADDRESSES"
 update_env_var "$ENV_FILE" "BASE_TOKEN_VAULT_ADDRESSES" "$BASE_TOKEN_VAULT_ADDRESSES"
+update_env_var "$ENV_FILE" "QUOTE_TOKEN_VAULT_ADDRESSES" "$QUOTE_TOKEN_VAULT_ADDRESSES"
 update_env_var "$ENV_FILE" "MARKET_BASE_TOKEN_IDS" "$MARKET_BASE_TOKEN_IDS"
+update_env_var "$ENV_FILE" "MARKET_QUOTE_TOKEN_IDS" "$MARKET_QUOTE_TOKEN_IDS"
+update_env_var "$ENV_FILE" "MARKET_BASE_SYMBOLS" "$MARKET_BASE_SYMBOLS"
+update_env_var "$ENV_FILE" "MARKET_QUOTE_SYMBOLS" "$MARKET_QUOTE_SYMBOLS"
+update_env_var "$ENV_FILE" "MARKET_MID_PRICES" "$MARKET_MID_PRICES"
 update_env_var "$ENV_FILE" "ROUTER_ADDRESS" "$ROUTER_ADDRESS"
 update_env_var "$ENV_FILE" "ETHEREUM_WS_RPC" "ws://127.0.0.1:8545"
 update_env_var "$ENV_FILE" "VARA_ETH_WS_RPC" "ws://127.0.0.1:9944"

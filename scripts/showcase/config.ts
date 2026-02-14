@@ -33,6 +33,12 @@ const parseCsv = (value?: string): string[] => {
     .filter((x) => x.length > 0);
 };
 
+const parseCsvNumbers = (value?: string): Array<number | undefined> =>
+  parseCsv(value).map((x) => {
+    const parsed = Number(x);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  });
+
 const isLocalWsUrl = (value: string): boolean =>
   /^(ws|wss):\/\/(127\.0\.0\.1|localhost)(:\d+)?/i.test(value.trim());
 
@@ -50,6 +56,11 @@ const legacyQuoteVault = getEnv("QUOTE_TOKEN_VAULT_ADDRESS") as Address;
 const marketOrderbooks = parseCsv(getOptionalEnv("ORDERBOOK_MARKET_ADDRESSES"));
 const marketBaseVaults = parseCsv(getOptionalEnv("BASE_TOKEN_VAULT_ADDRESSES"));
 const marketBaseTokenIds = parseCsv(getOptionalEnv("MARKET_BASE_TOKEN_IDS"));
+const marketQuoteVaults = parseCsv(getOptionalEnv("QUOTE_TOKEN_VAULT_ADDRESSES"));
+const marketQuoteTokenIds = parseCsv(getOptionalEnv("MARKET_QUOTE_TOKEN_IDS"));
+const marketBaseSymbols = parseCsv(getOptionalEnv("MARKET_BASE_SYMBOLS"));
+const marketQuoteSymbols = parseCsv(getOptionalEnv("MARKET_QUOTE_SYMBOLS"));
+const marketMidPrices = parseCsvNumbers(getOptionalEnv("MARKET_MID_PRICES"));
 
 const marketCount = Math.min(
   marketOrderbooks.length,
@@ -62,13 +73,24 @@ const markets =
     ? Array.from({ length: marketCount }).map((_, i) => ({
         orderbook: marketOrderbooks[i] as Address,
         baseTokenVault: marketBaseVaults[i] as Address,
+        quoteTokenVault: (marketQuoteVaults[i] ?? legacyQuoteVault) as Address,
         baseTokenId: marketBaseTokenIds[i],
+        quoteTokenId:
+          marketQuoteTokenIds[i] ?? "0000000000000000000000000000000000000001",
+        baseSymbol: marketBaseSymbols[i] ?? `BASE${i}`,
+        quoteSymbol: marketQuoteSymbols[i] ?? "USDC",
+        midPriceQuotePerBase: marketMidPrices[i],
       }))
     : [
         {
           orderbook: legacyOrderbook,
           baseTokenVault: legacyBaseVault,
+          quoteTokenVault: legacyQuoteVault,
           baseTokenId: "0000000000000000000000000000000000000000",
+          quoteTokenId: "0000000000000000000000000000000000000001",
+          baseSymbol: "BASE",
+          quoteSymbol: "QUOTE",
+          midPriceQuotePerBase: 1,
         },
       ];
 

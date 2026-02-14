@@ -37,44 +37,45 @@
           <section class="ladder-panel">
             <div class="ladder-head">
               <h3>Orderbook</h3>
-              <span class="muted">click a level to prefill</span>
+              <span class="muted">click a level to prefill order form</span>
             </div>
             <div class="ladder-columns">
-              <div>
-                <h4 class="ask-title">Asks</h4>
-                <div class="table-wrap compact">
-                  <table class="asks-table">
-                    <thead>
-                      <tr>
-                        <th>Price</th>
-                        <th>Size</th>
-                        <th>Total</th>
-                      </tr>
-                    </thead>
-                    <tbody></tbody>
-                  </table>
+              <div class="orderbook-head-row">
+                <span>Total</span>
+                <span>Size</span>
+                <span>Price</span>
+              </div>
+              <h4 class="ask-title">Asks</h4>
+              <div class="table-wrap compact orderbook-wrap">
+                <table class="asks-table orderbook-table">
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div class="depth-divider">
+                <div>
+                  <span class="muted">Spread</span>
+                  <b data-depth-spread>-</b>
+                </div>
+                <div>
+                  <span class="muted">Mid</span>
+                  <b data-depth-mid>-</b>
                 </div>
               </div>
-              <div>
-                <h4 class="bid-title">Bids</h4>
-                <div class="table-wrap compact">
-                  <table class="bids-table">
-                    <thead>
-                      <tr>
-                        <th>Price</th>
-                        <th>Size</th>
-                        <th>Total</th>
-                      </tr>
-                    </thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
+              <h4 class="bid-title">Bids</h4>
+              <div class="table-wrap compact orderbook-wrap">
+                <table class="bids-table orderbook-table">
+                  <tbody></tbody>
+                </table>
               </div>
             </div>
           </section>
 
           <section class="order-entry-panel">
             <h3>Order Entry</h3>
+            <label class="actor-label">
+              Trader
+              <select class="actor-role-select"></select>
+            </label>
             <form class="limit-form">
               <label>
                 Side
@@ -85,7 +86,7 @@
               </label>
               <label>
                 Price
-                <input type="number" name="priceQuotePerBase" min="0.000001" step="0.000001" />
+                <input type="number" name="priceQuotePerBase" min="0" step="any" />
               </label>
               <label>
                 Amount (base)
@@ -116,6 +117,23 @@
               </form>
               <div class="trade-status muted"></div>
             </div>
+
+            <div class="balances-panel">
+              <h3>Participant Balances</h3>
+              <div class="table-wrap compact">
+                <table class="balances-table">
+                  <thead>
+                    <tr>
+                      <th>Role</th>
+                      <th>Base</th>
+                      <th>Quote</th>
+                      <th>Use</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
           </section>
         </div>
         <div class="chart-wrap">
@@ -124,6 +142,8 @@
             <div class="chart-controls">
               <button type="button" class="mini-btn active" data-chart-mode="tick">Ticks</button>
               <button type="button" class="mini-btn" data-chart-mode="candle">Candles</button>
+              <button type="button" class="mini-btn auto-toggle" data-auto-toggle>Start Auto</button>
+              <span class="muted auto-state" data-auto-state>auto: stopped</span>
             </div>
           </div>
           <div class="price-chart" data-price-chart></div>
