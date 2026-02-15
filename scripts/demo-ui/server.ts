@@ -1091,6 +1091,11 @@ async function main() {
           TOKEN_DECIMALS,
         ).withSigner(makeSigner(actorAccount));
 
+        const [bestBidBefore, bestAskBefore] = await Promise.all([
+          market.orderbook.bestBidPrice().then((x) => BigInt(x)),
+          market.orderbook.bestAskPrice().then((x) => BigInt(x)),
+        ]);
+
         const result = await observeExecution(
           orderbook,
           actorAccount.address,
@@ -1110,6 +1115,9 @@ async function main() {
         trackSeenOrderId(market.index, result.orderId);
         const limitMatched =
           side === "buy" ? result.baseDelta > 0n : result.quoteDelta > 0n;
+        const bookExecutionReference = side === "buy"
+          ? fpPriceToNumber(bestAskBefore)
+          : fpPriceToNumber(bestBidBefore);
 
         pushRecentAction(market.index, market.orderbookAddress, {
           ts: new Date().toISOString(),
@@ -1123,7 +1131,10 @@ async function main() {
           quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
           executionPriceApprox: limitMatched
             ? resolveExecutionPriceApprox({
-                referencePrice: priceQuotePerBase,
+                referencePrice:
+                  bookExecutionReference > 0
+                    ? bookExecutionReference
+                    : priceQuotePerBase,
                 deltaPrice: executionPriceFromDeltas(
                   result.baseDelta,
                   result.quoteDelta,
