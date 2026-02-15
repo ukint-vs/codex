@@ -1,0 +1,31 @@
+<svg width="860" height="150" viewBox="0 0 860 150" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="codex logo">
+  <defs>
+    <linearGradient id="codexGradient" x1="20" y1="22" x2="760" y2="130" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#48F0CC" />
+      <stop offset="1" stop-color="#72C7FF" />
+    </linearGradient>
+    <filter id="codexGlow" x="0" y="0" width="860" height="150" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="2.5" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g filter="url(#codexGlow)" stroke="url(#codexGradient)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M114 24H56C38 24 24 38 24 56V94C24 112 38 126 56 126H114" />
+
+    <path d="M205 24H271C289 24 303 38 303 56V94C303 112 289 126 271 126H205C187 126 173 112 173 94V56C173 38 187 24 205 24Z" />
+
+    <path d="M356 24V126" />
+    <path d="M356 24H422C444 24 462 41 473 56C480 66 483 74 483 75C483 76 480 84 473 94C462 109 444 126 422 126H356" />
+
+    <path d="M536 24H626" />
+    <path d="M536 75H612" />
+    <path d="M536 126H626" />
+
+    <path d="M683 24L788 126" />
+    <path d="M788 24L683 126" />
+  </g>
+</svg>

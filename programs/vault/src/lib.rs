@@ -1,6 +1,8 @@
 #![no_std]
 
 use clob_common::{actor_to_eth, TokenId};
+#[cfg(feature = "debug")]
+use clob_common::{eth_to_actor, SHOWCASE_PREFUNDED_ETH_ADDRESSES};
 use sails_rs::{cell::RefCell, gstd::debug, gstd::exec, gstd::msg, prelude::*};
 
 mod state;
@@ -41,6 +43,9 @@ pub struct VaultProgram {
     state: RefCell<VaultState>,
 }
 
+#[cfg(feature = "debug")]
+const SHOWCASE_VAULT_PREFUND_ATOMS: u128 = 10_000_000_000_000;
+
 fn reply_ok() {
     // Empty reply is enough for callers; depositless on ethexe.
     msg::reply((), 0).expect("ReplyFailed");
@@ -64,15 +69,33 @@ fn decode_orderbook_deposit_ack(reply: &[u8]) -> bool {
     false
 }
 
+#[cfg(feature = "debug")]
+fn seed_showcase_prefunds(state: &mut VaultState) {
+    for address in SHOWCASE_PREFUNDED_ETH_ADDRESSES {
+        state
+            .balances
+            .insert(eth_to_actor(address), SHOWCASE_VAULT_PREFUND_ATOMS);
+    }
+}
+
 #[program]
 impl VaultProgram {
     #[export]
     pub fn create(token_id: ActorId) -> Self {
+        #[cfg(feature = "debug")]
+        let mut state = VaultState {
+            admin: Some(msg::source()),
+            token: actor_to_eth(token_id),
+            ..VaultState::default()
+        };
+        #[cfg(not(feature = "debug"))]
         let state = VaultState {
             admin: Some(msg::source()),
             token: actor_to_eth(token_id),
             ..VaultState::default()
         };
+        #[cfg(feature = "debug")]
+        seed_showcase_prefunds(&mut state);
         Self {
             state: RefCell::new(state),
         }

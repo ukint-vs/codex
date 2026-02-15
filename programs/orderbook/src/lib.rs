@@ -1,5 +1,7 @@
 #![no_std]
 use clob_common::TokenId;
+#[cfg(feature = "debug")]
+use clob_common::{eth_to_actor, SHOWCASE_PREFUNDED_ETH_ADDRESSES};
 use matching_engine::{Book, IncomingOrder, MatchError, OrderId, OrderKind, Side};
 use sails_rs::{cell::RefCell, gstd::msg, prelude::*};
 
@@ -14,6 +16,42 @@ const DEMO_MAX_TOTAL_ORDERS: u32 = 2_000;
 const BPS_SCALE: u32 = 10_000;
 #[cfg(feature = "debug")]
 const DEMO_SEED_FALLBACK: u64 = 0x9E37_79B9_7F4A_7C15;
+#[cfg(feature = "debug")]
+const SHOWCASE_PREFUND_BASE_ATOMS: u128 = 10_000_000_000_000;
+#[cfg(feature = "debug")]
+const SHOWCASE_PREFUND_QUOTE_ATOMS: u128 = 10_000_000_000_000;
+#[cfg(feature = "debug")]
+const SHOWCASE_INIT_LEVELS: u16 = 10;
+#[cfg(feature = "debug")]
+const SHOWCASE_INIT_ORDERS_PER_LEVEL: u16 = 10;
+#[cfg(feature = "debug")]
+const SHOWCASE_INIT_TICK_BPS: u16 = 50;
+#[cfg(feature = "debug")]
+const SHOWCASE_INIT_MIN_BASE_ATOMS: u128 = 2_000_000;
+#[cfg(feature = "debug")]
+const SHOWCASE_INIT_MAX_BASE_ATOMS: u128 = 20_000_000;
+#[cfg(feature = "debug")]
+const SHOWCASE_MAKERS_PER_SIDE: usize = SHOWCASE_PREFUNDED_ETH_ADDRESSES.len() / 2;
+#[cfg(feature = "debug")]
+const VARA_TOKEN_ID: TokenId = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+];
+#[cfg(feature = "debug")]
+const USDC_TOKEN_ID: TokenId = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+];
+#[cfg(feature = "debug")]
+const ETH_TOKEN_ID: TokenId = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11,
+];
+#[cfg(feature = "debug")]
+const MID_PRICE_1E30: u128 = 1_000_000_000_000_000_000_000_000_000_000;
+#[cfg(feature = "debug")]
+const MID_PRICE_VARA_USDC_1E30: u128 = 1_165_000_000_000_000_000_000_000_000;
+#[cfg(feature = "debug")]
+const MID_PRICE_ETH_USDC_1E30: u128 = 2_055_000_000_000_000_000_000_000_000_000_000;
+#[cfg(feature = "debug")]
+const MID_PRICE_USDC_VARA_1E30: u128 = 858_369_098_000_000_000_000_000_000_000_000;
 
 pub struct Orderbook<'a> {
     state: &'a RefCell<state::State>,
@@ -143,6 +181,102 @@ impl<'a> Orderbook<'a> {
         let bid = (mid * U256::from(bid_factor)) / U256::from(BPS_SCALE);
 
         (bid.low_u128(), ask.low_u128())
+    }
+
+    #[cfg(feature = "debug")]
+    fn showcase_mid_price(base_token_id: TokenId, quote_token_id: TokenId) -> u128 {
+        if base_token_id == VARA_TOKEN_ID && quote_token_id == USDC_TOKEN_ID {
+            MID_PRICE_VARA_USDC_1E30
+        } else if base_token_id == ETH_TOKEN_ID && quote_token_id == USDC_TOKEN_ID {
+            MID_PRICE_ETH_USDC_1E30
+        } else if base_token_id == USDC_TOKEN_ID && quote_token_id == VARA_TOKEN_ID {
+            MID_PRICE_USDC_VARA_1E30
+        } else {
+            MID_PRICE_1E30
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    fn seed_showcase_prefunds(st: &mut state::State) {
+        for address in SHOWCASE_PREFUNDED_ETH_ADDRESSES {
+            let actor = eth_to_actor(address);
+            st.deposit(actor, Asset::Base, U256::from(SHOWCASE_PREFUND_BASE_ATOMS));
+            st.deposit(
+                actor,
+                Asset::Quote,
+                U256::from(SHOWCASE_PREFUND_QUOTE_ATOMS),
+            );
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    fn seed_showcase_orderbook(st: &mut state::State) {
+        Self::seed_showcase_prefunds(st);
+
+        if st.book.best_price(Side::Buy).is_some() || st.book.best_price(Side::Sell).is_some() {
+            return;
+        }
+
+        let per_side = u32::from(SHOWCASE_INIT_LEVELS)
+            .checked_mul(u32::from(SHOWCASE_INIT_ORDERS_PER_LEVEL))
+            .expect("TooManyOrders");
+        let total = per_side.checked_mul(2).expect("TooManyOrders");
+        if total > DEMO_MAX_TOTAL_ORDERS {
+            panic!("TooManyOrders");
+        }
+
+        let mid_price = Self::showcase_mid_price(st.base_token_id, st.quote_token_id);
+        let mut rng_state = DEMO_SEED_FALLBACK
+            ^ (u64::from(st.base_token_id[19]) << 8)
+            ^ (u64::from(st.quote_token_id[19]) << 16);
+
+        for level in 1..=SHOWCASE_INIT_LEVELS {
+            let (bid_price, ask_price) =
+                Self::level_prices(mid_price, SHOWCASE_INIT_TICK_BPS, level);
+            if bid_price == 0 || ask_price == 0 || ask_price <= bid_price {
+                continue;
+            }
+
+            for i in 0..SHOWCASE_INIT_ORDERS_PER_LEVEL {
+                let maker_slot = (usize::from(level) + usize::from(i)) % SHOWCASE_MAKERS_PER_SIDE;
+                let ask_owner = eth_to_actor(SHOWCASE_PREFUNDED_ETH_ADDRESSES[maker_slot * 2]);
+                let bid_owner =
+                    eth_to_actor(SHOWCASE_PREFUNDED_ETH_ADDRESSES[(maker_slot * 2) + 1]);
+
+                let ask_amount = Self::seeded_amount(
+                    &mut rng_state,
+                    SHOWCASE_INIT_MIN_BASE_ATOMS,
+                    SHOWCASE_INIT_MAX_BASE_ATOMS,
+                );
+                let bid_amount = Self::seeded_amount(
+                    &mut rng_state,
+                    SHOWCASE_INIT_MIN_BASE_ATOMS,
+                    SHOWCASE_INIT_MAX_BASE_ATOMS,
+                );
+
+                Self::submit_order_for_owner(
+                    st,
+                    ask_owner,
+                    Side::Sell,
+                    OrderKind::Limit,
+                    ask_price,
+                    ask_amount,
+                    0,
+                )
+                .expect("InitSeedAskFailed");
+
+                Self::submit_order_for_owner(
+                    st,
+                    bid_owner,
+                    Side::Buy,
+                    OrderKind::Limit,
+                    bid_price,
+                    bid_amount,
+                    0,
+                )
+                .expect("InitSeedBidFailed");
+            }
+        }
     }
 }
 
@@ -537,16 +671,31 @@ impl OrderBookProgram {
         max_trades: u32,
         max_preview_scans: u32,
     ) -> Self {
+        #[cfg(feature = "debug")]
+        let mut state = state::State::new(
+            msg::source(),
+            base_vault_id,
+            quote_vault_id,
+            base_token_id,
+            quote_token_id,
+            max_trades,
+            max_preview_scans,
+        );
+        #[cfg(not(feature = "debug"))]
+        let state = state::State::new(
+            msg::source(),
+            base_vault_id,
+            quote_vault_id,
+            base_token_id,
+            quote_token_id,
+            max_trades,
+            max_preview_scans,
+        );
+        #[cfg(feature = "debug")]
+        Orderbook::seed_showcase_orderbook(&mut state);
+
         Self {
-            state: RefCell::new(state::State::new(
-                msg::source(),
-                base_vault_id,
-                quote_vault_id,
-                base_token_id,
-                quote_token_id,
-                max_trades,
-                max_preview_scans,
-            )),
+            state: RefCell::new(state),
         }
     }
 

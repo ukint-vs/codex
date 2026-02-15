@@ -7,6 +7,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "showcase": "tsx scripts/showcase/main.ts",
+    "showcase:liquidity": "tsx scripts/showcase/load-liquidity.ts",
     "demo:ui": "tsx scripts/demo-ui/server.ts",
     "demo:auto-trader": "tsx scripts/demo-ui/auto-trader.ts",
     "demo:live": "tsx scripts/demo-ui/live-demo.ts"

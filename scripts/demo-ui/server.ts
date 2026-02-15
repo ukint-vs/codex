@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,7 +32,6 @@ const DEFAULT_ORDERS_PER_MARKET = 20;
 const DEFAULT_DEPTH_LEVELS = 20;
 const DEFAULT_OPEN_ORDERS_SCAN_COUNT = 220;
 const DEFAULT_TRADES_PER_MARKET = 300;
-const DEFAULT_ACTION_HISTORY_LIMIT = 2_000;
 const DEFAULT_MAKER_ACCOUNTS_PER_SIDE = 4;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
@@ -40,7 +39,6 @@ const LOCAL_VALIDATOR_FALLBACK =
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
-const defaultHistoryFilePath = path.join(__dirname, "data", "recent-actions.json");
 
 type Participant = {
   role: string;
@@ -68,22 +66,6 @@ type DepthLevel = {
   sizeBase: string;
   totalBase: string;
   orders: number;
-};
-
-type ActionRow = {
-  ts: string;
-  kind: "market" | "take" | "limit";
-  status: "submitted" | "executed" | "failed";
-  actorRole: string;
-  side: "buy" | "sell";
-  amountBase: number;
-  orderId?: string;
-  selectedOrderId?: number;
-  selectedOrderSide?: "buy" | "sell";
-  baseDelta?: string;
-  quoteDelta?: string;
-  executionPriceApprox?: string;
-  note?: string;
 };
 
 type TradeRow = {
@@ -118,7 +100,6 @@ type MarketSnapshot = {
   balances: BalanceRow[];
   tradesCount: string;
   trades: TradeRow[];
-  recentActions: ActionRow[];
 };
 
 type Snapshot = {
@@ -131,12 +112,6 @@ type Snapshot = {
   participants: Participant[];
   markets: MarketSnapshot[];
   warning?: string;
-};
-
-type PersistedActionsV1 = {
-  version: 1;
-  savedAt: string;
-  entries: Record<string, ActionRow[]>;
 };
 
 type TriggerOrderBody = {
@@ -261,9 +236,6 @@ const tradesPerMarket = Number(
 );
 const refreshMs = Number(process.env.DEMO_UI_REFRESH_MS ?? DEFAULT_REFRESH_MS);
 const port = Number(process.env.DEMO_UI_PORT ?? 4180);
-const actionHistoryLimit = Number(
-  process.env.DEMO_UI_ACTION_HISTORY_LIMIT ?? DEFAULT_ACTION_HISTORY_LIMIT,
-);
 const makerAccountsPerSide = Math.max(
   1,
   Number(
@@ -271,11 +243,28 @@ const makerAccountsPerSide = Math.max(
       ?? DEFAULT_MAKER_ACCOUNTS_PER_SIDE,
   ),
 );
-const historyFilePath =
-  process.env.DEMO_UI_HISTORY_FILE?.trim() || defaultHistoryFilePath;
 
 const marketActionKey = (marketIndex: number, orderbookAddress: Address): string =>
   `${marketIndex}:${orderbookAddress.toLowerCase()}`;
+
+const createSignerTaskRunner = () => {
+  const tails = new Map<string, Promise<unknown>>();
+
+  return async <T>(signerKey: string, task: () => Promise<T>): Promise<T> => {
+    const key = signerKey.toLowerCase();
+    const previous = tails.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(task);
+    tails.set(key, next);
+
+    try {
+      return await next;
+    } finally {
+      if (tails.get(key) === next) {
+        tails.delete(key);
+      }
+    }
+  };
+};
 
 const buildParticipants = (perSide: number): Participant[] => {
   const base = [...accountsBaseTokensFunded.keys()].slice(0, perSide).map((address, i) => ({
@@ -429,49 +418,6 @@ const readJsonBody = async <T>(req: http.IncomingMessage): Promise<T> => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const formatPriceAdaptive = (value: number): string => {
-  if (!Number.isFinite(value) || value <= 0) return "0";
-  if (value >= 1000) return value.toFixed(2);
-  if (value >= 1) return value.toFixed(6).replace(/\.?0+$/, "");
-  if (value >= 0.01) return value.toFixed(8).replace(/\.?0+$/, "");
-  if (value >= 0.0001) return value.toFixed(10).replace(/\.?0+$/, "");
-  return value.toPrecision(10).replace(/\.?0+$/, "");
-};
-
-const parsePositiveNumber = (value: unknown): number => {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-};
-
-const executionPriceFromDeltas = (
-  baseDelta: bigint,
-  quoteDelta: bigint,
-): string | undefined => {
-  if (baseDelta === 0n || quoteDelta === 0n) return undefined;
-  const base = Number(baseDelta < 0n ? -baseDelta : baseDelta) / 10 ** TOKEN_DECIMALS;
-  const quote = Number(quoteDelta < 0n ? -quoteDelta : quoteDelta) / 10 ** TOKEN_DECIMALS;
-  if (!Number.isFinite(base) || base <= 0) return undefined;
-  return formatPriceAdaptive(quote / base);
-};
-
-const resolveExecutionPriceApprox = (args: {
-  referencePrice?: number;
-  deltaPrice?: string;
-}): string | undefined => {
-  const ref = parsePositiveNumber(args.referencePrice);
-  const delta = parsePositiveNumber(args.deltaPrice);
-  if (ref > 0 && delta > 0) {
-    const ratio = delta / ref;
-    if (ratio >= 0.2 && ratio <= 5) {
-      return formatPriceAdaptive(delta);
-    }
-    return formatPriceAdaptive(ref);
-  }
-  if (ref > 0) return formatPriceAdaptive(ref);
-  if (delta > 0) return formatPriceAdaptive(delta);
-  return undefined;
-};
-
 async function main() {
   await initCodec();
   await initAccounts(20);
@@ -484,6 +430,7 @@ async function main() {
   [...accountsQuoteTokensFunded.entries()].slice(0, makerAccountsPerSide).forEach(([_, account], i) =>
     accountByRole.set(`quote-maker-${i}`, account),
   );
+  const runForSigner = createSignerTaskRunner();
 
   const ethTransport = webSocket(config.transports.ethereumWs);
   const publicClient = createPublicClient({ transport: ethTransport });
@@ -557,103 +504,8 @@ async function main() {
     ),
   }));
 
-  const recentActionsByMarket = new Map<string, ActionRow[]>();
   const tradeSeenAtByMarket = new Map<string, Map<string, string>>();
   const warnedTradeHistoryUnavailable = new Set<string>();
-
-  const loadPersistedActions = async (): Promise<void> => {
-    try {
-      const raw = await readFile(historyFilePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<PersistedActionsV1>;
-      const entries = parsed.entries ?? {};
-
-      for (const [key, value] of Object.entries(entries)) {
-        if (!Array.isArray(value)) continue;
-        const normalized = value
-          .filter((row) => row && typeof row.ts === "string" && typeof row.kind === "string")
-          .slice(0, actionHistoryLimit);
-        if (normalized.length > 0) {
-          recentActionsByMarket.set(key, normalized);
-        }
-      }
-
-      logger.info("Loaded persisted demo UI actions", {
-        historyFilePath,
-        marketsWithHistory: recentActionsByMarket.size,
-      });
-    } catch (error) {
-      const message = String(error);
-      if (message.includes("ENOENT")) {
-        logger.info("No persisted demo UI actions found", { historyFilePath });
-        return;
-      }
-      logger.warn("Failed to load persisted demo UI actions", {
-        historyFilePath,
-        error: message,
-      });
-    }
-  };
-
-  let persistInFlight = false;
-  let persistTimer: NodeJS.Timeout | null = null;
-
-  const persistActions = async (): Promise<void> => {
-    if (persistInFlight) return;
-    persistInFlight = true;
-    try {
-      await mkdir(path.dirname(historyFilePath), { recursive: true });
-      const payload: PersistedActionsV1 = {
-        version: 1,
-        savedAt: new Date().toISOString(),
-        entries: Object.fromEntries(recentActionsByMarket.entries()),
-      };
-      const tempPath = `${historyFilePath}.tmp`;
-      await writeFile(tempPath, JSON.stringify(payload, null, 2), "utf8");
-      await rename(tempPath, historyFilePath);
-    } catch (error) {
-      logger.warn("Failed to persist demo UI actions", {
-        historyFilePath,
-        error: String(error),
-      });
-    } finally {
-      persistInFlight = false;
-    }
-  };
-
-  const schedulePersistActions = (): void => {
-    if (persistTimer) return;
-    persistTimer = setTimeout(() => {
-      persistTimer = null;
-      void persistActions();
-    }, 700);
-  };
-
-  const getRecentActions = (marketIndex: number, orderbookAddress: Address): ActionRow[] => {
-    const key = marketActionKey(marketIndex, orderbookAddress);
-    const direct = recentActionsByMarket.get(key);
-    if (direct) return direct;
-
-    const legacy = recentActionsByMarket.get(String(marketIndex));
-    if (!legacy) return [];
-
-    recentActionsByMarket.set(key, legacy);
-    recentActionsByMarket.delete(String(marketIndex));
-    schedulePersistActions();
-    return legacy;
-  };
-
-  const pushRecentAction = (
-    marketIndex: number,
-    orderbookAddress: Address,
-    action: ActionRow,
-  ) => {
-    const key = marketActionKey(marketIndex, orderbookAddress);
-    const current = recentActionsByMarket.get(key) ?? [];
-    current.unshift(action);
-    if (current.length > actionHistoryLimit) current.length = actionHistoryLimit;
-    recentActionsByMarket.set(key, current);
-    schedulePersistActions();
-  };
 
   const toTradeRows = (
     marketIndex: number,
@@ -733,8 +585,6 @@ async function main() {
     }
   };
 
-  await loadPersistedActions();
-
   const observeExecution = async (
     orderbook: Orderbook,
     actorAddress: Address,
@@ -745,18 +595,44 @@ async function main() {
     baseDelta: bigint;
     quoteDelta: bigint;
   }> => {
-    const [baseBefore, quoteBefore] = await orderbook.balanceOf(actorAddress);
+    let baseBefore = 0n;
+    let quoteBefore = 0n;
+    let baselineAvailable = false;
+
+    try {
+      [baseBefore, quoteBefore] = await orderbook.balanceOf(actorAddress);
+      baselineAvailable = true;
+    } catch (error) {
+      logger.warn("Failed to read baseline balance for execution observation", {
+        actorAddress,
+        error: String(error),
+      });
+    }
+
     const orderId = await submit();
+
+    if (!baselineAvailable) {
+      return {
+        orderId,
+        executed: false,
+        baseDelta: 0n,
+        quoteDelta: 0n,
+      };
+    }
 
     let baseAfter = baseBefore;
     let quoteAfter = quoteBefore;
 
     for (let i = 0; i < 12; i += 1) {
       await sleep(200);
-      const [b, q] = await orderbook.balanceOf(actorAddress);
-      baseAfter = b;
-      quoteAfter = q;
-      if (b !== baseBefore || q !== quoteBefore) break;
+      try {
+        const [b, q] = await orderbook.balanceOf(actorAddress);
+        baseAfter = b;
+        quoteAfter = q;
+        if (b !== baseBefore || q !== quoteBefore) break;
+      } catch {
+        // transient read error while waiting for settlement
+      }
     }
 
     const baseDelta = baseAfter - baseBefore;
@@ -830,7 +706,6 @@ async function main() {
             market.orderbookAddress,
             tradeData.trades,
           ),
-          recentActions: getRecentActions(market.index, market.orderbookAddress),
         } satisfies MarketSnapshot;
       }),
     );
@@ -905,62 +780,28 @@ async function main() {
           throw new Error(`Unknown actor role: ${actorRole}`);
         }
 
-        const orderbook = new Orderbook(
-          orderbookCodec,
-          varaEthApi,
-          publicClient,
-          market.orderbookAddress,
-          TOKEN_DECIMALS,
-          TOKEN_DECIMALS,
-        ).withSigner(makeSigner(actorAccount));
-
-        const [bestBidBefore, bestAskBefore] = await Promise.all([
-          market.orderbook.bestBidPrice().then((x) => BigInt(x)),
-          market.orderbook.bestAskPrice().then((x) => BigInt(x)),
-        ]);
-
         const maxQuote =
           side === "buy"
             ? Math.max(amountBase, Number(body.maxQuote ?? amountBase * 2))
             : 0;
+        const result = await runForSigner(actorAccount.address, async () => {
+          const orderbook = new Orderbook(
+            orderbookCodec,
+            varaEthApi,
+            publicClient,
+            market.orderbookAddress,
+            TOKEN_DECIMALS,
+            TOKEN_DECIMALS,
+          ).withSigner(makeSigner(actorAccount));
 
-        const result = await observeExecution(
-          orderbook,
-          actorAccount.address,
-          () =>
-            side === "buy"
-              ? orderbook.placeBuyMarketOrder(amountBase, maxQuote, false)
-              : orderbook.placeSellMarketOrder(amountBase, false),
-        );
-
-        const deltaExecutionPrice = executionPriceFromDeltas(
-          result.baseDelta,
-          result.quoteDelta,
-        );
-        const bookExecutionReference = side === "buy"
-          ? fpPriceToNumber(bestAskBefore)
-          : fpPriceToNumber(bestBidBefore);
-        const executionPriceApprox = result.executed
-          ? resolveExecutionPriceApprox({
-              referencePrice: bookExecutionReference,
-              deltaPrice: deltaExecutionPrice,
-            })
-          : undefined;
-
-        pushRecentAction(market.index, market.orderbookAddress, {
-          ts: new Date().toISOString(),
-          kind: "market",
-          status: result.executed ? "executed" : "submitted",
-          actorRole,
-          side,
-          amountBase,
-          orderId: result.orderId.toString(),
-          baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
-          quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
-          executionPriceApprox,
-          note: result.executed
-            ? "Balance changed"
-            : "Submitted (no immediate balance change observed)",
+          return observeExecution(
+            orderbook,
+            actorAccount.address,
+            () =>
+              side === "buy"
+                ? orderbook.placeBuyMarketOrder(amountBase, maxQuote, false)
+                : orderbook.placeSellMarketOrder(amountBase, false),
+          );
         });
 
         await refresh();
@@ -1031,70 +872,54 @@ async function main() {
           throw new Error(`Unknown actor role: ${actorRole}`);
         }
 
-        const orderbook = new Orderbook(
-          orderbookCodec,
-          varaEthApi,
-          publicClient,
-          market.orderbookAddress,
-          TOKEN_DECIMALS,
-          TOKEN_DECIMALS,
-        ).withSigner(makeSigner(actorAccount));
-
         const refPrice = fpPriceToNumber(sourceOrder.limitPrice);
         const buyCrossPrice = refPrice + 0.000001;
         const sellCrossPrice = Math.max(0.000001, refPrice - 0.000001);
+        const {
+          result,
+          selectedRemainingAfter,
+          selectedAffected,
+          didExecute,
+        } = await runForSigner(actorAccount.address, async () => {
+          const orderbook = new Orderbook(
+            orderbookCodec,
+            varaEthApi,
+            publicClient,
+            market.orderbookAddress,
+            TOKEN_DECIMALS,
+            TOKEN_DECIMALS,
+          ).withSigner(makeSigner(actorAccount));
 
-        const result = await observeExecution(
-          orderbook,
-          actorAccount.address,
-          () =>
-            takerSide === "buy"
-              ? orderbook.placeBuyImmediateOrCancelOrder(
-                  amountBase,
-                  buyCrossPrice,
-                  false,
-                )
-              : orderbook.placeSellImmediateOrCancelOrder(
-                  amountBase,
-                  sellCrossPrice,
-                  false,
-                ),
-        );
+          const result = await observeExecution(
+            orderbook,
+            actorAccount.address,
+            () =>
+              takerSide === "buy"
+                ? orderbook.placeBuyImmediateOrCancelOrder(
+                    amountBase,
+                    buyCrossPrice,
+                    false,
+                  )
+                : orderbook.placeSellImmediateOrCancelOrder(
+                    amountBase,
+                    sellCrossPrice,
+                    false,
+                  ),
+          );
 
-        const selectedAfter = await market.orderbook.orderById(BigInt(orderId));
-        const selectedRemainingAfter = selectedAfter.exists
-          ? selectedAfter.amountBase
-          : 0n;
-        const selectedAffected =
-          !selectedAfter.exists || selectedRemainingAfter < selectedRemainingBefore;
-        const didExecute = selectedAffected || result.executed;
+          const selectedAfter = await market.orderbook.orderById(BigInt(orderId));
+          const selectedRemainingAfter = selectedAfter.exists
+            ? selectedAfter.amountBase
+            : 0n;
+          const selectedAffected =
+            !selectedAfter.exists || selectedRemainingAfter < selectedRemainingBefore;
 
-        pushRecentAction(market.index, market.orderbookAddress, {
-          ts: new Date().toISOString(),
-          kind: "take",
-          status: didExecute ? "executed" : "failed",
-          actorRole,
-          side: takerSide,
-          amountBase,
-          orderId: result.orderId.toString(),
-          selectedOrderId: orderId,
-          selectedOrderSide: makerSide === 0 ? "buy" : "sell",
-          baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
-          quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
-          executionPriceApprox: didExecute
-            ? resolveExecutionPriceApprox({
-                referencePrice: refPrice,
-                deltaPrice: executionPriceFromDeltas(
-                  result.baseDelta,
-                  result.quoteDelta,
-                ),
-              })
-            : undefined,
-          note: selectedAffected
-            ? "Selected order was reduced/filled"
-            : didExecute
-              ? "Trade executed, but selected order not reached (higher-priority levels were matched first)"
-              : "No immediate execution observed",
+          return {
+            result,
+            selectedRemainingAfter,
+            selectedAffected,
+            didExecute: selectedAffected || result.executed,
+          };
         });
 
         await refresh();
@@ -1163,68 +988,35 @@ async function main() {
           throw new Error(`Unknown actor role: ${actorRole}`);
         }
 
-        const orderbook = new Orderbook(
-          orderbookCodec,
-          varaEthApi,
-          publicClient,
-          market.orderbookAddress,
-          TOKEN_DECIMALS,
-          TOKEN_DECIMALS,
-        ).withSigner(makeSigner(actorAccount));
+        const result = await runForSigner(actorAccount.address, async () => {
+          const orderbook = new Orderbook(
+            orderbookCodec,
+            varaEthApi,
+            publicClient,
+            market.orderbookAddress,
+            TOKEN_DECIMALS,
+            TOKEN_DECIMALS,
+          ).withSigner(makeSigner(actorAccount));
 
-        const [bestBidBefore, bestAskBefore] = await Promise.all([
-          market.orderbook.bestBidPrice().then((x) => BigInt(x)),
-          market.orderbook.bestAskPrice().then((x) => BigInt(x)),
-        ]);
-
-        const result = await observeExecution(
-          orderbook,
-          actorAccount.address,
-          () =>
-            side === "buy"
-              ? orderbook.placeBuyLimitOrder(
-                  amountBase,
-                  priceQuotePerBase,
-                  false,
-                )
-              : orderbook.placeSellLimitOrder(
-                  amountBase,
-                  priceQuotePerBase,
-                  false,
-                ),
-        );
+          return observeExecution(
+            orderbook,
+            actorAccount.address,
+            () =>
+              side === "buy"
+                ? orderbook.placeBuyLimitOrder(
+                    amountBase,
+                    priceQuotePerBase,
+                    false,
+                  )
+                : orderbook.placeSellLimitOrder(
+                    amountBase,
+                    priceQuotePerBase,
+                    false,
+                  ),
+          );
+        });
         const limitMatched =
           side === "buy" ? result.baseDelta > 0n : result.quoteDelta > 0n;
-        const bookExecutionReference = side === "buy"
-          ? fpPriceToNumber(bestAskBefore)
-          : fpPriceToNumber(bestBidBefore);
-
-        pushRecentAction(market.index, market.orderbookAddress, {
-          ts: new Date().toISOString(),
-          kind: "limit",
-          status: limitMatched ? "executed" : "submitted",
-          actorRole,
-          side,
-          amountBase,
-          orderId: result.orderId.toString(),
-          baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
-          quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
-          executionPriceApprox: limitMatched
-            ? resolveExecutionPriceApprox({
-                referencePrice:
-                  bookExecutionReference > 0
-                    ? bookExecutionReference
-                    : priceQuotePerBase,
-                deltaPrice: executionPriceFromDeltas(
-                  result.baseDelta,
-                  result.quoteDelta,
-                ),
-              })
-            : undefined,
-          note: limitMatched
-            ? "Limit matched immediately"
-            : "Limit order placed on book",
-        });
 
         await refresh();
 
@@ -1276,25 +1068,12 @@ async function main() {
     logger.info("Demo UI started", {
       url: `http://127.0.0.1:${port}`,
       refreshMs,
-      actionHistoryLimit,
-      historyFilePath,
       makerAccountsPerSide,
       ordersPerMarket,
       depthLevels,
       openOrdersScanCount,
       tradesPerMarket,
     });
-  });
-
-  const onExit = () => {
-    void persistActions();
-  };
-  process.on("beforeExit", onExit);
-  process.on("SIGINT", () => {
-    void persistActions().finally(() => process.exit(0));
-  });
-  process.on("SIGTERM", () => {
-    void persistActions().finally(() => process.exit(0));
   });
 }
 

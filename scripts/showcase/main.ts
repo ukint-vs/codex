@@ -39,10 +39,21 @@ const SETTLE_TIMEOUT_MS = 60_000;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
 const TOKEN_DECIMALS = 6;
+const TOKEN_ATOMS = 10n ** BigInt(TOKEN_DECIMALS);
 const MIN_REPRESENTABLE_PRICE = 0.000001;
+const envNumber = (key: string, fallback: number): number => {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+const IO_CONCURRENCY = Math.max(1, envNumber("SHOWCASE_IO_CONCURRENCY", 4));
 
 const formatToken = (amount: bigint, decimals: number = TOKEN_DECIMALS): string =>
   `${formatUnits(amount, decimals)} (${amount.toString()} atoms)`;
+const unitsToAtoms = (units: number): bigint => BigInt(units) * TOKEN_ATOMS;
+const atomsToUnitsCeil = (atoms: bigint): number =>
+  Number((atoms + TOKEN_ATOMS - 1n) / TOKEN_ATOMS);
 
 type DemoParticipant = {
   role: string;
@@ -170,6 +181,45 @@ const timeout = (ms: number) =>
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout(ms)]);
 }
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  const width = Math.max(1, Math.min(concurrency, items.length));
+  let cursor = 0;
+
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length) return;
+        await worker(items[index]);
+      }
+    }),
+  );
+}
+
+const createSignerTaskRunner = () => {
+  const tails = new Map<string, Promise<unknown>>();
+
+  return async <T>(signerKey: string, task: () => Promise<T>): Promise<T> => {
+    const key = signerKey.toLowerCase();
+    const previous = tails.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(task);
+    tails.set(key, next);
+
+    try {
+      return await next;
+    } finally {
+      if (tails.get(key) === next) {
+        tails.delete(key);
+      }
+    }
+  };
+};
 
 class CompatEthereumClient {
   public router: Pick<ReturnType<typeof getRouterClient>, "validators">;
@@ -342,12 +392,20 @@ async function main() {
     }
     return signer;
   };
+  const signerForAccount = (account: Account): ISigner =>
+    getSignerForAddress(account.address);
+  const runForSigner = createSignerTaskRunner();
 
-  const resolveAdminSigner = async (vault: Vault): Promise<ISigner> => {
+  const resolveAdminSigner = async (
+    vault: Vault,
+  ): Promise<{ signer: ISigner; key: string }> => {
     const adminActorId = await vault.queryAdmin();
     const adminAddress = actorIdToAddress(adminActorId);
     logger.info("Resolved admin signer", { adminActorId, adminAddress });
-    return getSignerForAddress(adminAddress);
+    return {
+      signer: getSignerForAddress(adminAddress),
+      key: adminAddress.toLowerCase(),
+    };
   };
 
   const marketContexts = config.contracts.markets.map((market, index) => {
@@ -381,6 +439,8 @@ async function main() {
       ...runtime,
       adminSigner: fallbackAdminSigner,
       quoteAdminSigner: fallbackAdminSigner,
+      adminSignerKey: fallbackAdminAccount.address.toLowerCase(),
+      quoteAdminSignerKey: fallbackAdminAccount.address.toLowerCase(),
     };
   });
 
@@ -395,27 +455,63 @@ async function main() {
 
   const fundAccounts = async (
     accounts: Map<Address, Account>,
-    vault: Vault,
+    vaultAddress: Address,
     adminSigner: ISigner,
+    adminSignerKey: string,
   ) => {
-    for (const [address, account] of accounts.entries()) {
-      const signer = makeSigner(account);
-      const available = await vault.withSigner(signer).getBalance(address);
-      if (available < TARGET_BALANCE) {
-        await vault
+    const accountEntries = [...accounts.entries()];
+    const balances: Array<{ address: Address; available: bigint }> = [];
+
+    await runWithConcurrency(
+      accountEntries,
+      IO_CONCURRENCY,
+      async ([address, account]) => {
+        const signer = signerForAccount(account);
+        const available = await new Vault(
+          vaultCodec,
+          varaEthApi,
+          publicClient,
+          vaultAddress,
+          TOKEN_DECIMALS,
+        ).withSigner(signer).getBalance(address);
+        balances.push({ address, available });
+      },
+    );
+
+    for (const { address, available } of balances) {
+      if (available >= TARGET_BALANCE) continue;
+      await runForSigner(adminSignerKey, () =>
+        new Vault(
+          vaultCodec,
+          varaEthApi,
+          publicClient,
+          vaultAddress,
+          TOKEN_DECIMALS,
+        )
           .withSigner(adminSigner)
-          .vaultDeposit(address, TARGET_BALANCE - available);
-      }
+          .vaultDeposit(address, TARGET_BALANCE - available),
+      );
     }
   };
 
   const authorizeMarket = async (
-    vault: Vault,
+    vaultAddress: Address,
     adminSigner: ISigner,
+    adminSignerKey: string,
     marketAddress: Address,
     label: string,
   ) => {
-    await vault.withSigner(adminSigner).addMarket(marketAddress);
+    await runForSigner(adminSignerKey, () =>
+      new Vault(
+        vaultCodec,
+        varaEthApi,
+        publicClient,
+        vaultAddress,
+        TOKEN_DECIMALS,
+      )
+        .withSigner(adminSigner)
+        .addMarket(marketAddress),
+    );
     logger.info("Market authorized in vault", {
       label,
       marketAddress,
@@ -424,13 +520,28 @@ async function main() {
 
   const fundedVaults = new Set<string>();
 
-  for (const market of marketContexts) {
-    market.adminSigner = await resolveAdminSigner(market.baseVault);
-    market.quoteAdminSigner = await resolveAdminSigner(market.quoteVault);
+  await Promise.all(
+    marketContexts.map(async (market) => {
+      const [baseSignerInfo, quoteSignerInfo] = await Promise.all([
+        resolveAdminSigner(market.baseVault),
+        resolveAdminSigner(market.quoteVault),
+      ]);
+      market.adminSigner = baseSignerInfo.signer;
+      market.quoteAdminSigner = quoteSignerInfo.signer;
+      market.adminSignerKey = baseSignerInfo.key;
+      market.quoteAdminSignerKey = quoteSignerInfo.key;
+    }),
+  );
 
+  for (const market of marketContexts) {
     const baseVaultKey = market.baseVaultAddress.toLowerCase();
     if (!fundedVaults.has(baseVaultKey)) {
-      await fundAccounts(accountsBaseTokensFunded, market.baseVault, market.adminSigner);
+      await fundAccounts(
+        accountsBaseTokensFunded,
+        market.baseVaultAddress,
+        market.adminSigner,
+        market.adminSignerKey,
+      );
       fundedVaults.add(baseVaultKey);
     }
 
@@ -438,8 +549,9 @@ async function main() {
     if (!fundedVaults.has(quoteVaultKey)) {
       await fundAccounts(
         accountsQuoteTokensFunded,
-        market.quoteVault,
+        market.quoteVaultAddress,
         market.quoteAdminSigner,
+        market.quoteAdminSignerKey,
       );
       fundedVaults.add(quoteVaultKey);
     }
@@ -447,14 +559,16 @@ async function main() {
 
   for (const market of marketContexts) {
     await authorizeMarket(
-      market.baseVault,
+      market.baseVaultAddress,
       market.adminSigner,
+      market.adminSignerKey,
       market.orderbookAddress,
       `base-${market.index}`,
     );
     await authorizeMarket(
-      market.quoteVault,
+      market.quoteVaultAddress,
       market.quoteAdminSigner,
+      market.quoteAdminSignerKey,
       market.orderbookAddress,
       `quote-${market.index}`,
     );
@@ -513,24 +627,73 @@ async function main() {
       takerMaxQuote: market.takerMaxQuote,
     });
 
-    for (const { address, account } of baseParticipants) {
-      await market
-        .baseVault
-        .withSigner(makeSigner(account))
-        .transferToMarket(market.orderbookAddress, market.transferBase);
-      logger.info("Base transferred to market", { market: market.index, address });
-    }
+    await Promise.all([
+      runWithConcurrency(
+        baseParticipants,
+        IO_CONCURRENCY,
+        async ({ address, account }) => {
+          const [baseBalance] = await market.orderbook.balanceOf(address);
+          const required = unitsToAtoms(market.transferBase);
+          if (baseBalance >= required) {
+            return;
+          }
 
-    for (const { address, account } of quoteParticipants) {
-      await market
-        .quoteVault
-        .withSigner(makeSigner(account))
-        .transferToMarket(market.orderbookAddress, market.transferQuote);
-      logger.info("Quote transferred to market", { market: market.index, address });
-    }
+          const deficitUnits = atomsToUnitsCeil(required - baseBalance);
+          await runForSigner(address, () =>
+            new Vault(
+              vaultCodec,
+              varaEthApi,
+              publicClient,
+              market.baseVaultAddress,
+              TOKEN_DECIMALS,
+            )
+              .withSigner(signerForAccount(account))
+              .transferToMarket(market.orderbookAddress, deficitUnits),
+          );
+          logger.info("Base top-up transferred to market", {
+            market: market.index,
+            address,
+            deficitUnits,
+          });
+        },
+      ),
+      runWithConcurrency(
+        quoteParticipants,
+        IO_CONCURRENCY,
+        async ({ address, account }) => {
+          const [, quoteBalance] = await market.orderbook.balanceOf(address);
+          const required = unitsToAtoms(market.transferQuote);
+          if (quoteBalance >= required) {
+            return;
+          }
 
-    const bestBidPreSeed = BigInt(await market.orderbook.bestBidPrice());
-    const bestAskPreSeed = BigInt(await market.orderbook.bestAskPrice());
+          const deficitUnits = atomsToUnitsCeil(required - quoteBalance);
+          await runForSigner(address, () =>
+            new Vault(
+              vaultCodec,
+              varaEthApi,
+              publicClient,
+              market.quoteVaultAddress,
+              TOKEN_DECIMALS,
+            )
+              .withSigner(signerForAccount(account))
+              .transferToMarket(market.orderbookAddress, deficitUnits),
+          );
+          logger.info("Quote top-up transferred to market", {
+            market: market.index,
+            address,
+            deficitUnits,
+          });
+        },
+      ),
+    ]);
+
+    const [bestBidPreSeedRaw, bestAskPreSeedRaw] = await Promise.all([
+      market.orderbook.bestBidPrice(),
+      market.orderbook.bestAskPrice(),
+    ]);
+    const bestBidPreSeed = BigInt(bestBidPreSeedRaw);
+    const bestAskPreSeed = BigInt(bestAskPreSeedRaw);
     const marketAlreadySeeded = bestBidPreSeed > 0n || bestAskPreSeed > 0n;
 
     let seedResult: {
@@ -556,22 +719,34 @@ async function main() {
       const midPrice = market.orderbook.calculateLimitPrice(
         market.midPriceQuotePerBase,
       );
-      seedResult = await market
-        .orderbook
-        .withSigner(market.adminSigner)
-        .populateDemoOrders({
-          seed: MARKETS_DEFAULT_SEED + BigInt(market.index),
-          levels: POPULATE_LEVELS,
-          ordersPerLevel: POPULATE_ORDERS_PER_LEVEL,
-          midPrice,
-          tickBps: POPULATE_TICK_BPS,
-          minAmountBase: POPULATE_MIN_BASE,
-          maxAmountBase: POPULATE_MAX_BASE,
-        });
+      seedResult = await runForSigner(market.adminSignerKey, () =>
+        new Orderbook(
+          orderbookCodec,
+          varaEthApi,
+          publicClient,
+          market.orderbookAddress,
+          TOKEN_DECIMALS,
+          TOKEN_DECIMALS,
+        )
+          .withSigner(market.adminSigner)
+          .populateDemoOrders({
+            seed: MARKETS_DEFAULT_SEED + BigInt(market.index),
+            levels: POPULATE_LEVELS,
+            ordersPerLevel: POPULATE_ORDERS_PER_LEVEL,
+            midPrice,
+            tickBps: POPULATE_TICK_BPS,
+            minAmountBase: POPULATE_MIN_BASE,
+            maxAmountBase: POPULATE_MAX_BASE,
+          }),
+      );
     }
 
-    const bestBidBefore = BigInt(await market.orderbook.bestBidPrice());
-    const bestAskBefore = BigInt(await market.orderbook.bestAskPrice());
+    const [bestBidBeforeRaw, bestAskBeforeRaw] = await Promise.all([
+      market.orderbook.bestBidPrice(),
+      market.orderbook.bestAskPrice(),
+    ]);
+    const bestBidBefore = BigInt(bestBidBeforeRaw);
+    const bestAskBefore = BigInt(bestAskBeforeRaw);
 
     const buyer = quoteParticipants[0];
     const seller = baseParticipants[0];
@@ -583,16 +758,13 @@ async function main() {
     const buyerAddress = buyer.address;
     const sellerAddress = seller.address;
 
-    const [buyerBaseBefore, buyerQuoteBefore] = await market.orderbook.balanceOf(
-      buyerAddress,
-    );
-    const [sellerBaseBefore, sellerQuoteBefore] = await market.orderbook.balanceOf(
-      sellerAddress,
-    );
+    const [[buyerBaseBefore, buyerQuoteBefore], [sellerBaseBefore, sellerQuoteBefore]] =
+      await Promise.all([
+        market.orderbook.balanceOf(buyerAddress),
+        market.orderbook.balanceOf(sellerAddress),
+      ]);
 
-    const maxQuoteUnitsFromBalance = Number(
-      buyerQuoteBefore / BigInt(10 ** TOKEN_DECIMALS),
-    );
+    const maxQuoteUnitsFromBalance = Number(buyerQuoteBefore / TOKEN_ATOMS);
     const buyMaxQuoteUnits = Math.min(
       market.takerMaxQuote,
       maxQuoteUnitsFromBalance,
@@ -607,10 +779,18 @@ async function main() {
         label: "sell-market-1",
         address: sellerAddress,
         submit: () =>
-          market
-            .orderbook
-            .withSigner(makeSigner(seller.account))
-            .placeSellMarketOrder(market.takerAmountBase),
+          runForSigner(sellerAddress, () =>
+            new Orderbook(
+              orderbookCodec,
+              varaEthApi,
+              publicClient,
+              market.orderbookAddress,
+              TOKEN_DECIMALS,
+              TOKEN_DECIMALS,
+            )
+              .withSigner(signerForAccount(seller.account))
+              .placeSellMarketOrder(market.takerAmountBase),
+          ),
       },
     ];
 
@@ -619,10 +799,18 @@ async function main() {
         label: "buy-market-1",
         address: buyerAddress,
         submit: () =>
-          market
-            .orderbook
-            .withSigner(makeSigner(buyer.account))
-            .placeBuyMarketOrder(market.takerAmountBase, buyMaxQuoteUnits),
+          runForSigner(buyerAddress, () =>
+            new Orderbook(
+              orderbookCodec,
+              varaEthApi,
+              publicClient,
+              market.orderbookAddress,
+              TOKEN_DECIMALS,
+              TOKEN_DECIMALS,
+            )
+              .withSigner(signerForAccount(buyer.account))
+              .placeBuyMarketOrder(market.takerAmountBase, buyMaxQuoteUnits),
+          ),
       });
     } else {
       logger.warn("Skipping buy taker due to zero quote balance in market", {
@@ -634,33 +822,42 @@ async function main() {
         label: "sell-market-2-fallback",
         address: sellerBackup.address,
         submit: () =>
-          market
-            .orderbook
-            .withSigner(makeSigner(sellerBackup.account))
-            .placeSellMarketOrder(market.takerAmountBase),
+          runForSigner(sellerBackup.address, () =>
+            new Orderbook(
+              orderbookCodec,
+              varaEthApi,
+              publicClient,
+              market.orderbookAddress,
+              TOKEN_DECIMALS,
+              TOKEN_DECIMALS,
+            )
+              .withSigner(signerForAccount(sellerBackup.account))
+              .placeSellMarketOrder(market.takerAmountBase),
+          ),
       });
     }
 
-    const takerExecutions: TakerExecution[] = [];
-    for (const request of takerRequests) {
-      try {
-        const orderId = await withTimeout(request.submit(), SETTLE_TIMEOUT_MS);
-        takerExecutions.push({
-          label: request.label,
-          address: request.address,
-          status: "fulfilled",
-          orderId: orderId.toString(),
-        });
-      } catch (error) {
-        const reason = (error as Error)?.message ?? String(error);
-        takerExecutions.push({
-          label: request.label,
-          address: request.address,
-          status: reason === "timeout" ? "timed_out" : "failed",
-          reason,
-        });
-      }
-    }
+    const takerExecutions: TakerExecution[] = await Promise.all(
+      takerRequests.map(async (request) => {
+        try {
+          const orderId = await withTimeout(request.submit(), SETTLE_TIMEOUT_MS);
+          return {
+            label: request.label,
+            address: request.address,
+            status: "fulfilled",
+            orderId: orderId.toString(),
+          } satisfies TakerExecution;
+        } catch (error) {
+          const reason = (error as Error)?.message ?? String(error);
+          return {
+            label: request.label,
+            address: request.address,
+            status: reason === "timeout" ? "timed_out" : "failed",
+            reason,
+          } satisfies TakerExecution;
+        }
+      }),
+    );
 
     const takersFulfilled = takerExecutions.filter(
       (x) => x.status === "fulfilled",
@@ -672,14 +869,19 @@ async function main() {
       (x) => x.status === "failed",
     ).length;
 
-    const bestBidAfter = BigInt(await market.orderbook.bestBidPrice());
-    const bestAskAfter = BigInt(await market.orderbook.bestAskPrice());
-    const [buyerBaseAfter, buyerQuoteAfter] = await market.orderbook.balanceOf(
-      buyerAddress,
-    );
-    const [sellerBaseAfter, sellerQuoteAfter] = await market.orderbook.balanceOf(
-      sellerAddress,
-    );
+    const [
+      bestBidAfterRaw,
+      bestAskAfterRaw,
+      [buyerBaseAfter, buyerQuoteAfter],
+      [sellerBaseAfter, sellerQuoteAfter],
+    ] = await Promise.all([
+      market.orderbook.bestBidPrice(),
+      market.orderbook.bestAskPrice(),
+      market.orderbook.balanceOf(buyerAddress),
+      market.orderbook.balanceOf(sellerAddress),
+    ]);
+    const bestBidAfter = BigInt(bestBidAfterRaw);
+    const bestAskAfter = BigInt(bestAskAfterRaw);
 
     logger.info("Market execution summary", {
       market: market.index,

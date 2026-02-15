@@ -1,14 +1,15 @@
 import { setTimeout as sleep } from "node:timers/promises";
 
-type ActionRow = {
+type TradeRow = {
+  seq: string;
+  makerOrderId: string;
+  takerOrderId: string;
+  maker: string;
+  taker: string;
+  priceQuotePerBase: string;
+  amountBase: string;
+  amountQuote: string;
   ts: string;
-  kind: "market" | "take" | "limit";
-  status: "submitted" | "executed" | "failed";
-  side: "buy" | "sell";
-  amountBase: number;
-  baseDelta?: string;
-  quoteDelta?: string;
-  executionPriceApprox?: string;
 };
 
 type OrderRow = {
@@ -46,7 +47,7 @@ type MarketSnapshot = {
     bids: DepthLevel[];
   };
   balances: BalanceRow[];
-  recentActions: ActionRow[];
+  trades: TradeRow[];
 };
 
 type Snapshot = {
@@ -130,6 +131,7 @@ const REPLENISH_MAX_PASSES = Math.max(
 );
 const TAKE_PICK_WINDOW = Math.max(3, Number(process.env.ORDER_RUNNER_TAKE_PICK_WINDOW ?? 20));
 const ROLE_SLOTS = Math.max(1, Number(process.env.ORDER_RUNNER_ROLE_SLOTS ?? 4));
+const ROLE_OFFSET = Math.max(0, Number(process.env.ORDER_RUNNER_ROLE_OFFSET ?? 0));
 const MARKETS_FILTER = new Set(
   (process.env.ORDER_RUNNER_MARKETS ?? "")
     .split(",")
@@ -139,6 +141,10 @@ const MARKETS_FILTER = new Set(
     .filter((x) => Number.isFinite(x)),
 );
 const LOOP_LIMIT = Math.max(0, Number(process.env.ORDER_RUNNER_LOOPS ?? 0));
+const MARKET_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_MARKET_CONCURRENCY ?? 2),
+);
 
 const fallbackMidByPair = new Map<string, number>([
   ["VARA/USDC", 0.001165],
@@ -199,6 +205,26 @@ const randFloat = (min: number, max: number): number =>
 const clampNumber = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
 
+const runWithConcurrency = async <T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+) => {
+  const width = Math.max(1, Math.min(concurrency, items.length));
+  let cursor = 0;
+
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length) return;
+        await worker(items[index]);
+      }
+    }),
+  );
+};
+
 const priceBoundsForReference = (referenceMid: number): { low: number; high: number } => ({
   low: Math.max(0.000000000001, referenceMid * 0.35),
   high: Math.max(0.000000000002, referenceMid * 2.6),
@@ -239,8 +265,15 @@ const estimateQuoteForAmount = (priceQuotePerBase: number, amountBase: number): 
   Math.max(1, Math.ceil(parsePositiveNumber(priceQuotePerBase) * Math.max(1, amountBase) * 1.25));
 
 const fallbackRoleForSide = (side: "buy" | "sell", cursor: number): string => {
-  const slot = Math.abs(Number(cursor ?? 0)) % ROLE_SLOTS;
+  const slot = ROLE_OFFSET + (Math.abs(Number(cursor ?? 0)) % ROLE_SLOTS);
   return side === "buy" ? `quote-maker-${slot}` : `base-maker-${slot}`;
+};
+
+const slotFromRole = (role: string): number | null => {
+  const match = role.match(/-(\d+)$/);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
 };
 
 const pickActorRoleForSide = (
@@ -266,8 +299,14 @@ const pickActorRoleForSide = (
       quote: parsePositiveNumber(row.quote),
     }))
     .filter((row) => row.role.length > 0);
-  const preferred = poolRaw.filter((row) => row.role.startsWith(preferredPrefix));
-  const pool = preferred.length > 0 ? preferred : poolRaw;
+  const scopedPoolRaw = poolRaw.filter((row) => {
+    const slot = slotFromRole(row.role);
+    if (slot === null) return true;
+    return slot >= ROLE_OFFSET && slot < ROLE_OFFSET + ROLE_SLOTS;
+  });
+  const sourcePool = scopedPoolRaw.length > 0 ? scopedPoolRaw : poolRaw;
+  const preferred = sourcePool.filter((row) => row.role.startsWith(preferredPrefix));
+  const pool = preferred.length > 0 ? preferred : sourcePool;
   if (pool.length === 0) return fallbackRoleForSide(side, cursor);
 
   const sufficient = pool.filter((row) =>
@@ -384,15 +423,9 @@ const executeOrder = (body: {
     body: JSON.stringify(body),
   });
 
-const collectExecutedPrices = (actions: ActionRow[]): number[] =>
-  actions
-    .filter((x) => {
-      if (x.status === "executed") return true;
-      const base = Math.abs(toNum(x.baseDelta));
-      const quote = Math.abs(toNum(x.quoteDelta));
-      return base > 0 && quote > 0;
-    })
-    .map((x) => toNum(x.executionPriceApprox))
+const collectExecutedPrices = (trades: TradeRow[]): number[] =>
+  trades
+    .map((x) => toNum(x.priceQuotePerBase))
     .filter((x) => x > 0)
     .reverse();
 
@@ -400,6 +433,7 @@ async function main() {
   console.log(`Auto trader started: ${DEMO_UI_BASE_URL}`);
   console.log(`Interval: ${INTERVAL_MS}ms`);
   console.log(`Per-market delay: ${PER_MARKET_DELAY_MS}ms`);
+  console.log(`Market concurrency: ${MARKET_CONCURRENCY}`);
   console.log(`Maker offset: ${MAKER_OFFSET_BPS} bps`);
   console.log(
     `Markets filter: ${MARKETS_FILTER.size > 0 ? [...MARKETS_FILTER].join(",") : "all"}`,
@@ -422,7 +456,7 @@ async function main() {
         continue;
       }
 
-      for (const market of markets) {
+      await runWithConcurrency(markets, MARKET_CONCURRENCY, async (market) => {
         try {
           const pair = `${(market.baseSymbol ?? "BASE").toUpperCase()}/${(market.quoteSymbol ?? "QUOTE").toUpperCase()}`;
           let liveMarket = market;
@@ -709,7 +743,7 @@ async function main() {
           await sleep(80);
           const postSnapshot = await fetchSnapshot();
           const postMarket = postSnapshot.markets.find((m) => m.index === market.index) ?? market;
-          const prices = collectExecutedPrices(postMarket.recentActions);
+          const prices = collectExecutedPrices(postMarket.trades ?? []);
 
           const latestPx =
             prices[prices.length - 1]
@@ -732,7 +766,7 @@ async function main() {
         } catch (marketError) {
           console.error(`market step error: ${(marketError as Error)?.message ?? String(marketError)}`);
         }
-      }
+      });
 
       if (snapshot.warning) {
         console.log(`warning: ${snapshot.warning}`);
