@@ -83,11 +83,6 @@ const parsePositiveNumber = (value) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 };
 
-const parseFiniteNumber = (value) => {
-  const parsed = Number.parseFloat(String(value ?? ""));
-  return Number.isFinite(parsed) ? parsed : 0;
-};
-
 const roundToStep = (value, step = PRICE_DISPLAY_STEP) => {
   const n = Number(value);
   if (!Number.isFinite(n) || step <= 0) return 0;
@@ -164,7 +159,7 @@ const renderTabs = (markets) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `tab-btn ${market.index === activeMarketIndex ? "active" : ""}`;
-    button.textContent = `#${market.index} ${pairLabel}`;
+    button.textContent = `M${market.index} ${pairLabel}`;
     button.addEventListener("click", () => {
       activeMarketIndex = market.index;
       renderTabs(markets);
@@ -235,30 +230,34 @@ const renderRecentOrders = (tbody, orders) => {
   }
 };
 
-const renderTradeTape = (tbody, actions) => {
+const renderTradeTape = (tbody, trades) => {
   tbody.innerHTML = "";
-  const rows = (actions ?? []).slice(0, 20);
+  const rows = (trades ?? []).slice(0, 30);
   if (!rows.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="4" class="muted">No actions yet. Use market/limit/take.</td>`;
+    tr.innerHTML = `<td colspan="5" class="muted">No on-chain executed trades yet.</td>`;
     tbody.appendChild(tr);
     return;
   }
 
-  for (const action of rows) {
+  for (const trade of rows) {
     const tr = document.createElement("tr");
-    const sideClass = action.side === "buy" ? "ok" : "warn";
-    const statusText = action.status;
-    const time = new Date(action.ts).toLocaleTimeString();
+    const time = new Date(trade.ts).toLocaleTimeString();
+    const price = formatPriceAdaptive(parsePositiveNumber(trade.priceQuotePerBase));
+    const amountBase = parsePositiveNumber(trade.amountBase) > 0
+      ? trade.amountBase
+      : "0";
+    const amountQuote = parsePositiveNumber(trade.amountQuote) > 0
+      ? trade.amountQuote
+      : "0";
     tr.innerHTML = `
       <td>${time}</td>
-      <td><span class="pill ${sideClass}">${action.side}</span></td>
-      <td>${action.kind}/${statusText}</td>
+      <td>#${trade.seq}</td>
+      <td>${price}</td>
+      <td>${amountBase} / ${amountQuote}</td>
       <td>
-        id:${action.orderId ?? "-"} |
-        amt:${action.amountBase} |
-        px:${action.executionPriceApprox ?? "-"} |
-        db:${action.baseDelta ?? "-"} dq:${action.quoteDelta ?? "-"}
+        m#${trade.makerOrderId} ${shortAddress(trade.maker)}
+        -> t#${trade.takerOrderId} ${shortAddress(trade.taker)}
       </td>
     `;
     tbody.appendChild(tr);
@@ -340,22 +339,22 @@ const ensurePriceChart = (cardState) => {
     width,
     height: PRICE_CHART_HEIGHT,
     layout: {
-      background: { color: "#041321" },
-      textColor: "#d3e8fa",
+      background: { color: "#081224" },
+      textColor: "#b8d9fa",
     },
     localization: {
       priceFormatter: (price) => formatPriceAdaptive(price),
     },
     grid: {
-      vertLines: { color: "#27435b55" },
-      horzLines: { color: "#27435b55" },
+      vertLines: { color: "#35537955" },
+      horzLines: { color: "#35537955" },
     },
     rightPriceScale: {
-      borderColor: "#3a607e",
+      borderColor: "#456c94",
       autoScale: true,
     },
     timeScale: {
-      borderColor: "#3a607e",
+      borderColor: "#456c94",
       timeVisible: true,
       secondsVisible: true,
     },
@@ -366,7 +365,7 @@ const ensurePriceChart = (cardState) => {
 
   cardState.priceChartApi = chart;
   cardState.tickSeries = chart.addLineSeries({
-    color: "#f86f5e",
+    color: "#69d8ff",
     lineWidth: 2,
     title: "Trades",
     crosshairMarkerVisible: true,
@@ -377,13 +376,13 @@ const ensurePriceChart = (cardState) => {
     },
   });
   cardState.candleSeries = chart.addCandlestickSeries({
-    upColor: "#1d6f60",
-    downColor: "#6f4731",
+    upColor: "#1f7f86",
+    downColor: "#2f6292",
     wickUpColor: "#48e0b6",
-    wickDownColor: "#ffbf70",
+    wickDownColor: "#75cfff",
     borderVisible: true,
     borderUpColor: "#48e0b6",
-    borderDownColor: "#ffbf70",
+    borderDownColor: "#75cfff",
     title: "Trades (candles)",
     priceFormat: {
       type: "price",
@@ -499,50 +498,47 @@ const appendExecutionTradePoint = (cardState, trade) => {
   );
   if (cardState.execTradeKeys.has(key)) return false;
   cardState.execTradeKeys.add(key);
+  const parsedSeq = Number.parseInt(String(trade?.seq ?? ""), 10);
+  const seq = Number.isFinite(parsedSeq) ? parsedSeq : cardState.nextExecSeq;
   cardState.execTrades.push({
     key,
     ts: Number.isFinite(Number(trade?.ts)) ? Number(trade.ts) : Date.now(),
     price,
     side: trade?.side === "sell" ? "sell" : "buy",
-    seq: cardState.nextExecSeq,
+    seq,
   });
-  cardState.nextExecSeq += 1;
+  cardState.nextExecSeq = Math.max(cardState.nextExecSeq + 1, seq + 1);
   trimExecutionTrades(cardState);
   return true;
 };
 
-const executionPriceFromDeltas = (baseDeltaRaw, quoteDeltaRaw) => {
-  const base = Math.abs(parseFiniteNumber(baseDeltaRaw));
-  const quote = Math.abs(parseFiniteNumber(quoteDeltaRaw));
-  if (!Number.isFinite(base) || !Number.isFinite(quote) || base <= 0 || quote <= 0) {
-    return 0;
-  }
-  return quote / base;
-};
+const appendExecutionTrades = (cardState, trades, market) => {
+  if (!Array.isArray(trades) || trades.length === 0) return;
 
-const appendExecutionTrades = (cardState, actions, market) => {
-  if (!Array.isArray(actions) || actions.length === 0) return;
+  const ordered = [...trades].sort((a, b) => {
+    const aSeq = Number.parseInt(String(a?.seq ?? ""), 10);
+    const bSeq = Number.parseInt(String(b?.seq ?? ""), 10);
+    if (Number.isFinite(aSeq) && Number.isFinite(bSeq) && aSeq !== bSeq) {
+      return aSeq - bSeq;
+    }
+    const aTs = Date.parse(String(a?.ts ?? ""));
+    const bTs = Date.parse(String(b?.ts ?? ""));
+    if (!Number.isFinite(aTs) || !Number.isFinite(bTs)) return 0;
+    return aTs - bTs;
+  });
 
-  for (const action of [...actions].reverse()) {
-    if (String(action.status ?? "") !== "executed") continue;
-    const price = Number.parseFloat(action.executionPriceApprox ?? "NaN");
+  for (const trade of ordered) {
+    const price = parsePositiveNumber(trade.priceQuotePerBase);
     if (!Number.isFinite(price) || price <= 0) continue;
     if (!isExecutionPricePlausible(price, market ?? cardState.latestMarket)) continue;
-    const ts = Date.parse(action.ts);
-    const key = [
-      action.ts,
-      action.orderId ?? "na",
-      action.selectedOrderId ?? "na",
-      action.kind,
-      action.status,
-      action.actorRole ?? "na",
-      action.amountBase ?? "na",
-    ].join("|");
+    const ts = Date.parse(String(trade.ts ?? ""));
+    const key = `chain|${trade.seq ?? `${trade.makerOrderId}|${trade.takerOrderId}|${trade.ts}`}`;
     appendExecutionTradePoint(cardState, {
       key,
+      seq: trade.seq,
       ts: Number.isFinite(ts) ? ts : Date.now(),
       price,
-      side: action.side,
+      side: "buy",
     });
   }
 };
@@ -758,6 +754,22 @@ const countRestingOrdersBySide = (orders) => {
   return { buy, sell };
 };
 
+const countRestingOrdersBySideFromMarket = (market) => {
+  const fromOrders = countRestingOrdersBySide(market?.orders ?? []);
+  let depthBuy = 0;
+  let depthSell = 0;
+  for (const level of market?.depth?.bids ?? []) {
+    depthBuy += Math.max(0, Number(level?.orders ?? 0));
+  }
+  for (const level of market?.depth?.asks ?? []) {
+    depthSell += Math.max(0, Number(level?.orders ?? 0));
+  }
+  return {
+    buy: Math.max(fromOrders.buy, depthBuy),
+    sell: Math.max(fromOrders.sell, depthSell),
+  };
+};
+
 const fallbackRoleForSide = (side, cursor) => {
   const slot = Math.abs(Number(cursor ?? 0)) % AUTO_ROLE_SLOTS;
   return side === "buy" ? `quote-maker-${slot}` : `base-maker-${slot}`;
@@ -799,7 +811,7 @@ const pickActorRoleForSide = (
   );
   const ranked = (sufficient.length > 0 ? sufficient : pool)
     .sort((a, b) => (side === "buy" ? (b.quote - a.quote) : (b.base - a.base)));
-  const topCount = Math.max(1, Math.min(3, ranked.length));
+  const topCount = Math.max(1, Math.min(AUTO_ROLE_SLOTS, ranked.length));
   const pick = ranked[Math.abs(Number(cursor ?? 0)) % topCount];
   return pick.role || fallbackRoleForSide(side, cursor);
 };
@@ -980,7 +992,7 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
     const replenishBookIfThin = async () => {
       let refreshed = false;
       for (let pass = 0; pass < AUTO_REPLENISH_MAX_PASSES; pass += 1) {
-        const counts = countRestingOrdersBySide(liveMarket.orders ?? []);
+        const counts = countRestingOrdersBySideFromMarket(liveMarket);
         const buyMissing = Math.max(0, AUTO_MIN_RESTING_PER_SIDE - counts.buy);
         const sellMissing = Math.max(0, AUTO_MIN_RESTING_PER_SIDE - counts.sell);
         if (buyMissing === 0 && sellMissing === 0) break;
@@ -1025,7 +1037,7 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
         ?? liveMarket;
       if (!liveMarket) break;
 
-      const counts = countRestingOrdersBySide(liveMarket.orders ?? []);
+      const counts = countRestingOrdersBySideFromMarket(liveMarket);
       if (
         counts.buy < Math.ceil(AUTO_MIN_RESTING_PER_SIDE / 2)
         || counts.sell < Math.ceil(AUTO_MIN_RESTING_PER_SIDE / 2)
@@ -1095,16 +1107,6 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
 
         if (result.selectedAffected || result.executed) {
           tradesDone += 1;
-          const localExecPrice = executionPriceFromDeltas(result.baseDelta, result.quoteDelta)
-            || pickPrice;
-          if (appendExecutionTradePoint(cardState, {
-            key: `auto-take|${marketIndex}|${result.takerOrderId ?? orderId}|${attempts}`,
-            ts: Date.now(),
-            price: localExecPrice,
-            side: takerSide,
-          }) && cardState.root.style.display !== "none") {
-            renderPriceChart(cardState);
-          }
           const impulse = takerSide === "buy"
             ? randInt(7, 34)
             : -randInt(7, 34);
@@ -1166,16 +1168,6 @@ const runAutoTradeStep = async (cardState, marketIndex) => {
         });
         if (result.executed) {
           sweepsDone += 1;
-          const sweepExecPrice = executionPriceFromDeltas(result.baseDelta, result.quoteDelta)
-            || fairMid;
-          if (appendExecutionTradePoint(cardState, {
-            key: `auto-sweep|${marketIndex}|${result.orderId ?? sweepsDone}|${attempts}`,
-            ts: Date.now(),
-            price: sweepExecPrice,
-            side: sweepSide,
-          }) && cardState.root.style.display !== "none") {
-            renderPriceChart(cardState);
-          }
           const impulse = sweepSide === "buy"
             ? randInt(10, 42)
             : -randInt(10, 42);
@@ -1263,7 +1255,8 @@ const createMarketCard = (market) => {
     actionsBody: card.querySelector(".actions-table tbody"),
   };
 
-  refs.title.textContent = `Market #${market.index} ${market.baseSymbol ?? "BASE"}/${market.quoteSymbol ?? "QUOTE"}`;
+  refs.title.textContent =
+    `codex market #${market.index} ${market.baseSymbol ?? "BASE"}/${market.quoteSymbol ?? "QUOTE"}`;
 
   const statBestBid = document.createElement("div");
   statBestBid.className = "stat";
@@ -1416,7 +1409,7 @@ const updateMarketCard = (market) => {
 
   setCellText(
     cardState.chip,
-    market.spreadBps === null ? "No Spread" : `${market.spreadBps} bps`,
+    market.spreadBps === null ? "spread n/a" : `${market.spreadBps} bps`,
   );
   cardState.addresses.innerHTML = `
     <div><b>Orderbook:</b> <code>${market.orderbook}</code></div>
@@ -1460,9 +1453,9 @@ const updateMarketCard = (market) => {
     hasTopOfBook ? formatPriceAdaptive((bestAsk + bestBid) / 2) : "-",
   );
   renderRecentOrders(cardState.ordersBody, market.orders ?? []);
-  const actions = market.recentActions ?? [];
-  renderTradeTape(cardState.actionsBody, actions);
-  appendExecutionTrades(cardState, actions, market);
+  const trades = market.trades ?? [];
+  renderTradeTape(cardState.actionsBody, trades);
+  appendExecutionTrades(cardState, trades, market);
 
   cardState.latestBalances = market.balances ?? [];
   const roles = cardState.latestBalances.map((row) => row.role);
@@ -1506,7 +1499,7 @@ const renderSnapshot = (snapshot) => {
   const date = new Date(snapshot.updatedAt);
   metaEl.textContent = `Last tick: ${date.toLocaleTimeString()} | Refresh ${(
     CHART_POLL_INTERVAL_MS / 1000
-  ).toFixed(1)}s | CEX ladder + live tape`;
+  ).toFixed(1)}s`;
 
   const indexes = new Set(snapshot.markets.map((m) => m.index));
   if (activeMarketIndex === null || !indexes.has(activeMarketIndex)) {
@@ -1530,7 +1523,7 @@ const renderSnapshot = (snapshot) => {
 };
 
 const renderError = (message) => {
-  metaEl.textContent = "Snapshot error";
+  metaEl.textContent = "codex snapshot error";
   warningsEl.innerHTML = `<p class="warning">${message}</p>`;
 };
 

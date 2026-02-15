@@ -6,7 +6,32 @@ type ActionRow = {
   status: "submitted" | "executed" | "failed";
   side: "buy" | "sell";
   amountBase: number;
+  baseDelta?: string;
+  quoteDelta?: string;
   executionPriceApprox?: string;
+};
+
+type OrderRow = {
+  id: string;
+  side: "Buy" | "Sell";
+  owner: string;
+  priceQuotePerBase: string;
+  remainingBase: string;
+  reservedQuote: string;
+};
+
+type DepthLevel = {
+  priceQuotePerBase: string;
+  sizeBase: string;
+  totalBase: string;
+  orders: number;
+};
+
+type BalanceRow = {
+  role: string;
+  address: string;
+  base: string;
+  quote: string;
 };
 
 type MarketSnapshot = {
@@ -15,6 +40,12 @@ type MarketSnapshot = {
   quoteSymbol?: string;
   bestBid: string;
   bestAsk: string;
+  orders: OrderRow[];
+  depth?: {
+    asks: DepthLevel[];
+    bids: DepthLevel[];
+  };
+  balances: BalanceRow[];
   recentActions: ActionRow[];
 };
 
@@ -33,6 +64,22 @@ type TriggerResult = {
   amountBase?: number;
   maxQuote?: number;
   executed?: boolean;
+  baseDelta?: string;
+  quoteDelta?: string;
+  error?: string;
+};
+
+type ExecuteResult = {
+  ok: boolean;
+  market?: number;
+  selectedOrderId?: number;
+  selectedOrderSide?: "buy" | "sell";
+  takerSide?: "buy" | "sell";
+  actorRole?: string;
+  amountBase?: number;
+  takerOrderId?: string;
+  executed?: boolean;
+  selectedAffected?: boolean;
   baseDelta?: string;
   quoteDelta?: string;
   error?: string;
@@ -73,6 +120,16 @@ const TRADES_PER_MARKET_MAX = Math.max(
 );
 const DRIFT_STEP_BPS = Math.max(4, Number(process.env.ORDER_RUNNER_DRIFT_STEP_BPS ?? 64));
 const DRIFT_MAX_BPS = Math.max(150, Number(process.env.ORDER_RUNNER_DRIFT_MAX_BPS ?? 2400));
+const MIN_RESTING_PER_SIDE = Math.max(
+  8,
+  Number(process.env.ORDER_RUNNER_MIN_RESTING_PER_SIDE ?? 18),
+);
+const REPLENISH_MAX_PASSES = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_REPLENISH_MAX_PASSES ?? 3),
+);
+const TAKE_PICK_WINDOW = Math.max(3, Number(process.env.ORDER_RUNNER_TAKE_PICK_WINDOW ?? 20));
+const ROLE_SLOTS = Math.max(1, Number(process.env.ORDER_RUNNER_ROLE_SLOTS ?? 4));
 const MARKETS_FILTER = new Set(
   (process.env.ORDER_RUNNER_MARKETS ?? "")
     .split(",")
@@ -93,6 +150,11 @@ const fallbackMidByPair = new Map<string, number>([
 const toNum = (v: string | number | undefined): number => {
   const n = Number(v ?? 0);
   return Number.isFinite(n) ? n : 0;
+};
+
+const parsePositiveNumber = (v: unknown): number => {
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
 const formatPriceAdaptive = (value: number): string => {
@@ -136,6 +198,107 @@ const randFloat = (min: number, max: number): number =>
 
 const clampNumber = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
+
+const priceBoundsForReference = (referenceMid: number): { low: number; high: number } => ({
+  low: Math.max(0.000000000001, referenceMid * 0.35),
+  high: Math.max(0.000000000002, referenceMid * 2.6),
+});
+
+const countRestingOrdersBySide = (
+  orders: OrderRow[],
+): { buy: number; sell: number } => {
+  let buy = 0;
+  let sell = 0;
+  for (const row of orders ?? []) {
+    if (parsePositiveNumber(row.remainingBase) < 1) continue;
+    if (String(row.side).toLowerCase() === "buy") buy += 1;
+    else sell += 1;
+  }
+  return { buy, sell };
+};
+
+const countRestingOrdersBySideFromMarket = (
+  market: MarketSnapshot,
+): { buy: number; sell: number } => {
+  const fromOrders = countRestingOrdersBySide(market.orders ?? []);
+  let depthBuy = 0;
+  let depthSell = 0;
+  for (const level of market.depth?.bids ?? []) {
+    depthBuy += Math.max(0, Number(level.orders ?? 0));
+  }
+  for (const level of market.depth?.asks ?? []) {
+    depthSell += Math.max(0, Number(level.orders ?? 0));
+  }
+  return {
+    buy: Math.max(fromOrders.buy, depthBuy),
+    sell: Math.max(fromOrders.sell, depthSell),
+  };
+};
+
+const estimateQuoteForAmount = (priceQuotePerBase: number, amountBase: number): number =>
+  Math.max(1, Math.ceil(parsePositiveNumber(priceQuotePerBase) * Math.max(1, amountBase) * 1.25));
+
+const fallbackRoleForSide = (side: "buy" | "sell", cursor: number): string => {
+  const slot = Math.abs(Number(cursor ?? 0)) % ROLE_SLOTS;
+  return side === "buy" ? `quote-maker-${slot}` : `base-maker-${slot}`;
+};
+
+const pickActorRoleForSide = (
+  balances: BalanceRow[],
+  side: "buy" | "sell",
+  amountBase: number,
+  priceQuotePerBase: number,
+  cursor: number,
+): string => {
+  const rows = Array.isArray(balances) ? balances : [];
+  if (rows.length === 0) return fallbackRoleForSide(side, cursor);
+
+  const requiredBase = side === "sell" ? Math.max(1, amountBase) : 0;
+  const requiredQuote = side === "buy"
+    ? estimateQuoteForAmount(priceQuotePerBase, amountBase)
+    : 0;
+  const preferredPrefix = side === "buy" ? "quote-maker-" : "base-maker-";
+
+  const poolRaw = rows
+    .map((row) => ({
+      role: String(row.role ?? ""),
+      base: parsePositiveNumber(row.base),
+      quote: parsePositiveNumber(row.quote),
+    }))
+    .filter((row) => row.role.length > 0);
+  const preferred = poolRaw.filter((row) => row.role.startsWith(preferredPrefix));
+  const pool = preferred.length > 0 ? preferred : poolRaw;
+  if (pool.length === 0) return fallbackRoleForSide(side, cursor);
+
+  const sufficient = pool.filter((row) =>
+    side === "buy" ? row.quote >= requiredQuote : row.base >= requiredBase,
+  );
+  const ranked = (sufficient.length > 0 ? sufficient : pool)
+    .sort((a, b) => (side === "buy" ? (b.quote - a.quote) : (b.base - a.base)));
+  const topCount = Math.max(1, Math.min(ROLE_SLOTS, ranked.length));
+  const pick = ranked[Math.abs(Number(cursor ?? 0)) % topCount];
+  return pick.role || fallbackRoleForSide(side, cursor);
+};
+
+const selectByWeightedWindow = <T>(
+  rows: T[],
+  distance: (row: T) => number,
+  window: number,
+): T | null => {
+  if (rows.length === 0) return null;
+  const ranked = [...rows].sort((a, b) => distance(a) - distance(b));
+  const pickWindow = Math.max(1, Math.min(ranked.length, window));
+  let totalWeight = 0;
+  for (let i = 0; i < pickWindow; i += 1) {
+    totalWeight += pickWindow - i;
+  }
+  let roll = Math.random() * totalWeight;
+  for (let i = 0; i < pickWindow; i += 1) {
+    roll -= pickWindow - i;
+    if (roll <= 0) return ranked[i];
+  }
+  return ranked[pickWindow - 1];
+};
 
 const sparkline = (values: number[], width: number): string => {
   const bars = "▁▂▃▄▅▆▇█";
@@ -210,9 +373,25 @@ const triggerOrder = (body: {
     body: JSON.stringify(body),
   });
 
+const executeOrder = (body: {
+  market: number;
+  orderId: number;
+  amountBase?: number;
+  actorRole: string;
+}) =>
+  fetchJson<ExecuteResult>("/api/execute-order", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
 const collectExecutedPrices = (actions: ActionRow[]): number[] =>
   actions
-    .filter((x) => x.status === "executed")
+    .filter((x) => {
+      if (x.status === "executed") return true;
+      const base = Math.abs(toNum(x.baseDelta));
+      const quote = Math.abs(toNum(x.quoteDelta));
+      return base > 0 && quote > 0;
+    })
     .map((x) => toNum(x.executionPriceApprox))
     .filter((x) => x > 0)
     .reverse();
@@ -246,8 +425,9 @@ async function main() {
       for (const market of markets) {
         try {
           const pair = `${(market.baseSymbol ?? "BASE").toUpperCase()}/${(market.quoteSymbol ?? "QUOTE").toUpperCase()}`;
-          const mid = estimateMid(market);
-          const bestAsk = toNum(market.bestAsk);
+          let liveMarket = market;
+          const mid = estimateMid(liveMarket);
+          const bounds = priceBoundsForReference(mid);
           const previousDrift = driftByMarket.get(market.index) ?? 0;
           let drift = clampNumber(
             previousDrift
@@ -259,83 +439,271 @@ async function main() {
             DRIFT_MAX_BPS,
           );
           driftByMarket.set(market.index, drift);
-          const fairMid = clampNumber(mid * (1 + drift / 10_000), mid * 0.35, mid * 2.6);
+          let fairMid = clampNumber(mid * (1 + drift / 10_000), bounds.low, bounds.high);
           const takerAmountBase = pickAmountBase(fairMid);
           const makerAmountBase = Math.max(1, Math.floor(takerAmountBase * randFloat(0.35, 0.75)));
+          let actorCursor = randInt(0, 10_000);
+          let lastExecPrice: number | undefined;
 
           let makerPlaced = 0;
-          for (let level = 1; level <= MAKER_LEVELS; level += 1) {
+          let makerFailed = 0;
+          let localRefreshCounter = 0;
+
+          const refreshMarket = async (): Promise<MarketSnapshot> => {
+            try {
+              const snap = await fetchSnapshot();
+              return snap.markets.find((m) => m.index === market.index) ?? liveMarket;
+            } catch {
+              return liveMarket;
+            }
+          };
+
+          const placeMakerOrder = async (
+            side: "buy" | "sell",
+            level: number,
+          ): Promise<boolean> => {
             const levelOffset = (MAKER_OFFSET_BPS + (level - 1) * 18) / 10_000;
-            for (const makerSide of ["buy", "sell"] as const) {
-              const rawPrice = makerSide === "buy"
-                ? fairMid * (1 - levelOffset)
-                : fairMid * (1 + levelOffset);
-              const makerPrice = clampNumber(rawPrice, mid * 0.35, mid * 2.6);
-              const makerActorRole =
-                makerSide === "buy"
-                  ? `quote-maker-${(market.index + level) % 4}`
-                  : `base-maker-${(market.index + level) % 4}`;
-              try {
-                await submitLimitOrder({
-                  market: market.index,
-                  side: makerSide,
-                  amountBase: Math.max(1, Math.floor(makerAmountBase * randFloat(0.7, 1.45))),
-                  priceQuotePerBase: makerPrice,
-                  actorRole: makerActorRole,
-                });
-                makerPlaced += 1;
-              } catch {
-                // keep running to sustain activity
+            const rawPrice = side === "buy"
+              ? fairMid * (1 - levelOffset)
+              : fairMid * (1 + levelOffset);
+            const makerPrice = clampNumber(rawPrice, bounds.low, bounds.high);
+            const amountBase = Math.max(1, Math.floor(makerAmountBase * randFloat(0.7, 1.45)));
+            const actorRole = pickActorRoleForSide(
+              liveMarket.balances ?? [],
+              side,
+              amountBase,
+              makerPrice,
+              actorCursor,
+            );
+            actorCursor += 1;
+
+            try {
+              await submitLimitOrder({
+                market: market.index,
+                side,
+                amountBase,
+                priceQuotePerBase: makerPrice,
+                actorRole,
+              });
+              makerPlaced += 1;
+              return true;
+            } catch {
+              makerFailed += 1;
+              return false;
+            }
+          };
+
+          const replenishBookIfThin = async (): Promise<void> => {
+            for (let pass = 0; pass < REPLENISH_MAX_PASSES; pass += 1) {
+              const counts = countRestingOrdersBySideFromMarket(liveMarket);
+              const buyMissing = Math.max(0, MIN_RESTING_PER_SIDE - counts.buy);
+              const sellMissing = Math.max(0, MIN_RESTING_PER_SIDE - counts.sell);
+              if (buyMissing === 0 && sellMissing === 0) return;
+
+              for (let i = 0; i < buyMissing; i += 1) {
+                await placeMakerOrder("buy", 1 + Math.floor(i / 2));
               }
+              for (let i = 0; i < sellMissing; i += 1) {
+                await placeMakerOrder("sell", 1 + Math.floor(i / 2));
+              }
+              await sleep(Math.max(60, PER_MARKET_DELAY_MS));
+              liveMarket = await refreshMarket();
+            }
+          };
+
+          for (let level = 1; level <= MAKER_LEVELS; level += 1) {
+            for (const makerSide of ["buy", "sell"] as const) {
+              await placeMakerOrder(makerSide, level);
             }
           }
 
           await sleep(PER_MARKET_DELAY_MS);
+          liveMarket = await refreshMarket();
+          await replenishBookIfThin();
 
           const tradesTarget = randInt(TRADES_PER_MARKET_MIN, TRADES_PER_MARKET_MAX);
           let tradesDone = 0;
           let tradeAttempts = 0;
-          let lastTrigger: TriggerResult | undefined;
+          const maxAttempts = Math.max(14, tradesTarget * 9);
 
-          while (tradesDone < tradesTarget && tradeAttempts < tradesTarget * 7) {
+          while (tradesDone < tradesTarget && tradeAttempts < maxAttempts) {
             tradeAttempts += 1;
-            const takerSide: "buy" | "sell" = Math.random() < (drift >= 0 ? 0.6 : 0.4)
-              ? "buy"
-              : "sell";
-            const actorRole =
-              takerSide === "buy"
-                ? `quote-maker-${(market.index + tradesDone + 1) % 4}`
-                : `base-maker-${(market.index + tradesDone + 1) % 4}`;
-            const amountBase = Math.max(
-              1,
-              Math.floor(takerAmountBase * randFloat(0.65, 1.9)),
-            );
-            const maxQuoteRef = Math.max(fairMid, mid, bestAsk);
-            const maxQuote = takerSide === "buy"
-              ? estimateMaxQuote(maxQuoteRef, amountBase)
-              : undefined;
-            try {
-              const takerResult = await triggerOrder({
-                market: market.index,
-                side: takerSide,
-                amountBase,
-                maxQuote,
-                actorRole,
-              });
-              lastTrigger = takerResult;
-              if (takerResult.executed) {
-                tradesDone += 1;
-                drift = clampNumber(
-                  drift + (takerSide === "buy" ? randInt(8, 30) : -randInt(8, 30)),
-                  -DRIFT_MAX_BPS,
-                  DRIFT_MAX_BPS,
-                );
-                driftByMarket.set(market.index, drift);
-              }
-            } catch {
-              // continue selecting another side/size; liquidity can be transient
+            localRefreshCounter += 1;
+            if (tradeAttempts === 1 || localRefreshCounter >= 2) {
+              liveMarket = await refreshMarket();
+              localRefreshCounter = 0;
             }
+
+            const counts = countRestingOrdersBySideFromMarket(liveMarket);
+            if (
+              counts.buy < Math.ceil(MIN_RESTING_PER_SIDE / 2)
+              || counts.sell < Math.ceil(MIN_RESTING_PER_SIDE / 2)
+            ) {
+              await replenishBookIfThin();
+            }
+
+            let executedNow = false;
+            const candidates = (liveMarket.orders ?? [])
+              .filter((row) => parsePositiveNumber(row.remainingBase) >= 1)
+              .filter((row) => {
+                const px = parsePositiveNumber(row.priceQuotePerBase);
+                return px >= bounds.low && px <= bounds.high;
+              });
+
+            if (candidates.length > 0) {
+              const targetPrice = clampNumber(
+                fairMid * (1 + randInt(-240, 240) / 10_000),
+                bounds.low,
+                bounds.high,
+              );
+              const picked = selectByWeightedWindow(
+                candidates,
+                (row) => Math.abs(parsePositiveNumber(row.priceQuotePerBase) - targetPrice),
+                TAKE_PICK_WINDOW,
+              );
+
+              if (picked) {
+                const orderId = Number(picked.id);
+                const remainingBase = Math.max(1, Math.floor(parsePositiveNumber(picked.remainingBase)));
+                const amountBase = Math.max(
+                  1,
+                  Math.min(
+                    remainingBase,
+                    Math.floor(takerAmountBase * randFloat(0.45, 1.6)),
+                  ),
+                );
+                const makerIsBuy = String(picked.side).toLowerCase() === "buy";
+                const takerSide: "buy" | "sell" = makerIsBuy ? "sell" : "buy";
+                const pickPrice = parsePositiveNumber(picked.priceQuotePerBase) || fairMid;
+                const actorRole = pickActorRoleForSide(
+                  liveMarket.balances ?? [],
+                  takerSide,
+                  amountBase,
+                  pickPrice,
+                  actorCursor,
+                );
+                actorCursor += 1;
+
+                try {
+                  const result = await executeOrder({
+                    market: market.index,
+                    orderId,
+                    amountBase,
+                    actorRole,
+                  });
+                  if (result.executed || result.selectedAffected) {
+                    executedNow = true;
+                    tradesDone += 1;
+                    lastExecPrice =
+                      deriveExecutionPrice(result.baseDelta, result.quoteDelta)
+                      ?? pickPrice;
+                    drift = clampNumber(
+                      drift + (takerSide === "buy" ? randInt(8, 30) : -randInt(8, 30)),
+                      -DRIFT_MAX_BPS,
+                      DRIFT_MAX_BPS,
+                    );
+                    driftByMarket.set(market.index, drift);
+                  }
+                } catch {
+                  // stale order or temporary liquidity mismatch
+                }
+              }
+            }
+
+            if (!executedNow) {
+              const takerSide: "buy" | "sell" = Math.random() < (drift >= 0 ? 0.6 : 0.4)
+                ? "buy"
+                : "sell";
+              const amountBase = Math.max(
+                1,
+                Math.floor(takerAmountBase * randFloat(0.65, 1.9)),
+              );
+              const bestAskNow = parsePositiveNumber(liveMarket.bestAsk);
+              const maxQuoteRef = Math.max(fairMid, mid, bestAskNow);
+              const actorRole = pickActorRoleForSide(
+                liveMarket.balances ?? [],
+                takerSide,
+                amountBase,
+                maxQuoteRef,
+                actorCursor,
+              );
+              actorCursor += 1;
+              const maxQuote = takerSide === "buy"
+                ? estimateMaxQuote(maxQuoteRef, amountBase)
+                : undefined;
+
+              try {
+                const takerResult = await triggerOrder({
+                  market: market.index,
+                  side: takerSide,
+                  amountBase,
+                  maxQuote,
+                  actorRole,
+                });
+                if (takerResult.executed) {
+                  tradesDone += 1;
+                  executedNow = true;
+                  lastExecPrice =
+                    deriveExecutionPrice(takerResult.baseDelta, takerResult.quoteDelta)
+                    ?? fairMid;
+                  drift = clampNumber(
+                    drift + (takerSide === "buy" ? randInt(8, 30) : -randInt(8, 30)),
+                    -DRIFT_MAX_BPS,
+                    DRIFT_MAX_BPS,
+                  );
+                  driftByMarket.set(market.index, drift);
+                }
+              } catch {
+                // continue
+              }
+            }
+
+            if (!executedNow && tradeAttempts % 4 === 0) {
+              await placeMakerOrder(Math.random() < 0.5 ? "buy" : "sell", randInt(1, 3));
+            }
+
+            fairMid = clampNumber(mid * (1 + drift / 10_000), bounds.low, bounds.high);
             await sleep(Math.max(50, Math.floor(PER_MARKET_DELAY_MS / 2)));
+          }
+
+          let kickTrades = 0;
+          if (tradesDone === 0) {
+            for (const kickSide of ["buy", "sell"] as const) {
+              liveMarket = await refreshMarket();
+              const amountBase = Math.max(1, Math.floor(takerAmountBase * randFloat(0.5, 1.2)));
+              const bestAskNow = parsePositiveNumber(liveMarket.bestAsk);
+              const maxQuoteRef = Math.max(fairMid, mid, bestAskNow);
+              const actorRole = pickActorRoleForSide(
+                liveMarket.balances ?? [],
+                kickSide,
+                amountBase,
+                maxQuoteRef,
+                actorCursor,
+              );
+              actorCursor += 1;
+
+              try {
+                const result = await triggerOrder({
+                  market: market.index,
+                  side: kickSide,
+                  amountBase,
+                  maxQuote: kickSide === "buy"
+                    ? estimateMaxQuote(maxQuoteRef, amountBase)
+                    : undefined,
+                  actorRole,
+                });
+                if (result.executed) {
+                  kickTrades += 1;
+                  tradesDone += 1;
+                  lastExecPrice =
+                    deriveExecutionPrice(result.baseDelta, result.quoteDelta)
+                    ?? fairMid;
+                }
+              } catch {
+                // continue
+              }
+              await sleep(Math.max(50, Math.floor(PER_MARKET_DELAY_MS / 2)));
+            }
           }
 
           await sleep(80);
@@ -345,7 +713,7 @@ async function main() {
 
           const latestPx =
             prices[prices.length - 1]
-            ?? deriveExecutionPrice(lastTrigger?.baseDelta, lastTrigger?.quoteDelta)
+            ?? lastExecPrice
             ?? fairMid;
 
           const chart = sparkline(prices.length > 0 ? prices : [latestPx], CHART_WIDTH);
@@ -353,8 +721,9 @@ async function main() {
             [
               `[m${market.index} ${pair}]`,
               `fair=${formatPriceAdaptive(fairMid)} drift=${Math.round(drift)}bps`,
-              `| makers=${makerPlaced}`,
+              `| makers=${makerPlaced}/${makerPlaced + makerFailed}`,
               `| trades=${tradesDone}/${tradesTarget}`,
+              `| kick=${kickTrades}`,
               `| px~${formatPriceAdaptive(latestPx)}`,
               `| bid=${formatPriceAdaptive(toNum(postMarket.bestBid))} ask=${formatPriceAdaptive(toNum(postMarket.bestAsk))}`,
               chart,

@@ -28,12 +28,12 @@ import { actorIdToAddress } from "../showcase/programs/util.js";
 const TOKEN_DECIMALS = 6;
 const PRICE_DECIMALS = 30;
 const DEFAULT_REFRESH_MS = 5000;
-const DEFAULT_POLL_SCAN_MAX_ORDER_ID = 450;
 const DEFAULT_ORDERS_PER_MARKET = 20;
 const DEFAULT_DEPTH_LEVELS = 20;
 const DEFAULT_OPEN_ORDERS_SCAN_COUNT = 220;
-const DEFAULT_SCAN_AHEAD_ORDER_ID = 300;
+const DEFAULT_TRADES_PER_MARKET = 300;
 const DEFAULT_ACTION_HISTORY_LIMIT = 2_000;
+const DEFAULT_MAKER_ACCOUNTS_PER_SIDE = 4;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
 
@@ -86,6 +86,18 @@ type ActionRow = {
   note?: string;
 };
 
+type TradeRow = {
+  seq: string;
+  makerOrderId: string;
+  takerOrderId: string;
+  maker: Address;
+  taker: Address;
+  priceQuotePerBase: string;
+  amountBase: string;
+  amountQuote: string;
+  ts: string;
+};
+
 type MarketSnapshot = {
   index: number;
   orderbook: Address;
@@ -104,6 +116,8 @@ type MarketSnapshot = {
     bids: DepthLevel[];
   };
   balances: BalanceRow[];
+  tradesCount: string;
+  trades: TradeRow[];
   recentActions: ActionRow[];
 };
 
@@ -233,9 +247,6 @@ const computeSpreadBps = (bestBid: bigint, bestAsk: bigint): string | null => {
   return (Number(bps) / 1_000).toFixed(3);
 };
 
-const scanMaxOrderId = Number(
-  process.env.DEMO_UI_SCAN_MAX_ORDER_ID ?? DEFAULT_POLL_SCAN_MAX_ORDER_ID,
-);
 const ordersPerMarket = Number(
   process.env.DEMO_UI_ORDERS_PER_MARKET ?? DEFAULT_ORDERS_PER_MARKET,
 );
@@ -245,13 +256,20 @@ const depthLevels = Number(
 const openOrdersScanCount = Number(
   process.env.DEMO_UI_OPEN_ORDERS_SCAN_COUNT ?? DEFAULT_OPEN_ORDERS_SCAN_COUNT,
 );
-const scanAheadOrderId = Number(
-  process.env.DEMO_UI_SCAN_AHEAD_ORDER_ID ?? DEFAULT_SCAN_AHEAD_ORDER_ID,
+const tradesPerMarket = Number(
+  process.env.DEMO_UI_TRADES_PER_MARKET ?? DEFAULT_TRADES_PER_MARKET,
 );
 const refreshMs = Number(process.env.DEMO_UI_REFRESH_MS ?? DEFAULT_REFRESH_MS);
 const port = Number(process.env.DEMO_UI_PORT ?? 4180);
 const actionHistoryLimit = Number(
   process.env.DEMO_UI_ACTION_HISTORY_LIMIT ?? DEFAULT_ACTION_HISTORY_LIMIT,
+);
+const makerAccountsPerSide = Math.max(
+  1,
+  Number(
+    process.env.DEMO_UI_MAKER_ACCOUNTS_PER_SIDE
+      ?? DEFAULT_MAKER_ACCOUNTS_PER_SIDE,
+  ),
 );
 const historyFilePath =
   process.env.DEMO_UI_HISTORY_FILE?.trim() || defaultHistoryFilePath;
@@ -259,12 +277,12 @@ const historyFilePath =
 const marketActionKey = (marketIndex: number, orderbookAddress: Address): string =>
   `${marketIndex}:${orderbookAddress.toLowerCase()}`;
 
-const buildParticipants = (): Participant[] => {
-  const base = [...accountsBaseTokensFunded.keys()].slice(0, 4).map((address, i) => ({
+const buildParticipants = (perSide: number): Participant[] => {
+  const base = [...accountsBaseTokensFunded.keys()].slice(0, perSide).map((address, i) => ({
     role: `base-maker-${i}`,
     address,
   }));
-  const quote = [...accountsQuoteTokensFunded.keys()].slice(0, 4).map((address, i) => ({
+  const quote = [...accountsQuoteTokensFunded.keys()].slice(0, perSide).map((address, i) => ({
     role: `quote-maker-${i}`,
     address,
   }));
@@ -282,28 +300,48 @@ type OpenOrder = {
 
 const scanOpenOrders = async (
   orderbook: Orderbook,
-  maxId: number,
   count: number,
 ): Promise<OpenOrder[]> => {
-  const rows: OpenOrder[] = [];
-  for (let id = maxId; id >= 1 && rows.length < count; id -= 1) {
-    const state = await orderbook.orderById(BigInt(id));
-    if (!state.exists) continue;
+  const rows = await orderbook.ordersReverse(0, count);
+  return rows.map((row) => ({
+    id: row.id,
+    side: (row.side === 0 ? 0 : 1) as 0 | 1,
+    owner: actorIdToAddress(row.owner),
+    limitPrice: row.limitPrice,
+    amountBase: row.amountBase,
+    reservedQuote: row.reservedQuote,
+  }));
+};
 
-    rows.push({
-      id: state.id,
-      side: (state.side === 0 ? 0 : 1) as 0 | 1,
-      owner: actorIdToAddress(state.owner),
-      limitPrice: state.limitPrice,
-      amountBase: state.amountBase,
-      reservedQuote: state.filledBase,
+const prioritizeOrdersForTaking = (orders: OpenOrder[], count: number): OpenOrder[] => {
+  const asks = orders
+    .filter((order) => order.side === 1)
+    .sort((a, b) => {
+      if (a.limitPrice !== b.limitPrice) return a.limitPrice < b.limitPrice ? -1 : 1;
+      if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+      return 0;
     });
+  const bids = orders
+    .filter((order) => order.side === 0)
+    .sort((a, b) => {
+      if (a.limitPrice !== b.limitPrice) return a.limitPrice > b.limitPrice ? -1 : 1;
+      if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+      return 0;
+    });
+
+  const prioritized: OpenOrder[] = [];
+  let i = 0;
+  while (prioritized.length < count && (i < asks.length || i < bids.length)) {
+    if (i < asks.length) prioritized.push(asks[i]);
+    if (prioritized.length >= count) break;
+    if (i < bids.length) prioritized.push(bids[i]);
+    i += 1;
   }
-  return rows;
+  return prioritized;
 };
 
 const toOrderRows = (orders: OpenOrder[], count: number): OrderRow[] =>
-  orders.slice(0, count).map((order) => ({
+  prioritizeOrdersForTaking(orders, count).map((order) => ({
     id: order.id.toString(),
     side: order.side === 0 ? "Buy" : "Sell",
     owner: order.owner,
@@ -357,6 +395,13 @@ const contentType = (filePath: string): string => {
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
   if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".svg")) return "image/svg+xml";
+  if (filePath.endsWith(".png")) return "image/png";
+  if (filePath.endsWith(".jpg") || filePath.endsWith(".jpeg")) return "image/jpeg";
+  if (filePath.endsWith(".webp")) return "image/webp";
+  if (filePath.endsWith(".woff2")) return "font/woff2";
+  if (filePath.endsWith(".woff")) return "font/woff";
+  if (filePath.endsWith(".ttf")) return "font/ttf";
   return "text/plain; charset=utf-8";
 };
 
@@ -431,12 +476,12 @@ async function main() {
   await initCodec();
   await initAccounts(20);
 
-  const participants = buildParticipants();
+  const participants = buildParticipants(makerAccountsPerSide);
   const accountByRole = new Map<string, Account>();
-  [...accountsBaseTokensFunded.entries()].slice(0, 4).forEach(([_, account], i) =>
+  [...accountsBaseTokensFunded.entries()].slice(0, makerAccountsPerSide).forEach(([_, account], i) =>
     accountByRole.set(`base-maker-${i}`, account),
   );
-  [...accountsQuoteTokensFunded.entries()].slice(0, 4).forEach(([_, account], i) =>
+  [...accountsQuoteTokensFunded.entries()].slice(0, makerAccountsPerSide).forEach(([_, account], i) =>
     accountByRole.set(`quote-maker-${i}`, account),
   );
 
@@ -513,38 +558,8 @@ async function main() {
   }));
 
   const recentActionsByMarket = new Map<string, ActionRow[]>();
-  const latestSeenOrderIdByMarket = new Map<number, number>();
-
-  const parseOrderIdNumber = (value: unknown): number | undefined => {
-    if (typeof value === "bigint") {
-      const n = Number(value);
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-    }
-    if (typeof value === "number") {
-      return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
-    }
-    if (typeof value === "string" && value.trim().length > 0) {
-      const n = Number(value.trim());
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-    }
-    return undefined;
-  };
-
-  const trackSeenOrderId = (marketIndex: number, orderIdLike: unknown): void => {
-    const orderId = parseOrderIdNumber(orderIdLike);
-    if (!Number.isFinite(orderId)) return;
-    const current = latestSeenOrderIdByMarket.get(marketIndex) ?? 0;
-    if (orderId > current) {
-      latestSeenOrderIdByMarket.set(marketIndex, orderId);
-    }
-  };
-
-  const scanUpperBoundForMarket = (marketIndex: number): number => {
-    const seen = latestSeenOrderIdByMarket.get(marketIndex) ?? 0;
-    const scanBase = Number.isFinite(scanMaxOrderId) ? Math.max(1, Math.floor(scanMaxOrderId)) : 1;
-    const ahead = Number.isFinite(scanAheadOrderId) ? Math.max(50, Math.floor(scanAheadOrderId)) : 300;
-    return Math.max(scanBase, seen + ahead);
-  };
+  const tradeSeenAtByMarket = new Map<string, Map<string, string>>();
+  const warnedTradeHistoryUnavailable = new Set<string>();
 
   const loadPersistedActions = async (): Promise<void> => {
     try {
@@ -557,13 +572,6 @@ async function main() {
         const normalized = value
           .filter((row) => row && typeof row.ts === "string" && typeof row.kind === "string")
           .slice(0, actionHistoryLimit);
-        const marketIndex = Number.parseInt(key.split(":")[0] ?? "", 10);
-        if (Number.isFinite(marketIndex)) {
-          for (const row of normalized) {
-            trackSeenOrderId(marketIndex, row.orderId);
-            trackSeenOrderId(marketIndex, row.selectedOrderId);
-          }
-        }
         if (normalized.length > 0) {
           recentActionsByMarket.set(key, normalized);
         }
@@ -644,9 +652,85 @@ async function main() {
     current.unshift(action);
     if (current.length > actionHistoryLimit) current.length = actionHistoryLimit;
     recentActionsByMarket.set(key, current);
-    trackSeenOrderId(marketIndex, action.orderId);
-    trackSeenOrderId(marketIndex, action.selectedOrderId);
     schedulePersistActions();
+  };
+
+  const toTradeRows = (
+    marketIndex: number,
+    orderbookAddress: Address,
+    trades: Awaited<ReturnType<Orderbook["tradesReverse"]>>,
+  ): TradeRow[] => {
+    const key = marketActionKey(marketIndex, orderbookAddress);
+    const seenAt = tradeSeenAtByMarket.get(key) ?? new Map<string, string>();
+    tradeSeenAtByMarket.set(key, seenAt);
+
+    const sorted = [...trades].sort((a, b) => {
+      if (a.seq === b.seq) return 0;
+      return a.seq < b.seq ? -1 : 1;
+    });
+    const now = new Date().toISOString();
+    const seqs = new Set<string>();
+    const rows: TradeRow[] = [];
+
+    for (const trade of sorted) {
+      const seq = trade.seq.toString();
+      seqs.add(seq);
+      const ts = seenAt.get(seq) ?? now;
+      if (!seenAt.has(seq)) {
+        seenAt.set(seq, ts);
+      }
+
+      rows.push({
+        seq,
+        makerOrderId: trade.makerOrderId.toString(),
+        takerOrderId: trade.takerOrderId.toString(),
+        maker: trade.maker,
+        taker: trade.taker,
+        priceQuotePerBase: asPrice(trade.price),
+        amountBase: asUnits(trade.amountBase, TOKEN_DECIMALS),
+        amountQuote: asUnits(trade.amountQuote, TOKEN_DECIMALS),
+        ts,
+      });
+    }
+
+    if (seenAt.size > tradesPerMarket * 6) {
+      for (const existing of seenAt.keys()) {
+        if (!seqs.has(existing)) {
+          seenAt.delete(existing);
+        }
+      }
+    }
+
+    rows.reverse();
+    return rows;
+  };
+
+  const loadTradeRows = async (market: (typeof markets)[number]): Promise<{
+    tradesCount: bigint;
+    trades: Awaited<ReturnType<Orderbook["tradesReverse"]>>;
+  }> => {
+    try {
+      const [tradesCount, trades] = await Promise.all([
+        market.orderbook.tradesCount(),
+        market.orderbook.tradesReverse(0, tradesPerMarket),
+      ]);
+
+      return { tradesCount, trades };
+    } catch (error) {
+      const key = `${market.index}:${market.orderbookAddress.toLowerCase()}`;
+      if (!warnedTradeHistoryUnavailable.has(key)) {
+        warnedTradeHistoryUnavailable.add(key);
+        logger.warn("Trade history queries unavailable for market", {
+          marketIndex: market.index,
+          orderbook: market.orderbookAddress,
+          error: String(error),
+        });
+      }
+      return {
+        tradesCount: 0n,
+        trades: [],
+      };
+    }
   };
 
   await loadPersistedActions();
@@ -704,13 +788,11 @@ async function main() {
   const collectSnapshot = async (): Promise<Snapshot> => {
     const marketRows = await Promise.all(
       markets.map(async (market) => {
-        const scanUpperBound = scanUpperBoundForMarket(market.index);
-        const [bestBidRaw, bestAskRaw, openOrders, balances] = await Promise.all([
+        const [bestBidRaw, bestAskRaw, openOrders, balances, tradeData] = await Promise.all([
           market.orderbook.bestBidPrice().then((x) => BigInt(x)),
           market.orderbook.bestAskPrice().then((x) => BigInt(x)),
           scanOpenOrders(
             market.orderbook,
-            scanUpperBound,
             Math.max(openOrdersScanCount, ordersPerMarket),
           ),
           Promise.all(
@@ -724,10 +806,8 @@ async function main() {
               };
             }),
           ),
+          loadTradeRows(market),
         ]);
-        for (const order of openOrders) {
-          trackSeenOrderId(market.index, order.id);
-        }
 
         return {
           index: market.index,
@@ -744,6 +824,12 @@ async function main() {
           orders: toOrderRows(openOrders, ordersPerMarket),
           depth: buildDepth(openOrders, depthLevels),
           balances,
+          tradesCount: tradeData.tradesCount.toString(),
+          trades: toTradeRows(
+            market.index,
+            market.orderbookAddress,
+            tradeData.trades,
+          ),
           recentActions: getRecentActions(market.index, market.orderbookAddress),
         } satisfies MarketSnapshot;
       }),
@@ -846,7 +932,6 @@ async function main() {
               ? orderbook.placeBuyMarketOrder(amountBase, maxQuote, false)
               : orderbook.placeSellMarketOrder(amountBase, false),
         );
-        trackSeenOrderId(market.index, result.orderId);
 
         const deltaExecutionPrice = executionPriceFromDeltas(
           result.baseDelta,
@@ -916,7 +1001,6 @@ async function main() {
         if (!Number.isFinite(orderId) || orderId <= 0) {
           throw new Error("orderId must be a positive number");
         }
-        trackSeenOrderId(market.index, orderId);
 
         const sourceOrder = await market.orderbook.orderById(BigInt(orderId));
         if (!sourceOrder.exists) {
@@ -983,15 +1067,12 @@ async function main() {
           : 0n;
         const selectedAffected =
           !selectedAfter.exists || selectedRemainingAfter < selectedRemainingBefore;
+        const didExecute = selectedAffected || result.executed;
 
         pushRecentAction(market.index, market.orderbookAddress, {
           ts: new Date().toISOString(),
           kind: "take",
-          status: selectedAffected
-            ? "executed"
-            : result.executed
-              ? "submitted"
-              : "failed",
+          status: didExecute ? "executed" : "failed",
           actorRole,
           side: takerSide,
           amountBase,
@@ -1000,7 +1081,7 @@ async function main() {
           selectedOrderSide: makerSide === 0 ? "buy" : "sell",
           baseDelta: asUnits(result.baseDelta, TOKEN_DECIMALS),
           quoteDelta: asUnits(result.quoteDelta, TOKEN_DECIMALS),
-          executionPriceApprox: result.executed
+          executionPriceApprox: didExecute
             ? resolveExecutionPriceApprox({
                 referencePrice: refPrice,
                 deltaPrice: executionPriceFromDeltas(
@@ -1011,9 +1092,9 @@ async function main() {
             : undefined,
           note: selectedAffected
             ? "Selected order was reduced/filled"
-            : result.executed
+            : didExecute
               ? "Trade executed, but selected order not reached (higher-priority levels were matched first)"
-              : "Submitted (no immediate balance change observed)",
+              : "No immediate execution observed",
         });
 
         await refresh();
@@ -1029,7 +1110,7 @@ async function main() {
             actorRole,
             amountBase,
             takerOrderId: result.orderId.toString(),
-            executed: result.executed,
+            executed: didExecute,
             selectedAffected,
             selectedRemainingBefore: asUnits(
               selectedRemainingBefore,
@@ -1112,7 +1193,6 @@ async function main() {
                   false,
                 ),
         );
-        trackSeenOrderId(market.index, result.orderId);
         const limitMatched =
           side === "buy" ? result.baseDelta > 0n : result.quoteDelta > 0n;
         const bookExecutionReference = side === "buy"
@@ -1198,11 +1278,11 @@ async function main() {
       refreshMs,
       actionHistoryLimit,
       historyFilePath,
-      scanMaxOrderId,
-      scanAheadOrderId,
+      makerAccountsPerSide,
       ordersPerMarket,
       depthLevels,
       openOrdersScanCount,
+      tradesPerMarket,
     });
   });
 
