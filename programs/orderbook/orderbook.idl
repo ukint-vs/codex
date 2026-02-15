@@ -15,5 +15,7 @@ service Orderbook {
   query BestAskPrice : () -> u128;
   query BestBidPrice : () -> u128;
   query OrderById : (order_id: u64) -> struct { bool, u64, actor_id, u16, u128, u128, u128 };
+  query Orders : (offset: u32, count: u32) -> vec struct { u64, actor_id, u16, u128, u128, u128 };
+  query OrdersReverse : (offset: u32, count: u32) -> vec struct { u64, actor_id, u16, u128, u128, u128 };
 };
 

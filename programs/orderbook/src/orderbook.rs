@@ -1,7 +1,7 @@
 use sails_rs::{
     collections::BTreeMap,
     ops::Bound::{Excluded, Unbounded},
-    U256,
+    Vec, U256,
 };
 
 use intrusive_arena::{Arena, Index, List, Node};
@@ -93,7 +93,29 @@ impl OrderBook {
     pub fn peek_order(&self, order_id: OrderId) -> Option<MakerView> {
         let idx = *self.by_id.get(&order_id)?;
         let node = self.arena.get(idx)?;
+
         Some(node.value)
+    }
+
+    pub fn orders(&self, offset: u32, count: u32) -> Vec<MakerView> {
+        self.collect(offset, count, self.by_id.values().copied())
+    }
+
+    pub fn orders_reverse(&self, offset: u32, count: u32) -> Vec<MakerView> {
+        self.collect(offset, count, self.by_id.values().rev().copied())
+    }
+
+    fn collect(
+        &self,
+        offset: u32,
+        count: u32,
+        iter: impl Iterator<Item = Index>,
+    ) -> Vec<MakerView> {
+        iter.skip(offset as _)
+            .take(count as _)
+            .map(|index| self.arena.get(index).map(|node| node.value))
+            .flatten()
+            .collect::<Vec<_>>()
     }
 }
 
