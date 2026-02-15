@@ -19,6 +19,8 @@ pub struct Orderbook<'a> {
     state: &'a RefCell<state::State>,
 }
 
+type TradeHistoryEntry = (u64, u64, u64, ActorId, ActorId, u128, u128, u128);
+
 impl<'a> Orderbook<'a> {
     pub fn new(state: &'a RefCell<state::State>) -> Self {
         Self { state }
@@ -58,7 +60,21 @@ impl<'a> Orderbook<'a> {
         let limits = st.limits;
         let report = matching_engine::execute(&mut st.book, &incoming, limits)?;
         st.settle_execution(&incoming, &report, locked_base, locked_quote);
+        st.append_executed_trades(&report.trades);
         Ok(order_id)
+    }
+
+    fn trade_to_io(trade: &state::ExecutedTrade) -> TradeHistoryEntry {
+        (
+            trade.seq,
+            trade.maker_order_id,
+            trade.taker_order_id,
+            trade.maker,
+            trade.taker,
+            trade.price,
+            trade.amount_base,
+            trade.amount_quote,
+        )
     }
 
     #[cfg(feature = "debug")]
@@ -474,6 +490,34 @@ impl<'a> Orderbook<'a> {
                     order.reserved_quote.low_u128(),
                 )
             })
+            .collect()
+    }
+
+    #[export]
+    pub fn trades_count(&self) -> u64 {
+        self.get().executed_trades.len() as u64
+    }
+
+    #[export]
+    pub fn trades(&self, offset: u32, count: u32) -> Vec<TradeHistoryEntry> {
+        self.get()
+            .executed_trades
+            .iter()
+            .skip(offset as usize)
+            .take(count as usize)
+            .map(Orderbook::trade_to_io)
+            .collect()
+    }
+
+    #[export]
+    pub fn trades_reverse(&self, offset: u32, count: u32) -> Vec<TradeHistoryEntry> {
+        self.get()
+            .executed_trades
+            .iter()
+            .rev()
+            .skip(offset as usize)
+            .take(count as usize)
+            .map(Orderbook::trade_to_io)
             .collect()
     }
 }

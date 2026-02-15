@@ -2,7 +2,7 @@ use clob_common::TokenId;
 use sails_rs::{collections::HashMap, prelude::*, U256};
 
 use matching_engine::{
-    Completion, EngineLimits, ExecutionReport, IncomingOrder, OrderId, OrderKind, Side,
+    Completion, EngineLimits, ExecutionReport, IncomingOrder, OrderId, OrderKind, Side, Trade,
 };
 
 use crate::orderbook::OrderBook;
@@ -13,6 +13,8 @@ use crate::orderbook::OrderBook;
 /// through exported contract methods due to interface/codec constraints.
 pub type SideIO = u16;
 pub type OrderKindIO = u16;
+const MAX_EXECUTED_TRADE_HISTORY: usize = 1_024;
+const MAX_RECORDED_TRADES_PER_EXECUTION: usize = 32;
 
 pub fn side_from_io(x: SideIO) -> Side {
     match x {
@@ -38,13 +40,27 @@ pub struct AccountBalances {
     pub quote: U256,
 }
 
+#[derive(Clone, Debug)]
+pub struct ExecutedTrade {
+    pub seq: u64,
+    pub maker_order_id: OrderId,
+    pub taker_order_id: OrderId,
+    pub maker: ActorId,
+    pub taker: ActorId,
+    pub price: u128,
+    pub amount_base: u128,
+    pub amount_quote: u128,
+}
+
 #[derive(Default, Debug)]
 pub struct State {
     pub admin: Option<ActorId>,
     pub next_order_id: OrderId,
+    pub next_trade_seq: u64,
     pub limits: EngineLimits,
     pub book: OrderBook,
     pub balances: HashMap<ActorId, AccountBalances>,
+    pub executed_trades: Vec<ExecutedTrade>,
     pub protocol_fee_quote: U256,
     pub base_token_id: TokenId,
     pub quote_token_id: TokenId,
@@ -71,12 +87,14 @@ impl State {
         Self {
             admin: Some(admin),
             next_order_id: 1,
+            next_trade_seq: 1,
             limits: EngineLimits {
                 max_trades,
                 max_preview_scans,
             },
             book: OrderBook::new(),
             balances: HashMap::with_capacity(100_000),
+            executed_trades: Vec::new(),
             protocol_fee_quote: U256::zero(),
             base_token_id,
             quote_token_id,
@@ -93,6 +111,32 @@ impl State {
 
     pub fn balance_mut(&mut self, who: ActorId) -> &mut AccountBalances {
         self.balances.entry(who).or_default()
+    }
+
+    pub fn append_executed_trades(&mut self, trades: &[Trade]) {
+        if trades.len() > MAX_RECORDED_TRADES_PER_EXECUTION {
+            return;
+        }
+
+        for tr in trades {
+            let seq = self.next_trade_seq;
+            self.next_trade_seq = self.next_trade_seq.saturating_add(1);
+
+            self.executed_trades.push(ExecutedTrade {
+                seq,
+                maker_order_id: tr.maker_order_id,
+                taker_order_id: tr.taker_order_id,
+                maker: tr.maker,
+                taker: tr.taker,
+                price: tr.price.low_u128(),
+                amount_base: tr.amount_base.low_u128(),
+                amount_quote: tr.amount_quote.low_u128(),
+            });
+
+            if self.executed_trades.len() > MAX_EXECUTED_TRADE_HISTORY {
+                let _ = self.executed_trades.remove(0);
+            }
+        }
     }
 
     fn lock(&mut self, who: ActorId, asset: Asset, amount: U256) {

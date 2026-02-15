@@ -9,7 +9,7 @@ import { Address, hexToBytes, PublicClient } from "viem";
 import type { Codec } from "../codec.js";
 import { BaseProgram } from "./base.js";
 import { logger } from "../logger.js";
-import { addressToActorId } from "./util.js";
+import { actorIdToAddress, addressToActorId } from "./util.js";
 
 export enum OrderKind {
   Limit = 0,
@@ -33,6 +33,11 @@ enum QueryMethod {
   OrderById = "OrderById",
   BestAskPrice = "BestAskPrice",
   BestBidPrice = "BestBidPrice",
+  Orders = "Orders",
+  OrdersReverse = "OrdersReverse",
+  Trades = "Trades",
+  TradesCount = "TradesCount",
+  TradesReverse = "TradesReverse",
 }
 
 export enum Side {
@@ -248,6 +253,156 @@ export class Orderbook extends BaseProgram {
       amountBase: BigInt(state[5]),
       filledBase: BigInt(state[6]),
     };
+  }
+
+  async orders(offset: number, count: number): Promise<
+    {
+      id: bigint;
+      owner: Address;
+      side: number;
+      limitPrice: bigint;
+      amountBase: bigint;
+      reservedQuote: bigint;
+    }[]
+  > {
+    const payload = this.codec.encodeQueryFn(SERVICE, QueryMethod.Orders, [
+      offset,
+      count,
+    ]);
+
+    const state = await this.readState(payload);
+
+    return (state as unknown[]).map((row) => {
+      const item = row as [unknown, unknown, unknown, unknown, unknown, unknown];
+      return {
+        id: BigInt(item[0] as bigint),
+        owner: item[1] as Address,
+        side: Number(item[2]),
+        limitPrice: BigInt(item[3] as bigint),
+        amountBase: BigInt(item[4] as bigint),
+        reservedQuote: BigInt(item[5] as bigint),
+      };
+    });
+  }
+
+  async ordersReverse(offset: number, count: number): Promise<
+    {
+      id: bigint;
+      owner: Address;
+      side: number;
+      limitPrice: bigint;
+      amountBase: bigint;
+      reservedQuote: bigint;
+    }[]
+  > {
+    const payload = this.codec.encodeQueryFn(SERVICE, QueryMethod.OrdersReverse, [
+      offset,
+      count,
+    ]);
+
+    const state = await this.readState(payload);
+
+    return (state as unknown[]).map((row) => {
+      const item = row as [unknown, unknown, unknown, unknown, unknown, unknown];
+      return {
+        id: BigInt(item[0] as bigint),
+        owner: item[1] as Address,
+        side: Number(item[2]),
+        limitPrice: BigInt(item[3] as bigint),
+        amountBase: BigInt(item[4] as bigint),
+        reservedQuote: BigInt(item[5] as bigint),
+      };
+    });
+  }
+
+  async tradesCount(): Promise<bigint> {
+    const payload = this.codec.encodeQueryFn(SERVICE, QueryMethod.TradesCount, []);
+    const state = await this.readState(payload);
+    return BigInt(state);
+  }
+
+  async trades(offset: number, count: number): Promise<
+    {
+      seq: bigint;
+      makerOrderId: bigint;
+      takerOrderId: bigint;
+      maker: Address;
+      taker: Address;
+      price: bigint;
+      amountBase: bigint;
+      amountQuote: bigint;
+    }[]
+  > {
+    const payload = this.codec.encodeQueryFn(SERVICE, QueryMethod.Trades, [
+      offset,
+      count,
+    ]);
+    const state = await this.readState(payload);
+
+    return (state as unknown[]).map((row) => {
+      const item = row as [
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+      ];
+      return {
+        seq: BigInt(item[0] as bigint),
+        makerOrderId: BigInt(item[1] as bigint),
+        takerOrderId: BigInt(item[2] as bigint),
+        maker: actorIdToAddress(item[3] as Address),
+        taker: actorIdToAddress(item[4] as Address),
+        price: BigInt(item[5] as bigint),
+        amountBase: BigInt(item[6] as bigint),
+        amountQuote: BigInt(item[7] as bigint),
+      };
+    });
+  }
+
+  async tradesReverse(offset: number, count: number): Promise<
+    {
+      seq: bigint;
+      makerOrderId: bigint;
+      takerOrderId: bigint;
+      maker: Address;
+      taker: Address;
+      price: bigint;
+      amountBase: bigint;
+      amountQuote: bigint;
+    }[]
+  > {
+    const payload = this.codec.encodeQueryFn(SERVICE, QueryMethod.TradesReverse, [
+      offset,
+      count,
+    ]);
+    const state = await this.readState(payload);
+
+    return (state as unknown[]).map((row) => {
+      const item = row as [
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+      ];
+      return {
+        seq: BigInt(item[0] as bigint),
+        makerOrderId: BigInt(item[1] as bigint),
+        takerOrderId: BigInt(item[2] as bigint),
+        maker: actorIdToAddress(item[3] as Address),
+        taker: actorIdToAddress(item[4] as Address),
+        price: BigInt(item[5] as bigint),
+        amountBase: BigInt(item[6] as bigint),
+        amountQuote: BigInt(item[7] as bigint),
+      };
+    });
   }
 
   private generateOrderTrackingId(): string {

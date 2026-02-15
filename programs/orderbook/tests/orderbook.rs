@@ -1318,3 +1318,111 @@ async fn populate_demo_orders_seeded_depth_executes_real_market_order() {
         "Expected first seeded ask to be fully consumed"
     );
 }
+
+#[tokio::test]
+async fn executed_trades_history_supports_count_ordering_and_pagination() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let price = price_fp_usdt_per_eth(2_000);
+    let ask_amount = eth_frac(3, 5);
+    let first_buy = eth_frac(2, 5);
+    let second_buy = eth_frac(1, 5);
+
+    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+    let ask_id = c
+        .submit_order(1, 0, price, ask_amount, 0)
+        .with_actor_id(seller())
+        .await
+        .unwrap();
+
+    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+    let first_taker_id = c
+        .submit_order(0, 1, 0, first_buy, usdt_micro(10_000))
+        .with_actor_id(buyer())
+        .await
+        .unwrap();
+
+    c.deposit(buyer2(), QUOTE_TOKEN_ID, usdt_micro(10_000))
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+    let second_taker_id = c
+        .submit_order(0, 1, 0, second_buy, usdt_micro(10_000))
+        .with_actor_id(buyer2())
+        .await
+        .unwrap();
+
+    assert_eq!(c.trades_count().await.unwrap(), 2);
+
+    let trades = c.trades(0, 10).await.unwrap();
+    assert_eq!(trades.len(), 2);
+
+    let first_quote = quote_floor_atoms(first_buy, price);
+    let second_quote = quote_floor_atoms(second_buy, price);
+
+    assert_eq!(
+        trades[0],
+        (
+            1,
+            ask_id,
+            first_taker_id,
+            seller(),
+            buyer(),
+            price,
+            first_buy,
+            first_quote,
+        )
+    );
+    assert_eq!(
+        trades[1],
+        (
+            2,
+            ask_id,
+            second_taker_id,
+            seller(),
+            buyer2(),
+            price,
+            second_buy,
+            second_quote,
+        )
+    );
+
+    let reverse = c.trades_reverse(0, 10).await.unwrap();
+    assert_eq!(reverse.len(), 2);
+    assert_eq!(reverse[0], trades[1]);
+    assert_eq!(reverse[1], trades[0]);
+
+    let paged = c.trades(1, 1).await.unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(paged[0], trades[1]);
+}
+
+#[tokio::test]
+async fn executed_trades_history_ignores_non_executed_orders() {
+    let program = setup_orderbook(1000, 1000).await;
+    let mut c = program.orderbook();
+
+    let price = price_fp_usdt_per_eth(2_000);
+    let buy_amount = eth_frac(1, 2);
+
+    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
+        .with_actor_id(vault())
+        .await
+        .unwrap();
+
+    c.submit_order(0, 0, price, buy_amount, 0)
+        .with_actor_id(buyer())
+        .await
+        .unwrap();
+
+    assert_eq!(c.trades_count().await.unwrap(), 0);
+    assert!(c.trades(0, 10).await.unwrap().is_empty());
+    assert!(c.trades_reverse(0, 10).await.unwrap().is_empty());
+}
