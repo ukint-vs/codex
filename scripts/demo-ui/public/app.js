@@ -5,17 +5,13 @@ const metaEl = document.getElementById("meta");
 const warningsEl = document.getElementById("warnings");
 const tabsEl = document.getElementById("market-tabs");
 const marketCardTemplate = document.getElementById("market-card-template");
-const llmProviderEl = document.getElementById("llm-provider");
-const llmModelEl = document.getElementById("llm-model");
-const llmApiKeyEl = document.getElementById("llm-api-key");
-const llmWalletEl = document.getElementById("llm-wallet");
 const llmChatEl = document.getElementById("llm-chat");
 const llmLoaderEl = document.getElementById("llm-loader");
 const llmFormEl = document.getElementById("llm-form");
 const llmInputEl = document.getElementById("llm-input");
 const llmCancelEl = document.getElementById("llm-cancel");
-const llmChartEl = document.getElementById("llm-market-chart");
-const llmChartMetaEl = document.getElementById("llm-chart-meta");
+const appShellEl = document.getElementById("app-shell");
+const assistantSidebarToggleEl = document.getElementById("assistant-sidebar-toggle");
 
 const EXEC_CHART_MAX_POINTS = 500;
 const EXEC_CHART_HISTORY_MAX_POINTS = 3000;
@@ -52,7 +48,9 @@ const AUTO_DRIFT_JUMP_PROB = 0.28;
 const AUTO_DRIFT_MEAN_REVERT = 0.13;
 const AUTO_DRIFT_MAX_BPS = 2800;
 const AUTO_EXEC_TARGET_JITTER_BPS = 240;
-const LLM_MARKET_HISTORY_MAX = 360;
+const ASSISTANT_SIDEBAR_COLLAPSED_STORAGE_KEY = "dex_assistant_sidebar_collapsed";
+const DEFAULT_ASSISTANT_PROVIDER = "openrouter";
+const DEFAULT_ASSISTANT_MODEL = "openrouter/free";
 
 const chartLib = window.LightweightCharts;
 const marketCards = new Map();
@@ -63,10 +61,9 @@ let llmBusy = false;
 let llmAbortController = null;
 const llmMessages = [];
 const llmAgent = new DexBrowserAgent({ debug: false });
-const llmMarketHistory = new Map();
-let llmChartApi = null;
-let llmBidSeries = null;
-let llmAskSeries = null;
+let assistantSidebarCollapsed = false;
+let assistantApiKey = null;
+let assistantApiKeyPromise = null;
 
 const shortAddress = (address) => `${address.slice(0, 8)}...${address.slice(-6)}`;
 const toUnixSec = (ms) => Math.max(1, Math.floor(ms / 1000));
@@ -81,6 +78,79 @@ const setCellText = (el, text) => {
   if (el.textContent !== text) {
     el.textContent = text;
   }
+};
+
+const applyAssistantSidebarState = (collapsed, options = {}) => {
+  const { persist = true, skipResize = false } = options;
+  assistantSidebarCollapsed = Boolean(collapsed);
+
+  if (appShellEl) {
+    appShellEl.classList.toggle("is-sidebar-collapsed", assistantSidebarCollapsed);
+  }
+
+  if (assistantSidebarToggleEl) {
+    assistantSidebarToggleEl.setAttribute("aria-expanded", String(!assistantSidebarCollapsed));
+    assistantSidebarToggleEl.setAttribute(
+      "aria-label",
+      assistantSidebarCollapsed ? "Expand assistant sidebar" : "Collapse assistant sidebar",
+    );
+  }
+
+  if (persist) {
+    try {
+      localStorage.setItem(
+        ASSISTANT_SIDEBAR_COLLAPSED_STORAGE_KEY,
+        assistantSidebarCollapsed ? "1" : "0",
+      );
+    } catch {
+      // Ignore storage failures.
+    }
+  }
+
+  if (!skipResize) {
+    window.setTimeout(() => {
+      resizeVisibleCharts();
+    }, 230);
+  }
+};
+
+const loadAssistantApiKey = async () => {
+  if (assistantApiKey !== null) return assistantApiKey;
+  if (assistantApiKeyPromise) return assistantApiKeyPromise;
+
+  assistantApiKeyPromise = (async () => {
+    const response = await fetch("/api/assistant/config", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`Failed to load assistant config: HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    assistantApiKey = String(payload?.apiKey ?? "").trim();
+    return assistantApiKey;
+  })();
+
+  try {
+    return await assistantApiKeyPromise;
+  } finally {
+    assistantApiKeyPromise = null;
+  }
+};
+
+const resolveAssistantWalletAddress = () => {
+  const fallbackMarketIndex = latestSnapshot?.markets?.[0]?.index ?? null;
+  const marketIndex = activeMarketIndex ?? fallbackMarketIndex;
+  if (marketIndex === null) return undefined;
+
+  const cardState = marketCards.get(marketIndex);
+  const balances = cardState?.latestBalances;
+  const actorRole = cardState?.actorRole;
+  if (Array.isArray(balances) && balances.length > 0) {
+    const row = balances.find((balance) => balance.role === actorRole) ?? balances[0];
+    if (row?.address) return row.address;
+  }
+
+  const market = latestSnapshot?.markets?.find((entry) => entry.index === marketIndex);
+  if (!market?.balances?.length) return undefined;
+  return market.balances[0].address;
 };
 
 const formatPriceAdaptive = (value) => {
@@ -103,11 +173,6 @@ const formatPriceForInput = (value) => {
 const parsePositiveNumber = (value) => {
   const parsed = Number.parseFloat(String(value ?? ""));
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-};
-
-const formatPriceDisplay = (value) => {
-  const n = Number.parseFloat(String(value ?? ""));
-  return Number.isFinite(n) && n > 0 ? formatPriceAdaptive(n) : String(value ?? "-");
 };
 
 const escapeHtml = (value) =>
@@ -190,65 +255,6 @@ const cancelLlmRequest = () => {
   llmAbortController.abort();
 };
 
-const ensureLlmChart = () => {
-  if (!llmChartEl || llmChartApi || !chartLib) return;
-  const width = Math.max(320, llmChartEl.clientWidth || 0);
-  llmChartApi = chartLib.createChart(llmChartEl, {
-    width,
-    height: PRICE_CHART_HEIGHT,
-    layout: {
-      background: { color: "#041321" },
-      textColor: "#d3e8fa",
-    },
-    grid: {
-      vertLines: { color: "#27435b55" },
-      horzLines: { color: "#27435b55" },
-    },
-    rightPriceScale: {
-      borderColor: "#3a607e",
-      autoScale: true,
-    },
-    timeScale: {
-      borderColor: "#3a607e",
-      timeVisible: true,
-      secondsVisible: true,
-    },
-  });
-
-  llmBidSeries = llmChartApi.addLineSeries({
-    color: "#48e0b6",
-    lineWidth: 2,
-    title: "Best Bid",
-  });
-  llmAskSeries = llmChartApi.addLineSeries({
-    color: "#ffbf70",
-    lineWidth: 2,
-    title: "Best Ask",
-  });
-};
-
-const renderLlmMarketChart = () => {
-  if (!latestSnapshot?.markets?.length || activeMarketIndex === null) return;
-  ensureLlmChart();
-  if (!llmChartApi || !llmBidSeries || !llmAskSeries) return;
-
-  const history = llmMarketHistory.get(activeMarketIndex) ?? [];
-  const bidData = history
-    .filter((x) => Number.isFinite(x.bid))
-    .map((x) => ({ time: x.time, value: x.bid }));
-  const askData = history
-    .filter((x) => Number.isFinite(x.ask))
-    .map((x) => ({ time: x.time, value: x.ask }));
-
-  llmBidSeries.setData(bidData);
-  llmAskSeries.setData(askData);
-  llmChartApi.timeScale().fitContent();
-
-  const market = latestSnapshot.markets.find((m) => m.index === activeMarketIndex);
-  if (!market || !llmChartMetaEl) return;
-  llmChartMetaEl.textContent = `Market #${market.index} | bid ${formatPriceDisplay(market.bestBid)} | ask ${formatPriceDisplay(market.bestAsk)} | spread ${market.spreadBps ?? "-"}`;
-};
-
 const sendLlmChat = async (question) => {
   if (llmBusy) return;
   const text = String(question ?? "").trim();
@@ -261,12 +267,17 @@ const sendLlmChat = async (question) => {
   setLlmLoading(true);
 
   try {
+    const apiKey = await loadAssistantApiKey();
+    if (!apiKey) {
+      throw new Error("Assistant API key is not configured on server. Set DEMO_UI_LLM_API_KEY.");
+    }
+
     llmAgent.activeMarketIndex = activeMarketIndex;
     const reply = await llmAgent.run({
-      provider: llmProviderEl?.value || "openrouter",
-      model: llmModelEl?.value?.trim() || undefined,
-      apiKey: llmApiKeyEl?.value?.trim() || undefined,
-      walletAddress: llmWalletEl?.value?.trim() || undefined,
+      provider: DEFAULT_ASSISTANT_PROVIDER,
+      model: DEFAULT_ASSISTANT_MODEL,
+      apiKey,
+      walletAddress: resolveAssistantWalletAddress(),
       messages: llmMessages,
       signal: llmAbortController.signal,
     });
@@ -371,7 +382,6 @@ const renderTabs = (markets) => {
           updateMarketCard(row);
         }
         resizeVisibleCharts();
-        renderLlmMarketChart();
       }
     });
     tabsEl.appendChild(button);
@@ -1711,17 +1721,6 @@ const renderSnapshot = (snapshot) => {
   }
   renderTabs(snapshot.markets);
 
-  const nowSec = Math.max(1, Math.floor(Date.now() / 1000));
-  for (const market of snapshot.markets) {
-    const bid = Number.parseFloat(String(market.bestBid ?? "NaN"));
-    const ask = Number.parseFloat(String(market.bestAsk ?? "NaN"));
-    if (!Number.isFinite(bid) && !Number.isFinite(ask)) continue;
-    const rows = llmMarketHistory.get(market.index) ?? [];
-    rows.push({ time: nowSec, bid, ask });
-    if (rows.length > LLM_MARKET_HISTORY_MAX) rows.splice(0, rows.length - LLM_MARKET_HISTORY_MAX);
-    llmMarketHistory.set(market.index, rows);
-  }
-
   const activeIndexes = new Set(snapshot.markets.map((m) => m.index));
   for (const market of snapshot.markets) {
     updateMarketCard(market);
@@ -1735,8 +1734,6 @@ const renderSnapshot = (snapshot) => {
     cardState.root.remove();
     marketCards.delete(index);
   }
-
-  renderLlmMarketChart();
 };
 
 const renderError = (message) => {
@@ -1768,10 +1765,6 @@ const poll = async () => {
 
 window.addEventListener("resize", () => {
   resizeVisibleCharts();
-  if (llmChartApi && llmChartEl) {
-    const width = llmChartEl.clientWidth;
-    if (width > 0) llmChartApi.applyOptions({ width, height: PRICE_CHART_HEIGHT });
-  }
 });
 
 window.addEventListener("beforeunload", () => {
@@ -1782,27 +1775,19 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-if (llmWalletEl) {
-  const savedWallet = localStorage.getItem("dex_llm_wallet");
-  if (savedWallet) llmWalletEl.value = savedWallet;
-  llmWalletEl.addEventListener("change", () => {
-    localStorage.setItem("dex_llm_wallet", llmWalletEl.value.trim());
-  });
+if (appShellEl) {
+  try {
+    assistantSidebarCollapsed =
+      localStorage.getItem(ASSISTANT_SIDEBAR_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    assistantSidebarCollapsed = false;
+  }
+  applyAssistantSidebarState(assistantSidebarCollapsed, { persist: false, skipResize: true });
 }
 
-if (llmProviderEl) {
-  const savedProvider = localStorage.getItem("dex_llm_provider");
-  if (savedProvider) llmProviderEl.value = savedProvider;
-  llmProviderEl.addEventListener("change", () => {
-    localStorage.setItem("dex_llm_provider", llmProviderEl.value);
-  });
-}
-
-if (llmApiKeyEl) {
-  const savedApiKey = localStorage.getItem("dex_llm_api_key");
-  if (savedApiKey) llmApiKeyEl.value = savedApiKey;
-  llmApiKeyEl.addEventListener("change", () => {
-    localStorage.setItem("dex_llm_api_key", llmApiKeyEl.value.trim());
+if (assistantSidebarToggleEl) {
+  assistantSidebarToggleEl.addEventListener("click", () => {
+    applyAssistantSidebarState(!assistantSidebarCollapsed);
   });
 }
 
@@ -1810,6 +1795,14 @@ if (llmFormEl) {
   llmFormEl.addEventListener("submit", async (event) => {
     event.preventDefault();
     await sendLlmChat(llmInputEl?.value ?? "");
+  });
+}
+
+if (llmInputEl) {
+  llmInputEl.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    await sendLlmChat(llmInputEl.value ?? "");
   });
 }
 

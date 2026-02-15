@@ -15,6 +15,7 @@ import {
   createPublicClient,
   createWalletClient,
   formatUnits,
+  PublicClient,
   webSocket,
 } from "viem";
 
@@ -175,7 +176,7 @@ class CompatEthereumClient {
   private chainId = 31337;
 
   constructor(
-    private publicClient: ReturnType<typeof createPublicClient>,
+    private publicClient: PublicClient,
     routerAddress: Address,
     fallbackValidators: Address[],
     signer?: ISigner,
@@ -273,6 +274,12 @@ const makerAccountsPerSide = Math.max(
       ?? DEFAULT_MAKER_ACCOUNTS_PER_SIDE,
   ),
 );
+const assistantApiKey =
+  process.env.DEMO_UI_LLM_API_KEY
+  ?? process.env.OPENROUTER_API_KEY
+  ?? process.env.OPENAI_API_KEY
+  ?? process.env.ANTHROPIC_API_KEY
+  ?? "";
 
 const marketActionKey = (marketIndex: number, orderbookAddress: Address): string =>
   `${marketIndex}:${orderbookAddress.toLowerCase()}`;
@@ -1173,6 +1180,12 @@ async function main() {
 
   const server = http.createServer(async (req, res) => {
     const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+
+    if (reqUrl.pathname === "/api/assistant/config") {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ apiKey: assistantApiKey.trim() }));
+      return;
+    }
 
     if (reqUrl.pathname === "/api/agent/schema") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });

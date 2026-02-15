@@ -13,6 +13,7 @@ Rules:
 9. After order placement/cancellation, report orderId, status, filled, and remaining.
 10. For multi-market questions, use list_markets first and pass marketIndex in tool arguments.
 `;
+const WRITE_TOOL_NAMES = new Set(["place_order", "smart_place_order", "cancel_order"]);
 
 const normalizeAssistantReply = (raw) => {
   const trimmed = String(raw ?? "").trim();
@@ -373,16 +374,18 @@ export class DexBrowserAgent {
 
   normalizeToolArgs(name, args = {}, walletAddress) {
     const out = { ...(args || {}) };
+    const isWriteTool = WRITE_TOOL_NAMES.has(name);
+
+    if (isWriteTool && typeof out.walletAddress === "string") {
+      delete out.walletAddress;
+    }
 
     if (
       walletAddress &&
       typeof out.walletAddress !== "string" &&
       (name === "get_balance" ||
-        name === "place_order" ||
-        name === "cancel_order" ||
         name === "list_orders" ||
-        name === "get_wallet_orders_overview" ||
-        name === "smart_place_order")
+        name === "get_wallet_orders_overview")
     ) {
       out.walletAddress = walletAddress;
     }
@@ -510,7 +513,8 @@ export class DexBrowserAgent {
   }
 
   async executeTool(name, args, walletAddress, signal) {
-    const normalizedArgs = this.normalizeToolArgs(name, args, walletAddress);
+    const requestWalletAddress = WRITE_TOOL_NAMES.has(name) ? undefined : walletAddress;
+    const normalizedArgs = this.normalizeToolArgs(name, args, requestWalletAddress);
     const started = Date.now();
     const response = await fetch(this.toolEndpoint, {
       method: "POST",
@@ -519,7 +523,7 @@ export class DexBrowserAgent {
       body: JSON.stringify({
         name,
         args: normalizedArgs ?? {},
-        walletAddress: walletAddress || undefined,
+        walletAddress: requestWalletAddress || undefined,
       }),
     });
     const payload = await response.json().catch(() => ({}));

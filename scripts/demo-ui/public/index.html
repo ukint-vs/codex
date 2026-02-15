@@ -12,80 +12,61 @@
   <div class="bg-glow bg-glow-a"></div>
   <div class="bg-glow bg-glow-b"></div>
 
-  <main class="layout">
-    <header class="header">
-      <div class="eyebrow">Public Demo</div>
-      <img class="brand-logo" src="/logo-codex.svg" alt="codex logo" />
-      <h1>Live Market Board</h1>
-      <div id="meta" class="meta"></div>
-    </header>
-
-    <section class="assistant-shell card">
-      <div class="assistant-head">
-        <div>
-          <div class="eyebrow">LLM Agent</div>
-          <h2>Dex Assistant</h2>
-          <p class="muted">Use natural language for balances, orders, pricing, and execution.</p>
-        </div>
-        <div class="assistant-controls">
-          <label>
-            Provider
-            <select id="llm-provider">
-              <option value="openrouter">OpenRouter</option>
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
-          </label>
-          <label>
-            Model (optional)
-            <input id="llm-model" placeholder="e.g. openai/gpt-4o-mini" />
-          </label>
-          <label>
-            API Key (BYOK)
-            <input id="llm-api-key" type="password" placeholder="sk-..." />
-          </label>
-          <label>
-            Wallet (optional)
-            <input id="llm-wallet" placeholder="0x..." />
-          </label>
-        </div>
+  <main class="app-shell" id="app-shell">
+    <aside class="assistant-shell assistant-sidebar card" id="assistant-sidebar">
+      <div class="assistant-sidebar-toolbar">
+        <span class="assistant-sidebar-title">Dex Assistant</span>
+        <button
+          type="button"
+          id="assistant-sidebar-toggle"
+          class="assistant-sidebar-toggle"
+          aria-expanded="true"
+          aria-controls="assistant-sidebar-content"
+        >
+          <span class="toggle-label-open">Collapse</span>
+          <span class="toggle-label-closed">Open</span>
+        </button>
       </div>
 
-      <div class="assistant-grid">
-        <div>
-          <div class="assistant-chat" id="llm-chat"></div>
-          <div id="llm-loader" class="assistant-loader" aria-live="polite" hidden>
-            <span class="loader-dot"></span>
-            <span class="loader-dot"></span>
-            <span class="loader-dot"></span>
-            <span class="loader-text">Assistant is thinking...</span>
-          </div>
-          <form id="llm-form" class="assistant-form">
-            <input id="llm-input" placeholder="What is my balance?" />
-            <div class="assistant-actions">
-              <button type="submit">Send</button>
-              <button type="button" id="llm-cancel" class="cancel-btn" disabled>Cancel</button>
+      <div class="assistant-sidebar-content" id="assistant-sidebar-content">
+        <div class="assistant-grid">
+          <div>
+            <div class="assistant-chat" id="llm-chat"></div>
+            <div id="llm-loader" class="assistant-loader" aria-live="polite" hidden>
+              <span class="loader-dot"></span>
+              <span class="loader-dot"></span>
+              <span class="loader-dot"></span>
+              <span class="loader-text">Assistant is thinking...</span>
             </div>
-          </form>
-          <div class="assistant-quick">
-            <button type="button" class="mini-btn" data-q="What is my balance?">Balance</button>
-            <button type="button" class="mini-btn" data-q="Show market overview and spread">Market</button>
-            <button type="button" class="mini-btn" data-q="Recommend a smart buy price for 10 base">Smart bid</button>
+            <form id="llm-form" class="assistant-form">
+              <textarea id="llm-input" rows="3" placeholder="What is my balance?"></textarea>
+              <div class="assistant-actions">
+                <button type="submit">Send</button>
+                <button type="button" id="llm-cancel" class="cancel-btn" disabled>Cancel</button>
+              </div>
+            </form>
+            <div class="assistant-quick">
+              <button type="button" class="mini-btn" data-q="What is my balance?">Balance</button>
+              <button type="button" class="mini-btn" data-q="Show market overview and spread">Market</button>
+              <button type="button" class="mini-btn" data-q="Recommend a smart buy price for 10 base">Smart bid</button>
+            </div>
           </div>
-        </div>
-        <div class="assistant-chart-wrap">
-          <div class="chart-head">
-            <h3>Active Market Trend</h3>
-            <span class="muted" id="llm-chart-meta">Waiting for data...</span>
-          </div>
-          <div class="price-chart" id="llm-market-chart"></div>
         </div>
       </div>
-    </section>
+    </aside>
 
-    <section id="warnings"></section>
-    <section id="market-tabs" class="market-tabs"></section>
-    <section id="markets" class="markets"></section>
+    <div class="layout">
+      <header class="header">
+        <div class="eyebrow">Public Demo</div>
+        <img class="brand-logo" src="/logo-codex.svg" alt="codex logo" />
+        <h1>Live Market Board</h1>
+        <div id="meta" class="meta"></div>
+      </header>
+
+      <section id="warnings"></section>
+      <section id="market-tabs" class="market-tabs"></section>
+      <section id="markets" class="markets"></section>
+    </div>
   </main>
 
   <template id="market-card-template">
