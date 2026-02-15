@@ -1,8 +1,21 @@
+import { DexBrowserAgent } from "./agent.js";
+
 const marketsEl = document.getElementById("markets");
 const metaEl = document.getElementById("meta");
 const warningsEl = document.getElementById("warnings");
 const tabsEl = document.getElementById("market-tabs");
 const marketCardTemplate = document.getElementById("market-card-template");
+const llmProviderEl = document.getElementById("llm-provider");
+const llmModelEl = document.getElementById("llm-model");
+const llmApiKeyEl = document.getElementById("llm-api-key");
+const llmWalletEl = document.getElementById("llm-wallet");
+const llmChatEl = document.getElementById("llm-chat");
+const llmLoaderEl = document.getElementById("llm-loader");
+const llmFormEl = document.getElementById("llm-form");
+const llmInputEl = document.getElementById("llm-input");
+const llmCancelEl = document.getElementById("llm-cancel");
+const llmChartEl = document.getElementById("llm-market-chart");
+const llmChartMetaEl = document.getElementById("llm-chart-meta");
 
 const EXEC_CHART_MAX_POINTS = 500;
 const EXEC_CHART_HISTORY_MAX_POINTS = 3000;
@@ -39,12 +52,21 @@ const AUTO_DRIFT_JUMP_PROB = 0.28;
 const AUTO_DRIFT_MEAN_REVERT = 0.13;
 const AUTO_DRIFT_MAX_BPS = 2800;
 const AUTO_EXEC_TARGET_JITTER_BPS = 240;
+const LLM_MARKET_HISTORY_MAX = 360;
 
 const chartLib = window.LightweightCharts;
 const marketCards = new Map();
 let activeMarketIndex = null;
 let latestSnapshot = null;
 let chartLibMissingWarned = false;
+let llmBusy = false;
+let llmAbortController = null;
+const llmMessages = [];
+const llmAgent = new DexBrowserAgent({ debug: false });
+const llmMarketHistory = new Map();
+let llmChartApi = null;
+let llmBidSeries = null;
+let llmAskSeries = null;
 
 const shortAddress = (address) => `${address.slice(0, 8)}...${address.slice(-6)}`;
 const toUnixSec = (ms) => Math.max(1, Math.floor(ms / 1000));
@@ -81,6 +103,187 @@ const formatPriceForInput = (value) => {
 const parsePositiveNumber = (value) => {
   const parsed = Number.parseFloat(String(value ?? ""));
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+const formatPriceDisplay = (value) => {
+  const n = Number.parseFloat(String(value ?? ""));
+  return Number.isFinite(n) && n > 0 ? formatPriceAdaptive(n) : String(value ?? "-");
+};
+
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+
+const formatInline = (value) => {
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  return html;
+};
+
+const formatLlmMessageHtml = (content) => {
+  const lines = String(content ?? "").split(/\r?\n/);
+  let html = "";
+  let inList = false;
+
+  const closeList = () => {
+    if (inList) {
+      html += "</ul>";
+      inList = false;
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    const bullet = raw.match(/^\s*[-*]\s+(.+)$/);
+    if (bullet) {
+      if (!inList) {
+        html += '<ul class="chat-list">';
+        inList = true;
+      }
+      html += `<li>${formatInline(bullet[1])}</li>`;
+      continue;
+    }
+
+    closeList();
+    if (!line) {
+      html += '<div class="chat-gap"></div>';
+      continue;
+    }
+    html += `<p>${formatInline(line)}</p>`;
+  }
+
+  closeList();
+  return html || `<p>${formatInline(content)}</p>`;
+};
+
+const addLlmMessage = (role, content) => {
+  if (!llmChatEl) return;
+  const row = document.createElement("div");
+  row.className = `chat-row ${role}`;
+  const who = role === "assistant" ? "Assistant" : "You";
+  row.innerHTML = `<div class="chat-role">${who}</div><div class="chat-bubble"></div>`;
+  row.querySelector(".chat-bubble").innerHTML = formatLlmMessageHtml(content);
+  llmChatEl.appendChild(row);
+  llmChatEl.scrollTop = llmChatEl.scrollHeight;
+};
+
+const setLlmLoading = (loading) => {
+  if (llmLoaderEl) {
+    llmLoaderEl.hidden = !loading;
+  }
+  const submitBtn = llmFormEl?.querySelector("button[type='submit']");
+  if (submitBtn) submitBtn.disabled = loading;
+  if (llmCancelEl) {
+    llmCancelEl.disabled = !loading;
+    llmCancelEl.hidden = !loading;
+  }
+  if (llmInputEl) llmInputEl.disabled = loading;
+};
+
+const cancelLlmRequest = () => {
+  if (!llmAbortController) return;
+  llmAbortController.abort();
+};
+
+const ensureLlmChart = () => {
+  if (!llmChartEl || llmChartApi || !chartLib) return;
+  const width = Math.max(320, llmChartEl.clientWidth || 0);
+  llmChartApi = chartLib.createChart(llmChartEl, {
+    width,
+    height: PRICE_CHART_HEIGHT,
+    layout: {
+      background: { color: "#041321" },
+      textColor: "#d3e8fa",
+    },
+    grid: {
+      vertLines: { color: "#27435b55" },
+      horzLines: { color: "#27435b55" },
+    },
+    rightPriceScale: {
+      borderColor: "#3a607e",
+      autoScale: true,
+    },
+    timeScale: {
+      borderColor: "#3a607e",
+      timeVisible: true,
+      secondsVisible: true,
+    },
+  });
+
+  llmBidSeries = llmChartApi.addLineSeries({
+    color: "#48e0b6",
+    lineWidth: 2,
+    title: "Best Bid",
+  });
+  llmAskSeries = llmChartApi.addLineSeries({
+    color: "#ffbf70",
+    lineWidth: 2,
+    title: "Best Ask",
+  });
+};
+
+const renderLlmMarketChart = () => {
+  if (!latestSnapshot?.markets?.length || activeMarketIndex === null) return;
+  ensureLlmChart();
+  if (!llmChartApi || !llmBidSeries || !llmAskSeries) return;
+
+  const history = llmMarketHistory.get(activeMarketIndex) ?? [];
+  const bidData = history
+    .filter((x) => Number.isFinite(x.bid))
+    .map((x) => ({ time: x.time, value: x.bid }));
+  const askData = history
+    .filter((x) => Number.isFinite(x.ask))
+    .map((x) => ({ time: x.time, value: x.ask }));
+
+  llmBidSeries.setData(bidData);
+  llmAskSeries.setData(askData);
+  llmChartApi.timeScale().fitContent();
+
+  const market = latestSnapshot.markets.find((m) => m.index === activeMarketIndex);
+  if (!market || !llmChartMetaEl) return;
+  llmChartMetaEl.textContent = `Market #${market.index} | bid ${formatPriceDisplay(market.bestBid)} | ask ${formatPriceDisplay(market.bestAsk)} | spread ${market.spreadBps ?? "-"}`;
+};
+
+const sendLlmChat = async (question) => {
+  if (llmBusy) return;
+  const text = String(question ?? "").trim();
+  if (!text) return;
+  llmBusy = true;
+  llmAbortController = new AbortController();
+  addLlmMessage("user", text);
+  llmMessages.push({ role: "user", content: text });
+  if (llmInputEl) llmInputEl.value = "";
+  setLlmLoading(true);
+
+  try {
+    llmAgent.activeMarketIndex = activeMarketIndex;
+    const reply = await llmAgent.run({
+      provider: llmProviderEl?.value || "openrouter",
+      model: llmModelEl?.value?.trim() || undefined,
+      apiKey: llmApiKeyEl?.value?.trim() || undefined,
+      walletAddress: llmWalletEl?.value?.trim() || undefined,
+      messages: llmMessages,
+      signal: llmAbortController.signal,
+    });
+    const normalized = String(reply ?? "").trim() || "No response from assistant.";
+    addLlmMessage("assistant", normalized);
+    llmMessages.push({ role: "assistant", content: normalized });
+  } catch (error) {
+    const message = (error && error.name === "AbortError")
+      ? "Request canceled."
+      : `Assistant error: ${error?.message ?? String(error)}`;
+    addLlmMessage("assistant", message);
+    llmMessages.push({ role: "assistant", content: message });
+  } finally {
+    llmBusy = false;
+    llmAbortController = null;
+    setLlmLoading(false);
+  }
 };
 
 const roundToStep = (value, step = PRICE_DISPLAY_STEP) => {
@@ -168,6 +371,7 @@ const renderTabs = (markets) => {
           updateMarketCard(row);
         }
         resizeVisibleCharts();
+        renderLlmMarketChart();
       }
     });
     tabsEl.appendChild(button);
@@ -1507,6 +1711,17 @@ const renderSnapshot = (snapshot) => {
   }
   renderTabs(snapshot.markets);
 
+  const nowSec = Math.max(1, Math.floor(Date.now() / 1000));
+  for (const market of snapshot.markets) {
+    const bid = Number.parseFloat(String(market.bestBid ?? "NaN"));
+    const ask = Number.parseFloat(String(market.bestAsk ?? "NaN"));
+    if (!Number.isFinite(bid) && !Number.isFinite(ask)) continue;
+    const rows = llmMarketHistory.get(market.index) ?? [];
+    rows.push({ time: nowSec, bid, ask });
+    if (rows.length > LLM_MARKET_HISTORY_MAX) rows.splice(0, rows.length - LLM_MARKET_HISTORY_MAX);
+    llmMarketHistory.set(market.index, rows);
+  }
+
   const activeIndexes = new Set(snapshot.markets.map((m) => m.index));
   for (const market of snapshot.markets) {
     updateMarketCard(market);
@@ -1520,6 +1735,8 @@ const renderSnapshot = (snapshot) => {
     cardState.root.remove();
     marketCards.delete(index);
   }
+
+  renderLlmMarketChart();
 };
 
 const renderError = (message) => {
@@ -1551,13 +1768,70 @@ const poll = async () => {
 
 window.addEventListener("resize", () => {
   resizeVisibleCharts();
+  if (llmChartApi && llmChartEl) {
+    const width = llmChartEl.clientWidth;
+    if (width > 0) llmChartApi.applyOptions({ width, height: PRICE_CHART_HEIGHT });
+  }
 });
 
 window.addEventListener("beforeunload", () => {
   stopped = true;
+  cancelLlmRequest();
   for (const cardState of marketCards.values()) {
     stopAutoTrade(cardState, "auto: stopped");
   }
 });
+
+if (llmWalletEl) {
+  const savedWallet = localStorage.getItem("dex_llm_wallet");
+  if (savedWallet) llmWalletEl.value = savedWallet;
+  llmWalletEl.addEventListener("change", () => {
+    localStorage.setItem("dex_llm_wallet", llmWalletEl.value.trim());
+  });
+}
+
+if (llmProviderEl) {
+  const savedProvider = localStorage.getItem("dex_llm_provider");
+  if (savedProvider) llmProviderEl.value = savedProvider;
+  llmProviderEl.addEventListener("change", () => {
+    localStorage.setItem("dex_llm_provider", llmProviderEl.value);
+  });
+}
+
+if (llmApiKeyEl) {
+  const savedApiKey = localStorage.getItem("dex_llm_api_key");
+  if (savedApiKey) llmApiKeyEl.value = savedApiKey;
+  llmApiKeyEl.addEventListener("change", () => {
+    localStorage.setItem("dex_llm_api_key", llmApiKeyEl.value.trim());
+  });
+}
+
+if (llmFormEl) {
+  llmFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await sendLlmChat(llmInputEl?.value ?? "");
+  });
+}
+
+if (llmCancelEl) {
+  llmCancelEl.addEventListener("click", () => {
+    cancelLlmRequest();
+  });
+}
+
+document.querySelectorAll("[data-q]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const text = btn.getAttribute("data-q") ?? "";
+    if (!text) return;
+    if (llmInputEl) llmInputEl.value = text;
+    await sendLlmChat(text);
+  });
+});
+
+if (llmChatEl && llmMessages.length === 0) {
+  const welcome = "Ask me about balances, spread, depth, orders, or place/cancel actions.";
+  addLlmMessage("assistant", welcome);
+  llmMessages.push({ role: "assistant", content: welcome });
+}
 
 poll();

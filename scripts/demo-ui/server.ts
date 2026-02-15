@@ -24,6 +24,23 @@ import { config } from "../showcase/config.js";
 import { logger } from "../showcase/logger.js";
 import { Orderbook } from "../showcase/programs/index.js";
 import { actorIdToAddress } from "../showcase/programs/util.js";
+import {
+  cancelOrder,
+  getBalance,
+  getCurrencyInfo,
+  getDexStatus,
+  getMarketOverview,
+  getOrderbookDepth,
+  getOrderInsight,
+  getOrderStatus,
+  getPriceRecommendation,
+  getWalletOrdersOverview,
+  listMarkets,
+  listOrders,
+  placeOrder,
+  smartPlaceOrder,
+  watchOrderStatus,
+} from "../browser-agent/runtime.js";
 
 const TOKEN_DECIMALS = 6;
 const PRICE_DECIMALS = 30;
@@ -135,6 +152,19 @@ type SubmitLimitOrderBody = {
   amountBase: number;
   priceQuotePerBase: number;
   actorRole?: string;
+};
+
+type AgentToolRequest = {
+  name: string;
+  args?: Record<string, unknown>;
+  walletAddress?: string;
+};
+
+type ToolResult = {
+  ok: boolean;
+  data?: unknown;
+  message?: string;
+  needsConfirmation?: boolean;
 };
 
 class CompatEthereumClient {
@@ -414,6 +444,402 @@ const readJsonBody = async <T>(req: http.IncomingMessage): Promise<T> => {
     throw new Error("Request body is empty");
   }
   return JSON.parse(body) as T;
+};
+
+const toolSchema = [
+  {
+    name: "list_markets",
+    description:
+      "List all configured DEX markets with marketIndex, symbols, orderbook and vault addresses.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "get_balance",
+    description:
+      "Get user balance from Dex vault/orderbook for a wallet address on a selected market.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        scope: { type: "string", enum: ["vault", "orderbook", "both"] },
+      },
+      required: ["walletAddress"],
+    },
+  },
+  {
+    name: "place_order",
+    description: "Place an order on Dex. Must be confirmed by user.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        side: { type: "string", enum: ["buy", "sell"] },
+        orderType: {
+          type: "string",
+          enum: ["limit", "market", "fill_or_kill", "immediate_or_cancel"],
+        },
+        amountBase: { type: "number" },
+        priceInQuotePerBase: { type: "number" },
+        maxQuoteAmount: { type: "number" },
+        confirm: { type: "boolean" },
+      },
+      required: ["side", "orderType", "amountBase"],
+    },
+  },
+  {
+    name: "cancel_order",
+    description: "Cancel an order on Dex. Must be confirmed by user.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        orderId: { type: "string" },
+        confirm: { type: "boolean" },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
+    name: "get_order_status",
+    description:
+      "Get order details and status by order id (open, partially filled, filled, closed).",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        orderId: { type: "string" },
+        marketIndex: { type: "number" },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
+    name: "list_orders",
+    description:
+      "List orders with filters by wallet, status, and side. Use this for my open orders, recent orders, or order history queries.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        status: {
+          type: "string",
+          enum: ["any", "open", "partially_filled", "filled", "closed_or_not_found"],
+        },
+        side: { type: "string", enum: ["any", "buy", "sell"] },
+        maxOrderId: { type: "number" },
+        limit: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "watch_order_status",
+    description:
+      "Poll an order status until it reaches terminal state (filled/closed) or max polls.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        orderId: { type: "string" },
+        marketIndex: { type: "number" },
+        intervalMs: { type: "number" },
+        maxPolls: { type: "number" },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
+    name: "get_order_insight",
+    description:
+      "Get complete order details plus analytics (distance to mid-price and market context).",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        orderId: { type: "string" },
+        marketIndex: { type: "number" },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
+    name: "get_wallet_orders_overview",
+    description:
+      "Get complete wallet order summary: counts by status/side, open exposure, and recent orders.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        maxOrderId: { type: "number" },
+        maxRows: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "get_orderbook_depth",
+    description:
+      "Get aggregated orderbook depth (bids and asks) with configurable levels.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+        levels: { type: "number" },
+        maxOrderId: { type: "number" },
+        maxRows: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "get_dex_status",
+    description:
+      "Get full DEX status snapshot: spread, liquidity imbalance, signer balances, and top depth.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+        maxOrderId: { type: "number" },
+        maxRows: { type: "number" },
+        depthLevels: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "get_market_overview",
+    description: "Get top-of-book market data (best bid and best ask) for a selected market.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "get_price_recommendation",
+    description:
+      "Get recommended order price based on side and strategy using current market quotes.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+        side: { type: "string", enum: ["buy", "sell"] },
+        strategy: { type: "string", enum: ["passive", "balanced", "aggressive"] },
+      },
+      required: ["side"],
+    },
+  },
+  {
+    name: "smart_place_order",
+    description:
+      "Place an order using automatic pricing strategy (passive/balanced/aggressive). Requires confirmation.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        walletAddress: { type: "string" },
+        marketIndex: { type: "number" },
+        side: { type: "string", enum: ["buy", "sell"] },
+        amountBase: { type: "number" },
+        strategy: { type: "string", enum: ["passive", "balanced", "aggressive"] },
+        maxSlippageBps: { type: "number" },
+        confirm: { type: "boolean" },
+      },
+      required: ["side", "amountBase"],
+    },
+  },
+  {
+    name: "get_currency_info",
+    description:
+      "Get currency metadata such as symbols, decimals, and vault/orderbook addresses.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+      },
+    },
+  },
+] as const;
+
+const executeTool = async (
+  name: string,
+  args: Record<string, unknown>,
+  walletAddress?: string,
+): Promise<ToolResult> => {
+  try {
+    if (name === "list_markets") {
+      return await listMarkets();
+    }
+    if (name === "get_balance") {
+      return await getBalance({
+        walletAddress:
+          (args.walletAddress as string | undefined) ?? walletAddress ?? "",
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        scope:
+          (args.scope as "vault" | "orderbook" | "both" | undefined) ?? "both",
+      });
+    }
+    if (name === "place_order") {
+      return await placeOrder({
+        walletAddress: (args.walletAddress as string | undefined) ?? walletAddress,
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        side: args.side as "buy" | "sell",
+        orderType: args.orderType as
+          | "limit"
+          | "market"
+          | "fill_or_kill"
+          | "immediate_or_cancel",
+        amountBase: Number(args.amountBase),
+        priceInQuotePerBase:
+          typeof args.priceInQuotePerBase === "number"
+            ? args.priceInQuotePerBase
+            : undefined,
+        maxQuoteAmount:
+          typeof args.maxQuoteAmount === "number" ? args.maxQuoteAmount : undefined,
+        confirm: Boolean(args.confirm),
+      });
+    }
+    if (name === "cancel_order") {
+      return await cancelOrder({
+        walletAddress: (args.walletAddress as string | undefined) ?? walletAddress,
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        orderId: String(args.orderId),
+        confirm: Boolean(args.confirm),
+      });
+    }
+    if (name === "get_order_status") {
+      return await getOrderStatus({
+        orderId: String(args.orderId),
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+      });
+    }
+    if (name === "list_orders") {
+      return await listOrders({
+        walletAddress: (args.walletAddress as string | undefined) ?? walletAddress,
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        status: args.status as
+          | "any"
+          | "open"
+          | "partially_filled"
+          | "filled"
+          | "closed_or_not_found"
+          | undefined,
+        side: args.side as "any" | "buy" | "sell" | undefined,
+        maxOrderId:
+          typeof args.maxOrderId === "number" ? args.maxOrderId : undefined,
+        limit: typeof args.limit === "number" ? args.limit : undefined,
+      });
+    }
+    if (name === "watch_order_status") {
+      return await watchOrderStatus({
+        orderId: String(args.orderId),
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        intervalMs:
+          typeof args.intervalMs === "number" ? args.intervalMs : undefined,
+        maxPolls: typeof args.maxPolls === "number" ? args.maxPolls : undefined,
+      });
+    }
+    if (name === "get_order_insight") {
+      return await getOrderInsight({
+        orderId: String(args.orderId),
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+      });
+    }
+    if (name === "get_wallet_orders_overview") {
+      return await getWalletOrdersOverview({
+        walletAddress: (args.walletAddress as string | undefined) ?? walletAddress,
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        maxOrderId:
+          typeof args.maxOrderId === "number" ? args.maxOrderId : undefined,
+        maxRows: typeof args.maxRows === "number" ? args.maxRows : undefined,
+      });
+    }
+    if (name === "get_orderbook_depth") {
+      return await getOrderbookDepth({
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        levels: typeof args.levels === "number" ? args.levels : undefined,
+        maxOrderId:
+          typeof args.maxOrderId === "number" ? args.maxOrderId : undefined,
+        maxRows: typeof args.maxRows === "number" ? args.maxRows : undefined,
+      });
+    }
+    if (name === "get_dex_status") {
+      return await getDexStatus({
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        maxOrderId:
+          typeof args.maxOrderId === "number" ? args.maxOrderId : undefined,
+        maxRows: typeof args.maxRows === "number" ? args.maxRows : undefined,
+        depthLevels:
+          typeof args.depthLevels === "number" ? args.depthLevels : undefined,
+      });
+    }
+    if (name === "get_market_overview") {
+      return await getMarketOverview({
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+      });
+    }
+    if (name === "get_price_recommendation") {
+      return await getPriceRecommendation({
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        side: args.side as "buy" | "sell",
+        strategy: args.strategy as "passive" | "balanced" | "aggressive" | undefined,
+      });
+    }
+    if (name === "smart_place_order") {
+      return await smartPlaceOrder({
+        walletAddress: (args.walletAddress as string | undefined) ?? walletAddress,
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+        side: args.side as "buy" | "sell",
+        amountBase: Number(args.amountBase),
+        strategy: args.strategy as "passive" | "balanced" | "aggressive" | undefined,
+        maxSlippageBps:
+          typeof args.maxSlippageBps === "number" ? args.maxSlippageBps : undefined,
+        confirm: Boolean(args.confirm),
+      });
+    }
+    if (name === "get_currency_info") {
+      return await getCurrencyInfo({
+        marketIndex:
+          typeof args.marketIndex === "number" ? args.marketIndex : undefined,
+      });
+    }
+
+    return { ok: false, message: `Unknown tool: ${name}` };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : "Tool error",
+    };
+  }
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -747,6 +1173,32 @@ async function main() {
 
   const server = http.createServer(async (req, res) => {
     const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+
+    if (reqUrl.pathname === "/api/agent/schema") {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ tools: toolSchema }));
+      return;
+    }
+
+    if (reqUrl.pathname === "/api/agent/tool" && req.method === "POST") {
+      try {
+        const body = await readJsonBody<AgentToolRequest>(req);
+        const name = String(body.name ?? "").trim();
+        if (!name) {
+          throw new Error("Tool name is required");
+        }
+        const args = (body.args ?? {}) as Record<string, unknown>;
+        const result = await executeTool(name, args, body.walletAddress);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const message = (error as Error)?.message ?? String(error);
+        logger.warn("Failed to execute agent tool", { error: message });
+        res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, message }));
+      }
+      return;
+    }
 
     if (reqUrl.pathname === "/api/snapshot") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
