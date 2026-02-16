@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-mockall = { version = "0.12", optional = true }
+mockall = { version = "0.14", optional = true }
 sails-rs = { workspace = true, features = ["ethexe"] }
 
 [build-dependencies]
