@@ -20,4 +20,4 @@ sails-client-gen = "=0.10.2"
 tokio = { version = "1", features = ["rt", "macros"] }
 gtest = "1"
 insta = "1"
-alloy-sol-types = { version = "0.8.15", default-features = false }
+alloy-sol-types = { version = "1.5.1", default-features = false }
