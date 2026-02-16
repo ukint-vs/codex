@@ -61,6 +61,23 @@
         <img class="brand-logo" src="/logo-codex.svg" alt="codex logo" />
         <h1>Live Market Board</h1>
         <div id="meta" class="meta"></div>
+        <section class="rpc-config" id="rpc-config">
+          <div class="rpc-config-grid">
+            <label>
+              Ethereum WS RPC
+              <input id="rpc-eth-input" type="text" spellcheck="false" placeholder="wss://..." />
+            </label>
+            <label>
+              Vara WS RPC
+              <input id="rpc-vara-input" type="text" spellcheck="false" placeholder="ws://..." />
+            </label>
+            <div class="rpc-config-actions">
+              <button type="button" class="mini-btn" id="rpc-apply-btn">Apply RPC</button>
+              <button type="button" class="mini-btn" id="rpc-default-btn">Use Defaults</button>
+            </div>
+          </div>
+          <div class="rpc-status muted" id="rpc-status">RPC: loading...</div>
+        </section>
       </header>
 
       <section id="warnings"></section>

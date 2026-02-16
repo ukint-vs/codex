@@ -12,6 +12,11 @@ const llmInputEl = document.getElementById("llm-input");
 const llmCancelEl = document.getElementById("llm-cancel");
 const appShellEl = document.getElementById("app-shell");
 const assistantSidebarToggleEl = document.getElementById("assistant-sidebar-toggle");
+const rpcEthInputEl = document.getElementById("rpc-eth-input");
+const rpcVaraInputEl = document.getElementById("rpc-vara-input");
+const rpcApplyBtnEl = document.getElementById("rpc-apply-btn");
+const rpcDefaultBtnEl = document.getElementById("rpc-default-btn");
+const rpcStatusEl = document.getElementById("rpc-status");
 
 const EXEC_CHART_MAX_POINTS = 500;
 const EXEC_CHART_HISTORY_MAX_POINTS = 3000;
@@ -72,6 +77,95 @@ const setWarning = (warning) => {
   warningsEl.innerHTML = warning
     ? `<p class="warning">Warning: ${warning}</p>`
     : "";
+};
+
+const formatRpcLabel = (value) => {
+  const text = String(value ?? "").trim();
+  if (!text) return "-";
+  if (text.length <= 64) return text;
+  return `${text.slice(0, 32)}...${text.slice(-18)}`;
+};
+
+const setRpcStatus = (message, tone = "muted") => {
+  if (!rpcStatusEl) return;
+  rpcStatusEl.className = `rpc-status ${tone}`;
+  rpcStatusEl.textContent = message;
+};
+
+const setRpcControlsDisabled = (disabled) => {
+  if (rpcEthInputEl) rpcEthInputEl.disabled = disabled;
+  if (rpcVaraInputEl) rpcVaraInputEl.disabled = disabled;
+  if (rpcApplyBtnEl) rpcApplyBtnEl.disabled = disabled;
+  if (rpcDefaultBtnEl) rpcDefaultBtnEl.disabled = disabled;
+};
+
+const parseRpcConfigPayload = (payload) => payload?.data ?? payload ?? {};
+
+const loadRpcConfig = async () => {
+  if (!rpcEthInputEl || !rpcVaraInputEl) return null;
+  try {
+    const response = await fetch("/api/rpc/config", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`RPC config HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const data = parseRpcConfigPayload(payload);
+    const ethereumWs = String(data.ethereumWs ?? "").trim();
+    const varaEthWsRpc = String(data.varaEthWsRpc ?? "").trim();
+    rpcEthInputEl.value = ethereumWs;
+    rpcVaraInputEl.value = varaEthWsRpc;
+    setRpcStatus(
+      `RPC active | ETH: ${formatRpcLabel(ethereumWs)} | VARA: ${formatRpcLabel(varaEthWsRpc)}`,
+      "muted",
+    );
+    return data;
+  } catch (error) {
+    setRpcStatus(`RPC config load failed: ${error?.message ?? String(error)}`, "err");
+    return null;
+  }
+};
+
+const applyRpcConfig = async ({ useDefaults = false } = {}) => {
+  if (!rpcEthInputEl || !rpcVaraInputEl) return;
+  setRpcControlsDisabled(true);
+  setRpcStatus(useDefaults ? "Switching RPC to defaults..." : "Switching RPC...", "muted");
+  try {
+    const payload = useDefaults
+      ? { useDefaults: true }
+      : {
+          ethereumWs: rpcEthInputEl.value,
+          varaEthWsRpc: rpcVaraInputEl.value,
+        };
+    const response = await fetch("/api/rpc/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result?.error ?? `HTTP ${response.status}`);
+    }
+    const data = parseRpcConfigPayload(result);
+    const ethereumWs = String(data.ethereumWs ?? "").trim();
+    const varaEthWsRpc = String(data.varaEthWsRpc ?? "").trim();
+    rpcEthInputEl.value = ethereumWs;
+    rpcVaraInputEl.value = varaEthWsRpc;
+    setRpcStatus(
+      `RPC updated | ETH: ${formatRpcLabel(ethereumWs)} | VARA: ${formatRpcLabel(varaEthWsRpc)}`,
+      "ok",
+    );
+    if (!polling && !stopped) {
+      try {
+        await fetchAndRenderSnapshot();
+      } catch {
+        // Keep existing polling loop behavior.
+      }
+    }
+  } catch (error) {
+    setRpcStatus(`RPC update failed: ${error?.message ?? String(error)}`, "err");
+  } finally {
+    setRpcControlsDisabled(false);
+  }
 };
 
 const setCellText = (el, text) => {
@@ -1739,6 +1833,19 @@ const renderSnapshot = (snapshot) => {
   metaEl.textContent = `Last tick: ${date.toLocaleTimeString()} | Refresh ${(
     CHART_POLL_INTERVAL_MS / 1000
   ).toFixed(1)}s`;
+  const source = snapshot?.source ?? {};
+  if (rpcEthInputEl && document.activeElement !== rpcEthInputEl) {
+    rpcEthInputEl.value = String(source.ethereumWs ?? "");
+  }
+  if (rpcVaraInputEl && document.activeElement !== rpcVaraInputEl) {
+    rpcVaraInputEl.value = String(source.varaEthWsRpc ?? "");
+  }
+  if (rpcStatusEl) {
+    setRpcStatus(
+      `RPC active | ETH: ${formatRpcLabel(source.ethereumWs)} | VARA: ${formatRpcLabel(source.varaEthWsRpc)}`,
+      "muted",
+    );
+  }
 
   const indexes = new Set(snapshot.markets.map((m) => m.index));
   if (activeMarketIndex === null || !indexes.has(activeMarketIndex)) {
@@ -1770,15 +1877,19 @@ let pollMs = POLL_INTERVAL_MS;
 let polling = false;
 let stopped = false;
 
+const fetchAndRenderSnapshot = async () => {
+  const response = await fetch("/api/snapshot", { cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const snapshot = await response.json();
+  renderSnapshot(snapshot);
+};
+
 const poll = async () => {
   if (polling || stopped) return;
   polling = true;
   try {
-    const response = await fetch("/api/snapshot", { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const snapshot = await response.json();
+    await fetchAndRenderSnapshot();
     pollMs = CHART_POLL_INTERVAL_MS;
-    renderSnapshot(snapshot);
   } catch (error) {
     renderError(error?.message ?? String(error));
     pollMs = Math.max(MIN_POLL_INTERVAL_MS, CHART_POLL_INTERVAL_MS);
@@ -1813,6 +1924,18 @@ if (appShellEl) {
 if (assistantSidebarToggleEl) {
   assistantSidebarToggleEl.addEventListener("click", () => {
     applyAssistantSidebarState(!assistantSidebarCollapsed);
+  });
+}
+
+if (rpcApplyBtnEl) {
+  rpcApplyBtnEl.addEventListener("click", async () => {
+    await applyRpcConfig();
+  });
+}
+
+if (rpcDefaultBtnEl) {
+  rpcDefaultBtnEl.addEventListener("click", async () => {
+    await applyRpcConfig({ useDefaults: true });
   });
 }
 
@@ -1852,4 +1975,6 @@ if (llmChatEl && llmMessages.length === 0) {
   llmMessages.push({ role: "assistant", content: welcome });
 }
 
-poll();
+void loadRpcConfig().finally(() => {
+  poll();
+});

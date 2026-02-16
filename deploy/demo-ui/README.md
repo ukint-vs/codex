@@ -89,6 +89,16 @@ Checks performed:
 
 ## 7) Operations
 
+### Switch RPC in web UI (no redeploy)
+
+The header includes runtime RPC controls:
+- `Ethereum WS RPC`
+- `Vara WS RPC`
+- `Apply RPC` / `Use Defaults`
+
+This updates backend RPC connections in-memory and takes effect immediately.
+Use this for switching between public testnet RPCs and host-local RPC bridges.
+
 ### View logs
 
 ```bash

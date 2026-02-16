@@ -163,6 +163,58 @@ body {
   font-weight: 500;
 }
 
+.rpc-config {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(103, 152, 210, 0.36);
+  border-radius: var(--radius-md);
+  background: rgba(8, 19, 35, 0.78);
+  display: grid;
+  gap: 8px;
+}
+
+.rpc-config-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
+}
+
+.rpc-config label {
+  display: grid;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: #95b8dc;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.rpc-config input {
+  width: 100%;
+  border: 1px solid rgba(102, 143, 193, 0.55);
+  border-radius: var(--radius-sm);
+  background: rgba(6, 14, 28, 0.96);
+  color: #d8ecff;
+  padding: 8px 10px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.75rem;
+}
+
+.rpc-config-actions {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.rpc-config-actions .mini-btn {
+  height: 36px;
+  min-width: 116px;
+}
+
+.rpc-status {
+  font-size: 0.76rem;
+  word-break: break-word;
+}
+
 .warning {
   margin: 0;
   padding: 11px 14px;
@@ -1277,9 +1329,14 @@ button:focus-visible {
 
   .market-addresses,
   .stats,
+  .rpc-config-grid,
   .limit-form,
   .trade-form {
     grid-template-columns: 1fr;
+  }
+
+  .rpc-config-actions {
+    align-items: center;
   }
 
   table {

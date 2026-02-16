@@ -186,6 +186,38 @@ type ToolResult = {
   needsConfirmation?: boolean;
 };
 
+type RuntimeMarket = {
+  index: number;
+  orderbookAddress: Address;
+  baseVaultAddress: Address;
+  quoteVaultAddress: Address;
+  baseTokenId: string;
+  quoteTokenId: string;
+  baseSymbol: string;
+  quoteSymbol: string;
+  orderbook: Orderbook;
+};
+
+type RpcConfigRequestBody = {
+  ethereumWs?: unknown;
+  varaEthWsRpc?: unknown;
+  useDefaults?: unknown;
+};
+
+const normalizeWsRpcInput = (value: unknown, key: "ethereumWs" | "varaEthWsRpc"): string => {
+  if (typeof value !== "string") {
+    throw new Error(`${key} must be a string`);
+  }
+  const raw = value.trim();
+  if (!raw) {
+    throw new Error(`${key} must not be empty`);
+  }
+  if (raw.startsWith("ws://") || raw.startsWith("wss://")) return raw;
+  if (raw.startsWith("http://")) return `ws://${raw.slice("http://".length)}`;
+  if (raw.startsWith("https://")) return `wss://${raw.slice("https://".length)}`;
+  throw new Error(`${key} must start with ws://, wss://, http://, or https://`);
+};
+
 class CompatEthereumClient {
   public router: Pick<ReturnType<typeof getRouterClient>, "validators">;
   private routerClient: ReturnType<typeof getRouterClient>;
@@ -996,8 +1028,14 @@ async function main() {
   );
   const runForSigner = createSignerTaskRunner();
 
-  const ethTransport = webSocket(config.transports.ethereumWs);
-  const publicClient = createPublicClient({ transport: ethTransport });
+  const defaultEthereumWs = config.transports.ethereumWs;
+  const defaultVaraEthWsRpc = config.transports.varaEthWsRpc;
+
+  let activeEthereumWs = defaultEthereumWs;
+  let activeVaraEthWsRpc = defaultVaraEthWsRpc;
+
+  let ethTransport = webSocket(activeEthereumWs);
+  let publicClient = createPublicClient({ transport: ethTransport });
 
   const makeSigner = (account: Account): ISigner => {
     const wc = createWalletClient({ account, transport: ethTransport });
@@ -1037,44 +1075,77 @@ async function main() {
       ? config.contracts.validators
       : [LOCAL_VALIDATOR_FALLBACK];
 
-  const ethClient = new CompatEthereumClient(
-    publicClient,
-    config.contracts.router,
-    fallbackValidators,
-  );
-  void ethClient.waitForInitialization().catch((error) => {
-    logger.warn("Ethereum client initialization failed; using fallback chain assumptions", {
-      error: String(error),
+  const buildCompatEthClient = (client: PublicClient) => {
+    const ethClient = new CompatEthereumClient(
+      client,
+      config.contracts.router,
+      fallbackValidators,
+    );
+    void ethClient.waitForInitialization().catch((error) => {
+      logger.warn("Ethereum client initialization failed; using fallback chain assumptions", {
+        error: String(error),
+      });
     });
-  });
+    return ethClient;
+  };
 
-  const varaEthApi = new VaraEthApi(
-    new WsVaraEthProvider(config.transports.varaEthWsRpc),
-    ethClient as any,
+  const buildMarkets = (api: VaraEthApi, client: PublicClient): RuntimeMarket[] =>
+    config.contracts.markets.map((market, index) => ({
+      index,
+      orderbookAddress: market.orderbook,
+      baseVaultAddress: market.baseTokenVault,
+      quoteVaultAddress: market.quoteTokenVault,
+      baseTokenId: market.baseTokenId,
+      quoteTokenId: market.quoteTokenId,
+      baseSymbol: (market.baseSymbol ?? `BASE${index}`).toUpperCase(),
+      quoteSymbol: (market.quoteSymbol ?? "USDC").toUpperCase(),
+      orderbook: new Orderbook(
+        orderbookCodec,
+        api,
+        client,
+        market.orderbook,
+        TOKEN_DECIMALS,
+        TOKEN_DECIMALS,
+      ),
+    }));
+
+  let varaEthApi = new VaraEthApi(
+    new WsVaraEthProvider(activeVaraEthWsRpc),
+    buildCompatEthClient(publicClient) as any,
   );
-
-  const markets = config.contracts.markets.map((market, index) => ({
-    index,
-    orderbookAddress: market.orderbook,
-    baseVaultAddress: market.baseTokenVault,
-    quoteVaultAddress: market.quoteTokenVault,
-    baseTokenId: market.baseTokenId,
-    quoteTokenId: market.quoteTokenId,
-    baseSymbol: (market.baseSymbol ?? `BASE${index}`).toUpperCase(),
-    quoteSymbol: (market.quoteSymbol ?? "USDC").toUpperCase(),
-    orderbook: new Orderbook(
-      orderbookCodec,
-      varaEthApi,
-      publicClient,
-      market.orderbook,
-      TOKEN_DECIMALS,
-      TOKEN_DECIMALS,
-    ),
-  }));
+  let markets = buildMarkets(varaEthApi, publicClient);
 
   const tradeSeenAtByMarket = new Map<string, Map<string, string>>();
   const warnedTradeHistoryUnavailable = new Set<string>();
   const warnedSnapshotMarketUnavailable = new Set<string>();
+
+  const refreshRuntimeConnections = async (
+    nextEthereumWs: string,
+    nextVaraEthWsRpc: string,
+  ) => {
+    const nextEthTransport = webSocket(nextEthereumWs);
+    const nextPublicClient = createPublicClient({ transport: nextEthTransport });
+    const nextVaraEthApi = new VaraEthApi(
+      new WsVaraEthProvider(nextVaraEthWsRpc),
+      buildCompatEthClient(nextPublicClient) as any,
+    );
+    const nextMarkets = buildMarkets(nextVaraEthApi, nextPublicClient);
+
+    ethTransport = nextEthTransport;
+    publicClient = nextPublicClient;
+    varaEthApi = nextVaraEthApi;
+    markets = nextMarkets;
+    activeEthereumWs = nextEthereumWs;
+    activeVaraEthWsRpc = nextVaraEthWsRpc;
+
+    warnedTradeHistoryUnavailable.clear();
+    warnedSnapshotMarketUnavailable.clear();
+
+    logger.info("Updated runtime RPC endpoints", {
+      ethereumWs: activeEthereumWs,
+      varaEthWsRpc: activeVaraEthWsRpc,
+    });
+  };
 
   const toTradeRows = (
     marketIndex: number,
@@ -1220,8 +1291,8 @@ async function main() {
     updatedAt: new Date(0).toISOString(),
     refreshMs,
     source: {
-      ethereumWs: config.transports.ethereumWs,
-      varaEthWsRpc: config.transports.varaEthWsRpc,
+      ethereumWs: activeEthereumWs,
+      varaEthWsRpc: activeVaraEthWsRpc,
     },
     participants,
     markets: [],
@@ -1319,8 +1390,8 @@ async function main() {
       updatedAt: new Date().toISOString(),
       refreshMs,
       source: {
-        ethereumWs: config.transports.ethereumWs,
-        varaEthWsRpc: config.transports.varaEthWsRpc,
+        ethereumWs: activeEthereumWs,
+        varaEthWsRpc: activeVaraEthWsRpc,
       },
       participants,
       markets: marketRows,
@@ -1360,6 +1431,67 @@ async function main() {
     if (reqUrl.pathname === "/api/assistant/config") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ apiKey: assistantApiKey.trim() }));
+      return;
+    }
+
+    if (reqUrl.pathname === "/api/rpc/config" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          data: {
+            ethereumWs: activeEthereumWs,
+            varaEthWsRpc: activeVaraEthWsRpc,
+            defaults: {
+              ethereumWs: defaultEthereumWs,
+              varaEthWsRpc: defaultVaraEthWsRpc,
+            },
+          },
+        }),
+      );
+      return;
+    }
+
+    if (reqUrl.pathname === "/api/rpc/config" && req.method === "POST") {
+      try {
+        const body = await readJsonBody<RpcConfigRequestBody>(req);
+        const useDefaults = body.useDefaults === true;
+        const nextEthereumWs = useDefaults
+          ? defaultEthereumWs
+          : normalizeWsRpcInput(
+              body.ethereumWs !== undefined ? body.ethereumWs : activeEthereumWs,
+              "ethereumWs",
+            );
+        const nextVaraEthWsRpc = useDefaults
+          ? defaultVaraEthWsRpc
+          : normalizeWsRpcInput(
+              body.varaEthWsRpc !== undefined ? body.varaEthWsRpc : activeVaraEthWsRpc,
+              "varaEthWsRpc",
+            );
+
+        await refreshRuntimeConnections(nextEthereumWs, nextVaraEthWsRpc);
+        void refresh();
+
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            data: {
+              ethereumWs: activeEthereumWs,
+              varaEthWsRpc: activeVaraEthWsRpc,
+              defaults: {
+                ethereumWs: defaultEthereumWs,
+                varaEthWsRpc: defaultVaraEthWsRpc,
+              },
+            },
+          }),
+        );
+      } catch (error) {
+        const message = (error as Error)?.message ?? String(error);
+        logger.warn("Failed to update runtime RPC endpoints", { error: message });
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, error: message }));
+      }
       return;
     }
 
