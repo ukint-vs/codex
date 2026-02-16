@@ -2,6 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import NodeWebSocket from "ws";
 
 import {
   ISigner,
@@ -42,6 +43,10 @@ import {
   smartPlaceOrder,
   watchOrderStatus,
 } from "../browser-agent/runtime.js";
+
+if (typeof (globalThis as { WebSocket?: unknown }).WebSocket === "undefined") {
+  (globalThis as { WebSocket?: unknown }).WebSocket = NodeWebSocket;
+}
 
 const TOKEN_DECIMALS = 6;
 const PRICE_DECIMALS = 30;

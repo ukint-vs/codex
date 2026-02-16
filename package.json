@@ -21,7 +21,8 @@
     "dotenv": "^17.2.3",
     "sails-js": "^0.5.1",
     "sails-js-parser": "^0.5.1",
-    "viem": "^2.45.1"
+    "viem": "^2.45.1",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "sails-js-types": "^0.5.1",

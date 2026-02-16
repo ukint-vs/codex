@@ -23,6 +23,9 @@ importers:
       viem:
         specifier: ^2.45.1
         version: 2.45.1(typescript@5.9.3)
+      ws:
+        specifier: ^8.19.0
+        version: 8.19.0
     devDependencies:
       sails-js-types:
         specifier: ^0.5.1
