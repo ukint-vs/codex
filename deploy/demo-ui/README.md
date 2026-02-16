@@ -150,3 +150,39 @@ bash deploy/demo-ui/scripts/deploy.sh
 ```
 
 Caddy will request a new Let's Encrypt certificate for the updated hostname.
+
+## 10) Local node mode (host `setup-local-env.sh` + Docker demo-ui)
+
+`scripts/setup-local-env.sh` runs Vara.Eth + Anvil on host ports `9944` and `8545`.
+Because `demo-ui` runs in a container, do not use `127.0.0.1` for RPC in `app.env`.
+
+Use:
+
+```env
+ETHEREUM_WS_RPC=ws://host.docker.internal:8545
+VARA_ETH_WS_RPC=ws://host.docker.internal:9944
+```
+
+Recommended flow:
+
+1. Start local node on host (keep it running in tmux/screen):
+
+```bash
+cd /path/to/gear-clob
+export PATH_TO_VARA_ETH_BIN=/path/to/vara-eth
+SKIP_BUILD=1 ./scripts/setup-local-env.sh
+```
+
+2. Sync addresses from root `.env` into `deploy/demo-ui/app.env` and replace RPC endpoints with `host.docker.internal`.
+
+3. Re-deploy demo stack:
+
+```bash
+bash deploy/demo-ui/scripts/deploy.sh
+```
+
+4. Validate from container:
+
+```bash
+docker compose -f deploy/demo-ui/docker-compose.yml exec demo-ui sh -lc 'getent hosts host.docker.internal && nc -vz host.docker.internal 8545 && nc -vz host.docker.internal 9944'
+```
