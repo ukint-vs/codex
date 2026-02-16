@@ -1,0 +1,22 @@
+FROM node:20-bookworm-slim
+
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
+
+COPY package.json pnpm-lock.yaml tsconfig.json ./
+COPY scripts ./scripts
+
+RUN pnpm install --frozen-lockfile
+
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 4180
+
+CMD ["pnpm", "demo:ui"]
