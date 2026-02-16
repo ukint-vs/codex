@@ -44,6 +44,7 @@ const DECIMALS = 6;
 const BASE_DECIMALS = 6;
 const QUOTE_DECIMALS = 6;
 const PRICE_PRECISION = 10n ** 30n;
+const DEFAULT_TRADE_EVIDENCE_SCAN = 400;
 
 function pow10(n: number): bigint {
   return 10n ** BigInt(n);
@@ -127,6 +128,60 @@ function toOrderRow(order: {
     filledBase: order.filledBase,
     remainingBase,
     limitPriceRaw: order.limitPrice,
+  };
+}
+
+type TradeEvidence = {
+  available: boolean;
+  scannedTrades: number;
+  matchedTrades: number;
+  makerMatches: number;
+  takerMatches: number;
+  matchedBase: string;
+  matchedQuote: string;
+  latestMatchedSeq: string | null;
+};
+
+function summarizeTradeEvidence(
+  trades: Array<{
+    seq: bigint;
+    makerOrderId: bigint;
+    takerOrderId: bigint;
+    amountBase: bigint;
+    amountQuote: bigint;
+  }>,
+  orderId: bigint,
+): TradeEvidence {
+  let matchedTrades = 0;
+  let makerMatches = 0;
+  let takerMatches = 0;
+  let matchedBaseRaw = 0n;
+  let matchedQuoteRaw = 0n;
+  let latestMatchedSeq: bigint | null = null;
+
+  for (const trade of trades) {
+    const isMaker = trade.makerOrderId === orderId;
+    const isTaker = trade.takerOrderId === orderId;
+    if (!isMaker && !isTaker) continue;
+    matchedTrades += 1;
+    if (isMaker) makerMatches += 1;
+    if (isTaker) takerMatches += 1;
+    matchedBaseRaw += trade.amountBase;
+    matchedQuoteRaw += trade.amountQuote;
+    if (latestMatchedSeq == null || trade.seq > latestMatchedSeq) {
+      latestMatchedSeq = trade.seq;
+    }
+  }
+
+  return {
+    available: true,
+    scannedTrades: trades.length,
+    matchedTrades,
+    makerMatches,
+    takerMatches,
+    matchedBase: toDisplay(matchedBaseRaw, BASE_DECIMALS),
+    matchedQuote: toDisplay(matchedQuoteRaw, QUOTE_DECIMALS),
+    latestMatchedSeq: latestMatchedSeq == null ? null : latestMatchedSeq.toString(),
   };
 }
 
@@ -455,6 +510,17 @@ export async function placeOrder(input: {
 
   const scopedOrderbook = orderbook.withSigner(takerSigner);
   const [baseBefore, quoteBefore] = await scopedOrderbook.balanceOf(takerAddress);
+  const tradeEvidenceScanCount = Math.max(
+    10,
+    Math.min(
+      5000,
+      Math.floor(
+        Number(
+          process.env.BROWSER_AGENT_TRADE_EVIDENCE_SCAN ?? DEFAULT_TRADE_EVIDENCE_SCAN,
+        ),
+      ),
+    ),
+  );
   let orderId: bigint;
   if (
     (input.orderType === "limit" ||
@@ -520,21 +586,44 @@ export async function placeOrder(input: {
   const status = classifyOrderStatus(order);
   const remaining =
     order.amountBase > order.filledBase ? order.amountBase - order.filledBase : 0n;
+  const resolvedSide =
+    status === "closed_or_not_found"
+      ? input.side
+      : order.side === 0
+        ? "buy"
+        : "sell";
   const [baseAfter, quoteAfter] = await scopedOrderbook.balanceOf(takerAddress);
   const baseDelta = baseAfter - baseBefore;
   const quoteDelta = quoteAfter - quoteBefore;
   const hadExecutionImpact = baseDelta !== 0n || quoteDelta !== 0n;
+  let tradeEvidence: TradeEvidence | { available: false; error: string } = {
+    available: false,
+    error: "not_scanned",
+  };
+  try {
+    const recentTrades = await orderbook.tradesReverse(0, tradeEvidenceScanCount);
+    tradeEvidence = summarizeTradeEvidence(recentTrades, orderId);
+  } catch (error) {
+    tradeEvidence = {
+      available: false,
+      error: error instanceof Error ? error.message : "trade scan failed",
+    };
+  }
 
   let inferredOutcome:
     | "resting_or_pending"
     | "partially_filled"
     | "filled"
+    | "executed_in_recent_trades"
     | "likely_executed_or_canceled"
     | "terminal_unknown_no_balance_change";
 
   if (status === "filled") inferredOutcome = "filled";
   else if (status === "partially_filled") inferredOutcome = "partially_filled";
   else if (status === "open") inferredOutcome = "resting_or_pending";
+  else if (tradeEvidence.available && tradeEvidence.matchedTrades > 0) {
+    inferredOutcome = "executed_in_recent_trades";
+  }
   else if (hadExecutionImpact) inferredOutcome = "likely_executed_or_canceled";
   else inferredOutcome = "terminal_unknown_no_balance_change";
 
@@ -549,7 +638,7 @@ export async function placeOrder(input: {
       inferredOutcome,
       statusDetail: {
         exists: order.exists,
-        side: order.side === 0 ? "buy" : "sell",
+        side: resolvedSide,
         amountBase:
           status === "closed_or_not_found"
             ? null
@@ -571,6 +660,13 @@ export async function placeOrder(input: {
             ? "Order is terminal or no longer available in active storage; detailed fill fields are unavailable from direct lookup."
             : undefined,
       },
+      submitted: {
+        side: input.side,
+        orderType: input.orderType,
+        amountBase: input.amountBase,
+        priceInQuotePerBase: input.priceInQuotePerBase ?? null,
+        maxQuoteAmount: input.maxQuoteAmount ?? null,
+      },
       executionImpact: {
         hadExecutionImpact,
         baseBefore: toDisplay(baseBefore, BASE_DECIMALS),
@@ -584,6 +680,7 @@ export async function placeOrder(input: {
           quoteDelta: quoteDelta.toString(),
         },
       },
+      tradeEvidence,
       ...input,
     },
   };
@@ -611,7 +708,7 @@ export async function getOrderStatus(input: {
       orderbookAddress: market.orderbookAddress,
       exists: order.exists,
       owner: order.owner,
-      side: order.side === 0 ? "buy" : "sell",
+      side: status === "closed_or_not_found" ? null : order.side === 0 ? "buy" : "sell",
       amountBase:
         status === "closed_or_not_found"
           ? null

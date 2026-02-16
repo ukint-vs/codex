@@ -50,7 +50,7 @@ const AUTO_DRIFT_MAX_BPS = 2800;
 const AUTO_EXEC_TARGET_JITTER_BPS = 240;
 const ASSISTANT_SIDEBAR_COLLAPSED_STORAGE_KEY = "dex_assistant_sidebar_collapsed";
 const DEFAULT_ASSISTANT_PROVIDER = "openrouter";
-const DEFAULT_ASSISTANT_MODEL = "openrouter/free";
+const DEFAULT_ASSISTANT_MODEL = "omoonshotai/kimi-k2.5/free";
 
 const chartLib = window.LightweightCharts;
 const marketCards = new Map();
@@ -1455,6 +1455,11 @@ const createMarketCard = (market) => {
     bidsBody: card.querySelector(".bids-table tbody"),
     depthSpread: card.querySelector("[data-depth-spread]"),
     depthMid: card.querySelector("[data-depth-mid]"),
+    storageMode: card.querySelector("[data-storage-mode]"),
+    storageCount: card.querySelector("[data-storage-count]"),
+    storageCap: card.querySelector("[data-storage-cap]"),
+    storageSample: card.querySelector("[data-storage-sample]"),
+    storageVisible: card.querySelector("[data-storage-visible]"),
     limitForm: card.querySelector(".limit-form"),
     tradeForm: card.querySelector(".trade-form"),
     tradeStatus: card.querySelector(".trade-status"),
@@ -1637,6 +1642,26 @@ const updateMarketCard = (market) => {
   setCellText(cardState.statBid, market.bestBid);
   setCellText(cardState.statAsk, market.bestAsk);
   setCellText(cardState.statSpread, market.spreadBps === null ? "-" : `${market.spreadBps} bps`);
+  const storage = market.storage ?? {};
+  const activeOrders = Math.max(0, Number(storage.activeOrders ?? 0));
+  const scanMax = Math.max(0, Number(storage.scanMax ?? 0));
+  const sampledOpenOrders = Math.max(0, Number(storage.sampledOpenOrders ?? 0));
+  const sampledOpenOrdersLimit = Math.max(0, Number(storage.sampledOpenOrdersLimit ?? 0));
+  const visibleRows = Math.max(0, Number(storage.visibleRows ?? 0));
+  const countType = String(storage.countType ?? "exact");
+  const countLabel = `${countType === "at_least" ? ">=" : ""}${activeOrders.toLocaleString()}`;
+  const sampleLabel = `${sampledOpenOrders.toLocaleString()} / ${sampledOpenOrdersLimit.toLocaleString()}`;
+
+  setCellText(
+    cardState.storageMode,
+    countType === "at_least"
+      ? "count mode: lower bound (scan capped)"
+      : "count mode: exact",
+  );
+  setCellText(cardState.storageCount, countLabel);
+  setCellText(cardState.storageCap, scanMax.toLocaleString());
+  setCellText(cardState.storageSample, sampleLabel);
+  setCellText(cardState.storageVisible, visibleRows.toLocaleString());
 
   const asks = market.depth?.asks ?? [];
   const bids = market.depth?.bids ?? [];

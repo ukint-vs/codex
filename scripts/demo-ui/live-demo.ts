@@ -1,6 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
 const childEnv = { ...process.env };
+const setDefaultEnv = (key: string, value: string) => {
+  if (!childEnv[key] || String(childEnv[key]).trim() === "") {
+    childEnv[key] = value;
+  }
+};
+setDefaultEnv("ORDER_RUNNER_MODE", "live");
+setDefaultEnv("ORDER_RUNNER_MARKET_CONCURRENCY", "1");
+setDefaultEnv("ORDER_RUNNER_MARKETS_PER_LOOP", "1");
+setDefaultEnv("ORDER_RUNNER_BOOTSTRAP_EACH_LOOP", "0");
+setDefaultEnv("ORDER_RUNNER_STALL_MAKER_INJECTION", "0");
+setDefaultEnv("ORDER_RUNNER_MAX_MAKER_ORDERS_PER_LOOP", "24");
+
 const DEMO_UI_BASE_URL = (
   process.env.DEMO_UI_BASE_URL ?? "http://127.0.0.1:4180"
 ).replace(/\/+$/, "");

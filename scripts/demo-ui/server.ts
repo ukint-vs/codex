@@ -51,6 +51,8 @@ const DEFAULT_DEPTH_LEVELS = 20;
 const DEFAULT_OPEN_ORDERS_SCAN_COUNT = 220;
 const DEFAULT_TRADES_PER_MARKET = 300;
 const DEFAULT_MAKER_ACCOUNTS_PER_SIDE = 4;
+const DEFAULT_STORAGE_SCAN_PAGE_SIZE = 250;
+const DEFAULT_STORAGE_SCAN_MAX_ORDERS = 10_000;
 const LOCAL_VALIDATOR_FALLBACK =
   "0x70997970C51812dc3A010C7d01b50e0d17dC79C8" as Address;
 
@@ -110,6 +112,15 @@ type MarketSnapshot = {
   bestBid: string;
   bestAsk: string;
   spreadBps: string | null;
+  storage: {
+    activeOrders: number;
+    countType: "exact" | "at_least";
+    scanMax: number;
+    pageSize: number;
+    sampledOpenOrders: number;
+    sampledOpenOrdersLimit: number;
+    visibleRows: number;
+  };
   orders: OrderRow[];
   depth: {
     asks: DepthLevel[];
@@ -131,6 +142,8 @@ type Snapshot = {
   markets: MarketSnapshot[];
   warning?: string;
 };
+
+let latestAgentSnapshot: Snapshot | null = null;
 
 type TriggerOrderBody = {
   market: number;
@@ -274,6 +287,14 @@ const makerAccountsPerSide = Math.max(
       ?? DEFAULT_MAKER_ACCOUNTS_PER_SIDE,
   ),
 );
+const storageScanPageSize = Math.max(
+  10,
+  Number(process.env.DEMO_UI_STORAGE_SCAN_PAGE_SIZE ?? DEFAULT_STORAGE_SCAN_PAGE_SIZE),
+);
+const storageScanMaxOrders = Math.max(
+  storageScanPageSize,
+  Number(process.env.DEMO_UI_STORAGE_SCAN_MAX_ORDERS ?? DEFAULT_STORAGE_SCAN_MAX_ORDERS),
+);
 const assistantApiKey =
   process.env.DEMO_UI_LLM_API_KEY
   ?? process.env.OPENROUTER_API_KEY
@@ -337,6 +358,38 @@ const scanOpenOrders = async (
     amountBase: row.amountBase,
     reservedQuote: row.reservedQuote,
   }));
+};
+
+const countOpenOrdersInStorage = async (
+  orderbook: Orderbook,
+  options: { pageSize: number; maxOrders: number },
+): Promise<{ activeOrders: number; countType: "exact" | "at_least" }> => {
+  let total = 0;
+  let offset = 0;
+
+  while (total < options.maxOrders) {
+    const remainingBudget = options.maxOrders - total;
+    const pageCount = Math.max(1, Math.min(options.pageSize, remainingBudget));
+    const page = await orderbook.ordersReverse(offset, pageCount);
+    const rows = page.length;
+    total += rows;
+
+    if (rows < pageCount) {
+      return {
+        activeOrders: total,
+        countType: "exact",
+      };
+    }
+    if (rows === 0) {
+      break;
+    }
+    offset += pageCount;
+  }
+
+  return {
+    activeOrders: total,
+    countType: "at_least",
+  };
 };
 
 const prioritizeOrdersForTaking = (orders: OpenOrder[], count: number): OpenOrder[] => {
@@ -462,6 +515,22 @@ const toolSchema = [
       type: "object",
       additionalProperties: false,
       properties: {},
+    },
+  },
+  {
+    name: "get_live_snapshot",
+    description:
+      "Get live DEX snapshot across markets: orderbook top levels, open orders, participant balances, and recent trades.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        marketIndex: { type: "number" },
+        includeOrders: { type: "boolean" },
+        includeBalances: { type: "boolean" },
+        includeTrades: { type: "boolean" },
+        tradesLimit: { type: "number" },
+      },
     },
   },
   {
@@ -692,6 +761,63 @@ const executeTool = async (
   try {
     if (name === "list_markets") {
       return await listMarkets();
+    }
+    if (name === "get_live_snapshot") {
+      const source = latestAgentSnapshot;
+      if (!source) {
+        return { ok: false, message: "Live snapshot is not ready yet." };
+      }
+
+      const requestedMarketIndex =
+        typeof args.marketIndex === "number" ? Math.floor(args.marketIndex) : undefined;
+      const includeOrders = args.includeOrders !== false;
+      const includeBalances = args.includeBalances !== false;
+      const includeTrades = args.includeTrades !== false;
+      const tradesLimit = Math.max(
+        0,
+        Math.min(
+          500,
+          typeof args.tradesLimit === "number" ? Math.floor(args.tradesLimit) : 80,
+        ),
+      );
+
+      const selectedMarkets =
+        requestedMarketIndex == null
+          ? source.markets
+          : source.markets.filter((market) => market.index === requestedMarketIndex);
+
+      if (requestedMarketIndex != null && selectedMarkets.length === 0) {
+        return {
+          ok: false,
+          message: `Unknown marketIndex ${requestedMarketIndex}.`,
+          data: {
+            availableMarketIndices: source.markets.map((market) => market.index),
+          },
+        };
+      }
+
+      return {
+        ok: true,
+        data: {
+          updatedAt: source.updatedAt,
+          refreshMs: source.refreshMs,
+          source: source.source,
+          warning: source.warning ?? null,
+          totalMarkets: source.markets.length,
+          returnedMarkets: selectedMarkets.length,
+          participants: source.participants,
+          markets: selectedMarkets.map((market) => ({
+            ...market,
+            orders: includeOrders ? market.orders : [],
+            balances: includeBalances ? market.balances : [],
+            trades: includeTrades ? market.trades.slice(0, tradesLimit) : [],
+            visibleTrades:
+              includeTrades
+                ? Math.min(tradesLimit, market.trades.length)
+                : 0,
+          })),
+        },
+      };
     }
     if (name === "get_balance") {
       return await getBalance({
@@ -939,6 +1065,7 @@ async function main() {
 
   const tradeSeenAtByMarket = new Map<string, Map<string, string>>();
   const warnedTradeHistoryUnavailable = new Set<string>();
+  const warnedSnapshotMarketUnavailable = new Set<string>();
 
   const toTradeRows = (
     marketIndex: number,
@@ -1095,53 +1222,89 @@ async function main() {
   let refreshing = false;
 
   const collectSnapshot = async (): Promise<Snapshot> => {
-    const marketRows = await Promise.all(
-      markets.map(async (market) => {
-        const [bestBidRaw, bestAskRaw, openOrders, balances, tradeData] = await Promise.all([
-          market.orderbook.bestBidPrice().then((x) => BigInt(x)),
-          market.orderbook.bestAskPrice().then((x) => BigInt(x)),
-          scanOpenOrders(
-            market.orderbook,
-            Math.max(openOrdersScanCount, ordersPerMarket),
-          ),
-          Promise.all(
-            participants.map(async (participant): Promise<BalanceRow> => {
-              const [base, quote] = await market.orderbook.balanceOf(participant.address);
-              return {
-                role: participant.role,
-                address: participant.address,
-                base: asUnits(base, TOKEN_DECIMALS),
-                quote: asUnits(quote, TOKEN_DECIMALS),
-              };
-            }),
-          ),
-          loadTradeRows(market),
-        ]);
+    const marketRowsAll = await Promise.all(
+      markets.map(async (market): Promise<MarketSnapshot | null> => {
+        try {
+          const [bestBidRaw, bestAskRaw, openOrders, balances, tradeData] = await Promise.all([
+            market.orderbook.bestBidPrice().then((x) => BigInt(x)),
+            market.orderbook.bestAskPrice().then((x) => BigInt(x)),
+            scanOpenOrders(
+              market.orderbook,
+              Math.max(openOrdersScanCount, ordersPerMarket),
+            ),
+            Promise.all(
+              participants.map(async (participant): Promise<BalanceRow> => {
+                const [base, quote] = await market.orderbook.balanceOf(participant.address);
+                return {
+                  role: participant.role,
+                  address: participant.address,
+                  base: asUnits(base, TOKEN_DECIMALS),
+                  quote: asUnits(quote, TOKEN_DECIMALS),
+                };
+              }),
+            ),
+            loadTradeRows(market),
+          ]);
+          const sampledOpenOrdersLimit = Math.max(openOrdersScanCount, ordersPerMarket);
+          const orderStorage = await countOpenOrdersInStorage(market.orderbook, {
+            pageSize: storageScanPageSize,
+            maxOrders: storageScanMaxOrders,
+          });
+          const visibleOrders = toOrderRows(openOrders, ordersPerMarket);
 
-        return {
-          index: market.index,
-          orderbook: market.orderbookAddress,
-          baseVault: market.baseVaultAddress,
-          quoteVault: market.quoteVaultAddress,
-          baseTokenId: market.baseTokenId,
-          quoteTokenId: market.quoteTokenId,
-          baseSymbol: market.baseSymbol,
-          quoteSymbol: market.quoteSymbol,
-          bestBid: asPrice(bestBidRaw),
-          bestAsk: asPrice(bestAskRaw),
-          spreadBps: computeSpreadBps(bestBidRaw, bestAskRaw),
-          orders: toOrderRows(openOrders, ordersPerMarket),
-          depth: buildDepth(openOrders, depthLevels),
-          balances,
-          tradesCount: tradeData.tradesCount.toString(),
-          trades: toTradeRows(
-            market.index,
-            market.orderbookAddress,
-            tradeData.trades,
-          ),
-        } satisfies MarketSnapshot;
+          const key = marketActionKey(market.index, market.orderbookAddress);
+          warnedSnapshotMarketUnavailable.delete(key);
+
+          return {
+            index: market.index,
+            orderbook: market.orderbookAddress,
+            baseVault: market.baseVaultAddress,
+            quoteVault: market.quoteVaultAddress,
+            baseTokenId: market.baseTokenId,
+            quoteTokenId: market.quoteTokenId,
+            baseSymbol: market.baseSymbol,
+            quoteSymbol: market.quoteSymbol,
+            bestBid: asPrice(bestBidRaw),
+            bestAsk: asPrice(bestAskRaw),
+            spreadBps: computeSpreadBps(bestBidRaw, bestAskRaw),
+            storage: {
+              activeOrders: orderStorage.activeOrders,
+              countType: orderStorage.countType,
+              scanMax: storageScanMaxOrders,
+              pageSize: storageScanPageSize,
+              sampledOpenOrders: openOrders.length,
+              sampledOpenOrdersLimit,
+              visibleRows: visibleOrders.length,
+            },
+            orders: visibleOrders,
+            depth: buildDepth(openOrders, depthLevels),
+            balances,
+            tradesCount: tradeData.tradesCount.toString(),
+            trades: toTradeRows(
+              market.index,
+              market.orderbookAddress,
+              tradeData.trades,
+            ),
+          } satisfies MarketSnapshot;
+        } catch (error) {
+          const key = marketActionKey(market.index, market.orderbookAddress);
+          if (!warnedSnapshotMarketUnavailable.has(key)) {
+            warnedSnapshotMarketUnavailable.add(key);
+            logger.warn("Snapshot market query failed; market will be skipped", {
+              marketIndex: market.index,
+              orderbook: market.orderbookAddress,
+              error: String(error),
+            });
+          }
+          return null;
+        }
       }),
     );
+    const marketRows = marketRowsAll.filter((row): row is MarketSnapshot => row !== null);
+    const unavailableMarkets = markets.length - marketRows.length;
+    const warning = unavailableMarkets > 0
+      ? `Snapshot partial: unavailable markets ${unavailableMarkets}/${markets.length}`
+      : lastError;
 
     return {
       updatedAt: new Date().toISOString(),
@@ -1152,7 +1315,7 @@ async function main() {
       },
       participants,
       markets: marketRows,
-      warning: lastError,
+      warning,
     };
   };
 
@@ -1162,6 +1325,7 @@ async function main() {
     try {
       snapshot = await collectSnapshot();
       lastError = undefined;
+      latestAgentSnapshot = snapshot;
     } catch (error) {
       lastError = (error as Error)?.message ?? String(error);
       snapshot = {
@@ -1169,6 +1333,7 @@ async function main() {
         warning: lastError,
         updatedAt: new Date().toISOString(),
       };
+      latestAgentSnapshot = snapshot;
       logger.warn("Demo UI snapshot refresh failed", { error: lastError });
     } finally {
       refreshing = false;

@@ -12,6 +12,7 @@ Rules:
 8. For wallet-level order analytics, use get_wallet_orders_overview.
 9. After order placement/cancellation, report orderId, status, filled, and remaining.
 10. For multi-market questions, use list_markets first and pass marketIndex in tool arguments.
+11. For "full DEX view" requests, use get_live_snapshot.
 `;
 const WRITE_TOOL_NAMES = new Set(["place_order", "smart_place_order", "cancel_order"]);
 
@@ -39,6 +40,112 @@ const normalizeAssistantReply = (raw) => {
 
 const asObj = (value) =>
   value && typeof value === "object" ? value : {};
+
+const firstDefined = (...values) => {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+};
+
+const compactObject = (obj) =>
+  Object.fromEntries(Object.entries(asObj(obj)).filter(([, value]) => value !== undefined));
+
+const buildOrderSubmissionMessage = ({
+  data,
+  status,
+  marketLabel = "",
+  closedHint,
+  openHint,
+}) => {
+  const payload = asObj(data);
+  const submitted = asObj(payload.submitted);
+  const statusDetail = asObj(payload.statusDetail);
+  const latestStatus = asObj(payload.latestStatus);
+  const impact = asObj(payload.executionImpact);
+  const tradeEvidence = asObj(payload.tradeEvidence);
+  const inferred = String(payload.inferredOutcome ?? "");
+  const orderType = String(
+    firstDefined(payload.orderType, submitted.orderType, "limit"),
+  ).toUpperCase();
+  const side = String(
+    firstDefined(
+      statusDetail.side,
+      payload.side,
+      submitted.side,
+      latestStatus.side,
+      "n/a",
+    ),
+  ).toUpperCase();
+  const amountBase = firstDefined(
+    payload.amountBase,
+    submitted.amountBase,
+    statusDetail.amountBase,
+    latestStatus.amountBase,
+    "n/a",
+  );
+  const isMarketOrder =
+    String(firstDefined(payload.orderType, submitted.orderType, "")).toLowerCase()
+    === "market";
+  const price = firstDefined(
+    statusDetail.limitPrice,
+    payload.priceInQuotePerBase,
+    submitted.priceInQuotePerBase,
+    latestStatus.limitPrice,
+    isMarketOrder ? "market" : undefined,
+    "market",
+  );
+  const orderId = payload.orderId ?? "?";
+  const resolvedStatus = String(
+    firstDefined(status, payload.status, latestStatus.status, "submitted"),
+  );
+  const impactLine = impact.hadExecutionImpact
+    ? `- **Balance Impact:** BASE ${impact.deltaBase ?? "n/a"}, QUOTE ${impact.deltaQuote ?? "n/a"}`
+    : `- **Balance Impact:** none observed yet`;
+  const tradeEvidenceLine =
+    tradeEvidence.available === true
+      ? Number(tradeEvidence.matchedTrades ?? 0) > 0
+        ? `- **Trade Evidence:** matched ${tradeEvidence.matchedTrades ?? "n/a"} recent trades (taker ${tradeEvidence.takerMatches ?? "n/a"}, maker ${tradeEvidence.makerMatches ?? "n/a"}), total ${tradeEvidence.matchedBase ?? "n/a"} BASE / ${tradeEvidence.matchedQuote ?? "n/a"} QUOTE.`
+        : `- **Trade Evidence:** no direct orderId matches in last ${tradeEvidence.scannedTrades ?? "n/a"} recent trades.`
+      : tradeEvidence.error
+        ? `- **Trade Evidence:** unavailable (${tradeEvidence.error}).`
+        : null;
+
+  if (resolvedStatus === "closed_or_not_found") {
+    return [
+      `**Order Submitted** (#${orderId})${marketLabel}`,
+      `- **Type:** ${orderType} ${side}`,
+      `- **Requested:** ${amountBase} BASE @ ${price}`,
+      `- **Status:** terminal/not-found in active storage`,
+      `- **Fill Details:** unavailable from direct lookup`,
+      impactLine,
+      tradeEvidenceLine,
+      `- **Inferred Outcome:** ${inferred || "unknown"}`,
+      "",
+      closedHint ?? "Use balances and wallet overview to verify final effect.",
+    ].filter(Boolean).join("\n");
+  }
+
+  const filled = firstDefined(latestStatus.filledBase, statusDetail.filledBase, "n/a");
+  const remaining = firstDefined(
+    latestStatus.remainingBase,
+    statusDetail.remainingBase,
+    "n/a",
+  );
+  return [
+    `**Order Submitted** (#${orderId})${marketLabel}`,
+    `- **Type:** ${orderType} ${side}`,
+    `- **Requested:** ${amountBase} BASE @ ${price}`,
+    `- **Status:** ${resolvedStatus}`,
+    `- **Filled Now:** ${filled} BASE`,
+    `- **Remaining:** ${remaining} BASE`,
+    impactLine,
+    tradeEvidenceLine,
+    `- **Inferred Outcome:** ${inferred || "unknown"}`,
+    "",
+    openHint ?? `You can ask: \`watch order #${orderId} status\`.`,
+  ].filter(Boolean).join("\n");
+};
 
 export const summarizeToolResult = (toolName, result) => {
   const r = asObj(result);
@@ -70,6 +177,25 @@ export const summarizeToolResult = (toolName, result) => {
     return `Configured markets (${data.count ?? markets.length}): ${rows}.`;
   }
 
+  if (toolName === "get_live_snapshot") {
+    const markets = Array.isArray(data.markets) ? data.markets : [];
+    if (!markets.length) {
+      return "Live DEX snapshot is currently empty.";
+    }
+    const rows = markets
+      .map((m) => {
+        const pair = `${m.baseSymbol ?? "BASE"}/${m.quoteSymbol ?? "QUOTE"}`;
+        const orders = Array.isArray(m.orders) ? m.orders.length : 0;
+        const trades = Number(
+          m.visibleTrades ?? (Array.isArray(m.trades) ? m.trades.length : 0),
+        );
+        return `#${m.index} ${pair}: bid ${m.bestBid ?? "n/a"}, ask ${m.bestAsk ?? "n/a"}, orders ${orders}, trades ${trades}`;
+      })
+      .join(" | ");
+    const warning = data.warning ? ` Warning: ${data.warning}.` : "";
+    return `Live DEX snapshot (${data.returnedMarkets ?? markets.length}/${data.totalMarkets ?? markets.length} markets, updated ${data.updatedAt ?? "n/a"}). ${rows}.${warning}`;
+  }
+
   if (toolName === "get_balance") {
     const vault = asObj(data.vault);
     const vb = asObj(vault.base);
@@ -83,41 +209,11 @@ export const summarizeToolResult = (toolName, result) => {
   }
 
   if (toolName === "place_order" || toolName === "smart_place_order") {
-    const d = data.statusDetail ? asObj(data.statusDetail) : data;
-    const impact = asObj(data.executionImpact);
-    const inferred = String(data.inferredOutcome ?? "");
-    const orderType = String(data.orderType ?? "limit").toUpperCase();
-    const side = String(d.side ?? data.side ?? "n/a").toUpperCase();
-    const amountBase = data.amountBase ?? d.amountBase ?? "n/a";
-    const price = d.limitPrice ?? data.priceInQuotePerBase ?? "market";
-    const impactLine = impact.hadExecutionImpact
-      ? `- **Balance Impact:** BASE ${impact.deltaBase ?? "n/a"}, QUOTE ${impact.deltaQuote ?? "n/a"}`
-      : `- **Balance Impact:** none observed yet`;
-    if (String(data.status ?? "") === "closed_or_not_found") {
-      return [
-        `**Order Submitted** (#${data.orderId ?? "?"})`,
-        `- **Type:** ${orderType} ${side}`,
-        `- **Requested:** ${amountBase} BASE @ ${price}`,
-        `- **Status:** terminal/not-found in active order storage`,
-        `- **Fill Details:** unavailable from direct lookup`,
-        impactLine,
-        `- **Inferred Outcome:** ${inferred || "unknown"}`,
-        "",
-        `Use \`get_wallet_orders_overview\` and balance checks for final execution impact.`,
-      ].join("\n");
-    }
-    return [
-      `**Order Submitted** (#${data.orderId ?? "?"})`,
-      `- **Type:** ${orderType} ${side}`,
-      `- **Requested:** ${amountBase} BASE @ ${price}`,
-      `- **Status:** ${data.status ?? "submitted"}`,
-      `- **Filled Now:** ${d.filledBase ?? "n/a"} BASE`,
-      `- **Remaining:** ${d.remainingBase ?? "n/a"} BASE`,
-      impactLine,
-      `- **Inferred Outcome:** ${inferred || "unknown"}`,
-      "",
-      `You can ask: \`watch order #${data.orderId ?? "?"} status\`.`,
-    ].join("\n");
+    return buildOrderSubmissionMessage({
+      data,
+      status: data.status,
+      closedHint: "Use `get_wallet_orders_overview` and balance checks for final execution impact.",
+    });
   }
 
   if (toolName === "cancel_order") {
@@ -433,6 +529,50 @@ export class DexBrowserAgent {
     return out;
   }
 
+  preparePendingActionArgs(name, requestedArgs = {}, toolData = {}) {
+    const requested = asObj(requestedArgs);
+    const data = asObj(toolData);
+    const submitted = asObj(data.submitted);
+
+    if (name === "place_order") {
+      return compactObject({
+        marketIndex: firstDefined(data.marketIndex, requested.marketIndex),
+        side: firstDefined(data.side, submitted.side, requested.side),
+        orderType: firstDefined(data.orderType, submitted.orderType, requested.orderType),
+        amountBase: firstDefined(data.amountBase, submitted.amountBase, requested.amountBase),
+        priceInQuotePerBase: firstDefined(
+          data.priceInQuotePerBase,
+          submitted.priceInQuotePerBase,
+          requested.priceInQuotePerBase,
+        ),
+        maxQuoteAmount: firstDefined(
+          data.maxQuoteAmount,
+          submitted.maxQuoteAmount,
+          requested.maxQuoteAmount,
+        ),
+      });
+    }
+
+    if (name === "smart_place_order") {
+      return compactObject({
+        marketIndex: firstDefined(data.marketIndex, requested.marketIndex),
+        side: firstDefined(data.side, submitted.side, requested.side),
+        amountBase: firstDefined(data.amountBase, submitted.amountBase, requested.amountBase),
+        strategy: firstDefined(data.strategy, requested.strategy),
+        maxSlippageBps: firstDefined(data.maxSlippageBps, requested.maxSlippageBps),
+      });
+    }
+
+    if (name === "cancel_order") {
+      return compactObject({
+        marketIndex: firstDefined(data.marketIndex, requested.marketIndex),
+        orderId: firstDefined(data.orderId, requested.orderId),
+      });
+    }
+
+    return compactObject(requested);
+  }
+
   async ensureTools(signal) {
     if (this.tools) return this.tools;
     const response = await fetch(this.schemaEndpoint, {
@@ -592,12 +732,18 @@ export class DexBrowserAgent {
           signal,
         ),
       ]);
+      const resultData = asObj(result.data);
+      const existingStatusDetail = asObj(resultData.statusDetail);
       const merged = {
         ...result,
         data: {
-          ...asObj(result.data),
-          statusDetail: asObj(insight?.data),
+          ...resultData,
+          statusDetail:
+            Object.keys(existingStatusDetail).length > 0
+              ? existingStatusDetail
+              : asObj(insight?.data),
           latestStatus: asObj(status?.data),
+          latestInsight: asObj(insight?.data),
         },
       };
       merged.userMessage = this.formatPendingExecutionMessage(toolName, merged, status);
@@ -613,55 +759,15 @@ export class DexBrowserAgent {
     }
     const data = result?.data ?? {};
     if (toolName === "place_order" || toolName === "smart_place_order") {
-      const orderId = data.orderId ?? "unknown";
       const marketLabel =
         typeof data.marketIndex === "number" ? ` (market #${data.marketIndex})` : "";
-      const status =
-        statusResult?.data?.status ??
-        data.status ??
-        "submitted";
-      const impact = asObj(data.executionImpact);
-      const d = data.statusDetail ? asObj(data.statusDetail) : data;
-      const orderType = String(data.orderType ?? "limit").toUpperCase();
-      const side = String(d.side ?? data.side ?? "n/a").toUpperCase();
-      const amountBase = data.amountBase ?? d.amountBase ?? "n/a";
-      const price = d.limitPrice ?? data.priceInQuotePerBase ?? "market";
-      const impactLine = impact.hadExecutionImpact
-        ? `- **Balance Impact:** BASE ${impact.deltaBase ?? "n/a"}, QUOTE ${impact.deltaQuote ?? "n/a"}`
-        : `- **Balance Impact:** none observed yet`;
-      if (status === "closed_or_not_found") {
-        return [
-          `**Order Submitted** (#${orderId})${marketLabel}`,
-          `- **Type:** ${orderType} ${side}`,
-          `- **Requested:** ${amountBase} BASE @ ${price}`,
-          `- **Status:** terminal/not-found in active storage`,
-          `- **Fill Details:** unavailable from direct lookup`,
-          impactLine,
-          `- **Inferred Outcome:** ${data.inferredOutcome ?? "unknown"}`,
-          "",
-          `Use balances and wallet overview to verify final effect.`,
-        ].join("\n");
-      }
-      const filled =
-        statusResult?.data?.filledBase ??
-        data?.statusDetail?.filledBase ??
-        "n/a";
-      const remaining =
-        statusResult?.data?.remainingBase ??
-        data?.statusDetail?.remainingBase ??
-        "n/a";
-      return [
-        `**Order Submitted** (#${orderId})${marketLabel}`,
-        `- **Type:** ${orderType} ${side}`,
-        `- **Requested:** ${amountBase} BASE @ ${price}`,
-        `- **Status:** ${status}`,
-        `- **Filled Now:** ${filled} BASE`,
-        `- **Remaining:** ${remaining} BASE`,
-        impactLine,
-        `- **Inferred Outcome:** ${data.inferredOutcome ?? "unknown"}`,
-        "",
-        `You can ask me to watch this order status.`,
-      ].join("\n");
+      return buildOrderSubmissionMessage({
+        data,
+        status: statusResult?.data?.status ?? data.status ?? "submitted",
+        marketLabel,
+        closedHint: "Use balances and wallet overview to verify final effect.",
+        openHint: "You can ask me to watch this order status.",
+      });
     }
     if (toolName === "cancel_order") {
       return `Cancel request sent for order #${data.orderId ?? "unknown"}. Current status: ${data.statusAfterCancel ?? "unknown"}.`;
@@ -724,12 +830,22 @@ export class DexBrowserAgent {
       }
     }
 
+    const resultData = asObj(result?.data);
+    const existingStatusDetail = asObj(resultData.statusDetail);
+    const merged = {
+      ...result,
+      data: {
+        ...resultData,
+        statusDetail:
+          Object.keys(existingStatusDetail).length > 0
+            ? existingStatusDetail
+            : asObj(insightResult?.data),
+        latestStatus: asObj(statusResult?.data),
+        latestInsight: asObj(insightResult?.data),
+      },
+    };
     this.pendingAction = null;
-    return this.formatPendingExecutionMessage(
-      pending.name,
-      insightResult ?? result,
-      statusResult,
-    );
+    return this.formatPendingExecutionMessage(pending.name, merged, statusResult);
   }
 
   setPendingAction(name, args, walletAddress) {
@@ -781,6 +897,13 @@ export class DexBrowserAgent {
     }
     if (/dex status|market status|health/i.test(text)) {
       return { type: "dex_status", marketIndex };
+    }
+    if (
+      /dex snapshot|live snapshot|full snapshot|all markets overview|everything in dex|whole dex/i.test(
+        text,
+      )
+    ) {
+      return { type: "live_snapshot", marketIndex };
     }
 
     const recommend = raw.match(
@@ -878,7 +1001,15 @@ export class DexBrowserAgent {
         input?.signal,
       );
       if (pre?.needsConfirmation) {
-        this.setPendingAction("cancel_order", { orderId: intent.orderId, marketIndex }, walletAddress);
+        this.setPendingAction(
+          "cancel_order",
+          this.preparePendingActionArgs(
+            "cancel_order",
+            { orderId: intent.orderId, marketIndex },
+            pre?.data,
+          ),
+          walletAddress,
+        );
       }
       return summarizeToolResult("cancel_order", pre);
     }
@@ -913,6 +1044,22 @@ export class DexBrowserAgent {
       return summarizeToolResult("get_dex_status", result);
     }
 
+    if (intent.type === "live_snapshot") {
+      const result = await this.executeToolWithRetry(
+        "get_live_snapshot",
+        {
+          ...(intent.marketIndex != null ? { marketIndex: intent.marketIndex } : {}),
+          includeOrders: true,
+          includeBalances: true,
+          includeTrades: true,
+          tradesLimit: 40,
+        },
+        walletAddress,
+        input?.signal,
+      );
+      return summarizeToolResult("get_live_snapshot", result);
+    }
+
     if (intent.type === "price_recommendation") {
       const result = await this.executeToolWithRetry(
         "get_price_recommendation",
@@ -940,7 +1087,11 @@ export class DexBrowserAgent {
       if (pre?.needsConfirmation) {
         this.setPendingAction(
           "place_order",
-          { ...args, confirm: undefined },
+          this.preparePendingActionArgs(
+            "place_order",
+            { ...args, confirm: undefined },
+            pre?.data,
+          ),
           walletAddress,
         );
       }
@@ -1065,7 +1216,11 @@ export class DexBrowserAgent {
           signal,
         );
         if (result?.needsConfirmation) {
-          this.setPendingAction(call.function.name, parsedArgs, input.walletAddress);
+          this.setPendingAction(
+            call.function.name,
+            this.preparePendingActionArgs(call.function.name, parsedArgs, result?.data),
+            input.walletAddress,
+          );
         } else if (parsedArgs?.confirm === true) {
           this.pendingAction = null;
         }
@@ -1176,7 +1331,11 @@ export class DexBrowserAgent {
           signal,
         );
         if (result?.needsConfirmation) {
-          this.setPendingAction(toolUse.name, toolUse.input ?? {}, input.walletAddress);
+          this.setPendingAction(
+            toolUse.name,
+            this.preparePendingActionArgs(toolUse.name, toolUse.input ?? {}, result?.data),
+            input.walletAddress,
+          );
         } else if (toolUse?.input?.confirm === true) {
           this.pendingAction = null;
         }
@@ -1224,6 +1383,7 @@ export class DexBrowserAgent {
                 intent?.type === "market_overview" ? "get_market_overview" :
                   intent?.type === "depth" ? "get_orderbook_depth" :
                     intent?.type === "dex_status" ? "get_dex_status" :
+                      intent?.type === "live_snapshot" ? "get_live_snapshot" :
                       intent?.type === "price_recommendation" ? "get_price_recommendation" :
                         intent?.type === "place_order" ? "place_order" :
                           "tool";

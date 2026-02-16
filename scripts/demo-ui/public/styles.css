@@ -285,7 +285,7 @@ code {
 .stats {
   margin-top: 12px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
 }
 
@@ -316,6 +316,53 @@ code {
 
 .stat-v.warn {
   color: var(--warn);
+}
+
+.storage-view {
+  margin-top: 10px;
+  border: 1px solid rgba(94, 129, 173, 0.4);
+  border-radius: var(--radius-md);
+  background: rgba(10, 20, 38, 0.82);
+  padding: 10px 12px;
+}
+
+.storage-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.storage-head h3 {
+  margin: 0;
+}
+
+.storage-grid {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.storage-item {
+  border: 1px solid rgba(97, 133, 177, 0.34);
+  border-radius: var(--radius-sm);
+  background: rgba(8, 18, 34, 0.9);
+  padding: 8px 10px;
+}
+
+.storage-k {
+  display: block;
+  font-size: 0.66rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: #84a7cb;
+  margin-bottom: 4px;
+}
+
+.storage-item b {
+  font-size: 0.89rem;
+  color: #bde6ff;
 }
 
 .cex-grid {

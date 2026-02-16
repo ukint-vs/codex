@@ -55,6 +55,24 @@ const QUOTE_TRANSFER_UNITS_FLOOR = Math.max(100, envNumber("LIQ_QUOTE_TRANSFER_U
 const USE_POPULATE_DEMO = envBool("LIQ_USE_POPULATE_DEMO", true);
 const SEED_BASE = BigInt(Math.max(1, envNumber("LIQ_SEED_BASE", 4_242)));
 const POPULATE_ONLY_ON_EMPTY = envBool("LIQ_POPULATE_ONLY_ON_EMPTY", true);
+const MIN_OPEN_ORDERS_PER_MARKET = Math.max(
+  1,
+  envNumber(
+    "LIQ_MIN_OPEN_ORDERS_PER_MARKET",
+    envNumber("LIQ_MIN_EXISTING_ORDERS_TO_SKIP", 100),
+  ),
+);
+const MIN_OPEN_ORDERS_PER_SIDE = Math.max(
+  1,
+  envNumber(
+    "LIQ_MIN_OPEN_ORDERS_PER_SIDE",
+    Math.ceil(MIN_OPEN_ORDERS_PER_MARKET / 2),
+  ),
+);
+const MIN_PRICE_LEVELS_PER_SIDE = Math.max(
+  1,
+  envNumber("LIQ_MIN_PRICE_LEVELS_PER_SIDE", Math.max(8, Math.ceil(LEVELS / 2))),
+);
 const IO_CONCURRENCY = Math.max(1, envNumber("LIQ_IO_CONCURRENCY", 8));
 
 type MakerParticipant = {
@@ -205,6 +223,76 @@ const deriveTransferPlan = (midPrice: number): { baseUnits: number; quoteUnits: 
   const quoteUnits = Math.max(QUOTE_TRANSFER_UNITS_FLOOR, quotePerMaker);
 
   return { baseUnits, quoteUnits };
+};
+
+const evaluateExistingDepth = async (
+  market: MarketContext,
+  bestBid: bigint,
+  bestAsk: bigint,
+): Promise<{
+  existingOrders: number;
+  existingBids: number;
+  existingAsks: number;
+  existingBidLevels: number;
+  existingAskLevels: number;
+  skip: boolean;
+}> => {
+  const hasBothSides = bestBid > 0n && bestAsk > 0n;
+  if (!POPULATE_ONLY_ON_EMPTY || !hasBothSides) {
+    return {
+      existingOrders: 0,
+      existingBids: 0,
+      existingAsks: 0,
+      existingBidLevels: 0,
+      existingAskLevels: 0,
+      skip: false,
+    };
+  }
+
+  const scanCount = Math.max(
+    1,
+    MIN_OPEN_ORDERS_PER_MARKET + 1,
+    MIN_OPEN_ORDERS_PER_SIDE * 2 + 1,
+  );
+  try {
+    const orders = await market.orderbook.ordersReverse(0, scanCount);
+    const existingOrders = orders.length;
+    const bids = orders.filter((x) => x.side === 0);
+    const asks = orders.filter((x) => x.side === 1);
+    const existingBids = bids.length;
+    const existingAsks = asks.length;
+    const existingBidLevels = new Set(bids.map((x) => x.limitPrice.toString())).size;
+    const existingAskLevels = new Set(asks.map((x) => x.limitPrice.toString())).size;
+    return {
+      existingOrders,
+      existingBids,
+      existingAsks,
+      existingBidLevels,
+      existingAskLevels,
+      skip: (
+        existingOrders >= MIN_OPEN_ORDERS_PER_MARKET
+        && existingBids >= MIN_OPEN_ORDERS_PER_SIDE
+        && existingAsks >= MIN_OPEN_ORDERS_PER_SIDE
+        && existingBidLevels >= MIN_PRICE_LEVELS_PER_SIDE
+        && existingAskLevels >= MIN_PRICE_LEVELS_PER_SIDE
+      ),
+    };
+  } catch (error) {
+    logger.warn("Failed to inspect existing order depth, will attempt seeding", {
+      market: market.index,
+      pair: market.pair,
+      orderbook: market.orderbookAddress,
+      error: String(error),
+    });
+    return {
+      existingOrders: 0,
+      existingBids: 0,
+      existingAsks: 0,
+      existingBidLevels: 0,
+      existingAskLevels: 0,
+      skip: false,
+    };
+  }
 };
 
 const fillBalanceIfNeeded = async (
@@ -473,8 +561,8 @@ const tryPopulateDemoDepth = async (
 ): Promise<SeedStats | null> => {
   const bestBid = BigInt(await market.orderbook.bestBidPrice());
   const bestAsk = BigInt(await market.orderbook.bestAskPrice());
-  const hasDepth = bestBid > 0n || bestAsk > 0n;
-  if (POPULATE_ONLY_ON_EMPTY && hasDepth) {
+  const existingDepth = await evaluateExistingDepth(market, bestBid, bestAsk);
+  if (existingDepth.skip) {
     return {
       bidsPlaced: 0,
       asksPlaced: 0,
@@ -752,6 +840,10 @@ async function main() {
     minBaseUnits: MIN_BASE_UNITS,
     maxBaseUnits: MAX_BASE_UNITS,
     usePopulateDemo: USE_POPULATE_DEMO,
+    populateOnlyOnEmpty: POPULATE_ONLY_ON_EMPTY,
+    minOpenOrdersPerMarket: MIN_OPEN_ORDERS_PER_MARKET,
+    minOpenOrdersPerSide: MIN_OPEN_ORDERS_PER_SIDE,
+    minPriceLevelsPerSide: MIN_PRICE_LEVELS_PER_SIDE,
   });
 
   const summary: Array<Record<string, string | number>> = [];
@@ -759,13 +851,13 @@ async function main() {
   for (const market of markets) {
     const preBid = BigInt(await market.orderbook.bestBidPrice());
     const preAsk = BigInt(await market.orderbook.bestAskPrice());
-    const hasDepth = preBid > 0n || preAsk > 0n;
+    const existingDepth = await evaluateExistingDepth(market, preBid, preAsk);
     if (preBid > 0n && preAsk > 0n) {
       market.midPriceQuotePerBase = normalizeMidPrice(fpPriceToNumber((preBid + preAsk) / 2n));
     }
 
     let stats: SeedStats;
-    if (POPULATE_ONLY_ON_EMPTY && hasDepth) {
+    if (existingDepth.skip) {
       stats = {
         bidsPlaced: 0,
         asksPlaced: 0,
@@ -800,6 +892,11 @@ async function main() {
       asksPlaced: stats.asksPlaced,
       bidsFailed: stats.bidsFailed,
       asksFailed: stats.asksFailed,
+      existingOrders: existingDepth.existingOrders,
+      existingBids: existingDepth.existingBids,
+      existingAsks: existingDepth.existingAsks,
+      existingBidLevels: existingDepth.existingBidLevels,
+      existingAskLevels: existingDepth.existingAskLevels,
       bestBid: asUnits(postBid, PRICE_DECIMALS),
       bestAsk: asUnits(postAsk, PRICE_DECIMALS),
       tradesCount: tradesCount.toString(),

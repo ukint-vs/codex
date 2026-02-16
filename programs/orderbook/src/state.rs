@@ -13,7 +13,7 @@ use crate::orderbook::OrderBook;
 /// through exported contract methods due to interface/codec constraints.
 pub type SideIO = u16;
 pub type OrderKindIO = u16;
-const MAX_EXECUTED_TRADE_HISTORY: usize = 1_024;
+const MAX_EXECUTED_TRADE_HISTORY: usize = 512;
 const MAX_RECORDED_TRADES_PER_EXECUTION: usize = 32;
 
 pub fn side_from_io(x: SideIO) -> Side {

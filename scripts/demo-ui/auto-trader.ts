@@ -103,6 +103,16 @@ type LimitResult = {
 const DEMO_UI_BASE_URL = (
   process.env.DEMO_UI_BASE_URL ?? "http://127.0.0.1:4180"
 ).replace(/\/+$/, "");
+const parseBoolEnv = (key: string, fallback: boolean): boolean => {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
+const ORDER_RUNNER_MODE = (process.env.ORDER_RUNNER_MODE ?? "live").trim().toLowerCase();
+const IS_STRESS_MODE = ORDER_RUNNER_MODE === "stress";
 const INTERVAL_MS = Math.max(700, Number(process.env.ORDER_RUNNER_INTERVAL_MS ?? 2500));
 const PER_MARKET_DELAY_MS = Math.max(
   50,
@@ -110,28 +120,59 @@ const PER_MARKET_DELAY_MS = Math.max(
 );
 const CHART_WIDTH = Math.max(16, Number(process.env.ORDER_RUNNER_CHART_WIDTH ?? 44));
 const MAKER_OFFSET_BPS = Math.max(1, Number(process.env.ORDER_RUNNER_MAKER_OFFSET_BPS ?? 5));
-const MAKER_LEVELS = Math.max(2, Number(process.env.ORDER_RUNNER_MAKER_LEVELS ?? 4));
+const MAKER_LEVELS = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_MAKER_LEVELS ?? (IS_STRESS_MODE ? 4 : 2)),
+);
 const TRADES_PER_MARKET_MIN = Math.max(
-  2,
-  Number(process.env.ORDER_RUNNER_TRADES_MIN ?? 3),
+  1,
+  Number(process.env.ORDER_RUNNER_TRADES_MIN ?? (IS_STRESS_MODE ? 3 : 2)),
 );
 const TRADES_PER_MARKET_MAX = Math.max(
   TRADES_PER_MARKET_MIN,
-  Number(process.env.ORDER_RUNNER_TRADES_MAX ?? 6),
+  Number(process.env.ORDER_RUNNER_TRADES_MAX ?? (IS_STRESS_MODE ? 6 : 4)),
 );
 const DRIFT_STEP_BPS = Math.max(4, Number(process.env.ORDER_RUNNER_DRIFT_STEP_BPS ?? 64));
 const DRIFT_MAX_BPS = Math.max(150, Number(process.env.ORDER_RUNNER_DRIFT_MAX_BPS ?? 2400));
 const MIN_RESTING_PER_SIDE = Math.max(
-  8,
-  Number(process.env.ORDER_RUNNER_MIN_RESTING_PER_SIDE ?? 18),
+  4,
+  Number(process.env.ORDER_RUNNER_MIN_RESTING_PER_SIDE ?? (IS_STRESS_MODE ? 18 : 10)),
 );
 const REPLENISH_MAX_PASSES = Math.max(
   1,
-  Number(process.env.ORDER_RUNNER_REPLENISH_MAX_PASSES ?? 3),
+  Number(process.env.ORDER_RUNNER_REPLENISH_MAX_PASSES ?? (IS_STRESS_MODE ? 3 : 2)),
 );
 const TAKE_PICK_WINDOW = Math.max(3, Number(process.env.ORDER_RUNNER_TAKE_PICK_WINDOW ?? 20));
 const ROLE_SLOTS = Math.max(1, Number(process.env.ORDER_RUNNER_ROLE_SLOTS ?? 4));
 const ROLE_OFFSET = Math.max(0, Number(process.env.ORDER_RUNNER_ROLE_OFFSET ?? 0));
+const BOOTSTRAP_LADDER_EACH_LOOP = parseBoolEnv(
+  "ORDER_RUNNER_BOOTSTRAP_EACH_LOOP",
+  IS_STRESS_MODE,
+);
+const STALL_MAKER_INJECTION = parseBoolEnv(
+  "ORDER_RUNNER_STALL_MAKER_INJECTION",
+  IS_STRESS_MODE,
+);
+const REFRESH_EVERY_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_REFRESH_EVERY_ATTEMPTS ?? (IS_STRESS_MODE ? 2 : 4)),
+);
+const MAX_MAKER_ORDERS_PER_LOOP = Math.max(
+  0,
+  Number(process.env.ORDER_RUNNER_MAX_MAKER_ORDERS_PER_LOOP ?? (IS_STRESS_MODE ? 180 : 24)),
+);
+const MARKETS_PER_LOOP = Math.max(
+  0,
+  Number(process.env.ORDER_RUNNER_MARKETS_PER_LOOP ?? (IS_STRESS_MODE ? 0 : 1)),
+);
+const MIN_TRADE_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_MIN_TRADE_ATTEMPTS ?? (IS_STRESS_MODE ? 14 : 8)),
+);
+const MAX_ATTEMPTS_PER_TRADE = Math.max(
+  1,
+  Number(process.env.ORDER_RUNNER_MAX_ATTEMPTS_PER_TRADE ?? (IS_STRESS_MODE ? 9 : 5)),
+);
 const MARKETS_FILTER = new Set(
   (process.env.ORDER_RUNNER_MARKETS ?? "")
     .split(",")
@@ -143,7 +184,7 @@ const MARKETS_FILTER = new Set(
 const LOOP_LIMIT = Math.max(0, Number(process.env.ORDER_RUNNER_LOOPS ?? 0));
 const MARKET_CONCURRENCY = Math.max(
   1,
-  Number(process.env.ORDER_RUNNER_MARKET_CONCURRENCY ?? 2),
+  Number(process.env.ORDER_RUNNER_MARKET_CONCURRENCY ?? (IS_STRESS_MODE ? 2 : 1)),
 );
 
 const fallbackMidByPair = new Map<string, number>([
@@ -431,10 +472,20 @@ const collectExecutedPrices = (trades: TradeRow[]): number[] =>
 
 async function main() {
   console.log(`Auto trader started: ${DEMO_UI_BASE_URL}`);
+  console.log(`Mode: ${IS_STRESS_MODE ? "stress" : "live"}`);
   console.log(`Interval: ${INTERVAL_MS}ms`);
   console.log(`Per-market delay: ${PER_MARKET_DELAY_MS}ms`);
   console.log(`Market concurrency: ${MARKET_CONCURRENCY}`);
   console.log(`Maker offset: ${MAKER_OFFSET_BPS} bps`);
+  console.log(`Maker levels: ${MAKER_LEVELS}`);
+  console.log(`Min resting per side: ${MIN_RESTING_PER_SIDE}`);
+  console.log(`Max maker orders/loop: ${MAX_MAKER_ORDERS_PER_LOOP}`);
+  console.log(`Markets per loop: ${MARKETS_PER_LOOP === 0 ? "all" : MARKETS_PER_LOOP}`);
+  console.log(`Min trade attempts: ${MIN_TRADE_ATTEMPTS}`);
+  console.log(`Max attempts per trade: ${MAX_ATTEMPTS_PER_TRADE}`);
+  console.log(`Refresh every attempts: ${REFRESH_EVERY_ATTEMPTS}`);
+  console.log(`Bootstrap each loop: ${BOOTSTRAP_LADDER_EACH_LOOP}`);
+  console.log(`Stall maker injection: ${STALL_MAKER_INJECTION}`);
   console.log(
     `Markets filter: ${MARKETS_FILTER.size > 0 ? [...MARKETS_FILTER].join(",") : "all"}`,
   );
@@ -442,6 +493,7 @@ async function main() {
 
   const driftByMarket = new Map<number, number>();
   let loops = 0;
+  let marketCursor = 0;
 
   while (LOOP_LIMIT === 0 || loops < LOOP_LIMIT) {
     try {
@@ -456,7 +508,16 @@ async function main() {
         continue;
       }
 
-      await runWithConcurrency(markets, MARKET_CONCURRENCY, async (market) => {
+      const marketsToRun = MARKETS_PER_LOOP > 0 && markets.length > MARKETS_PER_LOOP
+        ? Array.from({ length: MARKETS_PER_LOOP }, (_, i) =>
+          markets[(marketCursor + i) % markets.length]
+        )
+        : markets;
+      if (MARKETS_PER_LOOP > 0 && markets.length > MARKETS_PER_LOOP) {
+        marketCursor = (marketCursor + MARKETS_PER_LOOP) % markets.length;
+      }
+
+      await runWithConcurrency(marketsToRun, MARKET_CONCURRENCY, async (market) => {
         try {
           const pair = `${(market.baseSymbol ?? "BASE").toUpperCase()}/${(market.quoteSymbol ?? "QUOTE").toUpperCase()}`;
           let liveMarket = market;
@@ -496,6 +557,9 @@ async function main() {
             side: "buy" | "sell",
             level: number,
           ): Promise<boolean> => {
+            if (makerPlaced + makerFailed >= MAX_MAKER_ORDERS_PER_LOOP) {
+              return false;
+            }
             const levelOffset = (MAKER_OFFSET_BPS + (level - 1) * 18) / 10_000;
             const rawPrice = side === "buy"
               ? fairMid * (1 - levelOffset)
@@ -527,6 +591,20 @@ async function main() {
             }
           };
 
+          const countsAtStart = countRestingOrdersBySideFromMarket(liveMarket);
+          const shouldBootstrap =
+            BOOTSTRAP_LADDER_EACH_LOOP || (countsAtStart.buy === 0 && countsAtStart.sell === 0);
+          if (shouldBootstrap) {
+            for (let level = 1; level <= MAKER_LEVELS; level += 1) {
+              for (const makerSide of ["buy", "sell"] as const) {
+                await placeMakerOrder(makerSide, level);
+              }
+            }
+          }
+
+          await sleep(PER_MARKET_DELAY_MS);
+          liveMarket = await refreshMarket();
+
           const replenishBookIfThin = async (): Promise<void> => {
             for (let pass = 0; pass < REPLENISH_MAX_PASSES; pass += 1) {
               const counts = countRestingOrdersBySideFromMarket(liveMarket);
@@ -544,26 +622,20 @@ async function main() {
               liveMarket = await refreshMarket();
             }
           };
-
-          for (let level = 1; level <= MAKER_LEVELS; level += 1) {
-            for (const makerSide of ["buy", "sell"] as const) {
-              await placeMakerOrder(makerSide, level);
-            }
-          }
-
-          await sleep(PER_MARKET_DELAY_MS);
-          liveMarket = await refreshMarket();
           await replenishBookIfThin();
 
           const tradesTarget = randInt(TRADES_PER_MARKET_MIN, TRADES_PER_MARKET_MAX);
           let tradesDone = 0;
           let tradeAttempts = 0;
-          const maxAttempts = Math.max(14, tradesTarget * 9);
+          const maxAttempts = Math.max(
+            MIN_TRADE_ATTEMPTS,
+            tradesTarget * MAX_ATTEMPTS_PER_TRADE,
+          );
 
           while (tradesDone < tradesTarget && tradeAttempts < maxAttempts) {
             tradeAttempts += 1;
             localRefreshCounter += 1;
-            if (tradeAttempts === 1 || localRefreshCounter >= 2) {
+            if (tradeAttempts === 1 || localRefreshCounter >= REFRESH_EVERY_ATTEMPTS) {
               liveMarket = await refreshMarket();
               localRefreshCounter = 0;
             }
@@ -692,7 +764,7 @@ async function main() {
               }
             }
 
-            if (!executedNow && tradeAttempts % 4 === 0) {
+            if (STALL_MAKER_INJECTION && !executedNow && tradeAttempts % 4 === 0) {
               await placeMakerOrder(Math.random() < 0.5 ? "buy" : "sell", randInt(1, 3));
             }
 
