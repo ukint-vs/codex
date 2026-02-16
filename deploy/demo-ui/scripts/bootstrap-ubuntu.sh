@@ -14,15 +14,14 @@ apt-get install -y ca-certificates curl gnupg lsb-release ufw
 
 echo "[2/6] Configuring Docker apt repository..."
 install -m 0755 -d /etc/apt/keyrings
-if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.asc
-fi
-chmod a+r /etc/apt/keyrings/docker.asc
+rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
 
 ARCH="$(dpkg --print-architecture)"
 CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
 cat >/etc/apt/sources.list.d/docker.list <<EOF
-deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${CODENAME} stable
+deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${CODENAME} stable
 EOF
 
 echo "[3/6] Installing Docker Engine + Compose plugin..."

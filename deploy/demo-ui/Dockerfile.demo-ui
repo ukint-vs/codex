@@ -9,6 +9,8 @@ RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
 
 COPY package.json pnpm-lock.yaml tsconfig.json ./
 COPY scripts ./scripts
+COPY programs/orderbook/orderbook.idl ./programs/orderbook/orderbook.idl
+COPY programs/vault/vault.idl ./programs/vault/vault.idl
 
 RUN pnpm install --frozen-lockfile
 

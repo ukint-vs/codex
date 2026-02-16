@@ -8,15 +8,9 @@ DEPLOY_ENV="${DEPLOY_DIR}/deploy.env"
 read_env_key() {
   local file="$1"
   local key="$2"
-  awk -F= -v k="$key" '
-    /^[[:space:]]*#/ { next }
-    $1 == k {
-      $1 = ""
-      sub(/^=/, "")
-      print
-      exit
-    }
-  ' "$file"
+  local line
+  line="$(grep -m1 "^${key}=" "$file" || true)"
+  printf '%s' "${line#*=}"
 }
 
 if [[ ! -f "$DEPLOY_ENV" ]]; then
