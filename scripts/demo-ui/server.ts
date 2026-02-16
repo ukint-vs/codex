@@ -1042,7 +1042,11 @@ async function main() {
     config.contracts.router,
     fallbackValidators,
   );
-  await ethClient.waitForInitialization();
+  void ethClient.waitForInitialization().catch((error) => {
+    logger.warn("Ethereum client initialization failed; using fallback chain assumptions", {
+      error: String(error),
+    });
+  });
 
   const varaEthApi = new VaraEthApi(
     new WsVaraEthProvider(config.transports.varaEthWsRpc),
@@ -1345,8 +1349,10 @@ async function main() {
     }
   };
 
-  await refresh();
-  setInterval(refresh, refreshMs).unref();
+  void refresh();
+  setInterval(() => {
+    void refresh();
+  }, refreshMs).unref();
 
   const server = http.createServer(async (req, res) => {
     const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);

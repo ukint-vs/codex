@@ -21,4 +21,4 @@ USER appuser
 
 EXPOSE 4180
 
-CMD ["pnpm", "demo:ui"]
+CMD ["node", "--import=tsx", "scripts/demo-ui/server.ts"]
