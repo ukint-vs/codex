@@ -1,0 +1,25 @@
+# VCS and local agent artifacts
+.git
+.gitmodules
+.agent
+.agent_bak
+
+# Dependency/build outputs
+node_modules
+frontend/node_modules
+target
+out
+cache
+
+# Local runtime/env secrets
+.env
+.env.*
+!.env.example
+deploy/demo-ui/app.env
+deploy/demo-ui/deploy.env
+
+# Logs and temporary files
+*.log
+send_message_*.log
+vara-eth.log
+.DS_Store

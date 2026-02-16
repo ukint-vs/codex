@@ -15,7 +15,7 @@ COPY programs/vault/vault.idl ./programs/vault/vault.idl
 RUN pnpm install --frozen-lockfile
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && chown -R appuser:appuser /app
+    && chown appuser:appuser /app
 
 USER appuser
 
