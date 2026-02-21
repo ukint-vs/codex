@@ -3706,7 +3706,21 @@ dependencies = [
  "downcast",
  "fragile",
  "lazy_static",
- "mockall_derive",
+ "mockall_derive 0.12.1",
+ "predicates",
+ "predicates-tree",
+]
+
+[[package]]
+name = "mockall"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f58d964098a5f9c6b63d0798e5372fd04708193510a7af313c22e9f29b7b620b"
+dependencies = [
+ "cfg-if",
+ "downcast",
+ "fragile",
+ "mockall_derive 0.14.0",
  "predicates",
  "predicates-tree",
 ]
@@ -3716,6 +3730,18 @@ name = "mockall_derive"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af7cbce79ec385a1d4f54baa90a76401eb15d9cab93685f62e7e9f942aa00ae2"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "mockall_derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca41ce716dda6a9be188b385aa78ee5260fc25cd3802cb2a8afdc6afbe6b6dbf"
 dependencies = [
  "cfg-if",
  "proc-macro2",
@@ -3991,7 +4017,7 @@ dependencies = [
 name = "orderbook-client"
 version = "0.1.0"
 dependencies = [
- "mockall",
+ "mockall 0.14.0",
  "orderbook",
  "sails-client-gen",
  "sails-idl-gen",
@@ -5003,7 +5029,7 @@ dependencies = [
  "hex",
  "keccak-const",
  "log",
- "mockall",
+ "mockall 0.12.1",
  "parity-scale-codec",
  "paste",
  "pin-project-lite",
@@ -6699,7 +6725,7 @@ dependencies = [
 name = "vault-client"
 version = "0.1.0"
 dependencies = [
- "mockall",
+ "mockall 0.14.0",
  "sails-client-gen",
  "sails-idl-gen",
  "sails-rs",
