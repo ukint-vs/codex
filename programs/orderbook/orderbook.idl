@@ -1,18 +1,22 @@
+type Address = struct {
+  h160,
+};
+
 constructor {
-  Create : (base_vault_id: actor_id, quote_vault_id: actor_id, base_token_id: [u8, 20], quote_token_id: [u8, 20], max_trades: u32, max_preview_scans: u32);
+  Create : (base_vault_id: Address, quote_vault_id: Address, base_token_id: Address, quote_token_id: Address, max_trades: u32, max_preview_scans: u32);
 };
 
 service Orderbook {
   CancelOrder : (order_id: u64) -> null;
-  Deposit : (account: actor_id, token: [u8, 20], amount: u128) -> bool;
+  Deposit : (account: Address, token: Address, amount: u128) -> bool;
   /// Submits an order and immediately matches against the book.
   /// Limit remainder is placed as resting order inside the book.
   SubmitOrder : (side: u16, kind: u16, limit_price: u128, amount_base: u128, max_quote: u128) -> u64;
   WithdrawBase : (amount: u128) -> null;
   WithdrawQuote : (amount: u128) -> null;
-  query BalanceOf : (who: actor_id) -> struct { u128, u128 };
+  query BalanceOf : (who: Address) -> struct { u128, u128 };
   query BestAskPrice : () -> u128;
   query BestBidPrice : () -> u128;
-  query OrderById : (order_id: u64) -> struct { bool, u64, actor_id, u16, u128, u128, u128 };
+  query OrderById : (order_id: u64) -> struct { bool, u64, Address, u16, u128, u128, u128 };
 };
 

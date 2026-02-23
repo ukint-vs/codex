@@ -1,3 +1,4 @@
+use dex_common::Address;
 use sails_rs::{prelude::*, U256};
 
 pub type OrderId = u64;
@@ -40,7 +41,7 @@ pub struct IncomingOrder {
     pub kind: OrderKind,
     pub limit_price: U256,
     pub amount_base: U256,
-    pub owner: ActorId,
+    pub owner: Address,
     // budget for Market BUY (else 0)
     pub max_quote: U256,
 }
@@ -49,7 +50,7 @@ pub struct IncomingOrder {
 #[derive(Debug, Clone, Copy)]
 pub struct MakerView {
     pub id: OrderId,
-    pub owner: ActorId,
+    pub owner: Address,
     pub side: Side,
     pub price: U256,
     pub remaining_base: U256,
@@ -62,7 +63,7 @@ pub struct MakerView {
 #[derive(Debug, Clone)]
 pub struct RestingOrder {
     pub id: OrderId,
-    pub owner: ActorId,
+    pub owner: Address,
     pub side: Side,
     pub price: U256,
     pub remaining_base: U256,
@@ -76,8 +77,8 @@ pub struct RestingOrder {
 pub struct Trade {
     pub maker_order_id: OrderId,
     pub taker_order_id: OrderId,
-    pub maker: ActorId,
-    pub taker: ActorId,
+    pub maker: Address,
+    pub taker: Address,
     pub price: U256,
     pub amount_base: U256,
     pub amount_quote: U256,

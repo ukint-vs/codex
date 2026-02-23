@@ -1,4 +1,4 @@
-use clob_common::TokenId;
+use dex_common::{Address, TokenId};
 use sails_rs::collections::{BTreeMap, BTreeSet};
 use sails_rs::prelude::*;
 
@@ -6,7 +6,7 @@ use sails_rs::prelude::*;
 #[codec(crate = sails_rs::scale_codec)]
 #[scale_info(crate = sails_rs::scale_info)]
 pub struct QuarantinedDeposit {
-    pub user: ActorId,
+    pub user: Address,
     pub amount: u128,
     pub deposit_timestamp: u64,
     pub release_timestamp: u64,
@@ -16,7 +16,7 @@ pub struct QuarantinedDeposit {
 #[codec(crate = sails_rs::scale_codec)]
 #[scale_info(crate = sails_rs::scale_info)]
 pub struct WithdrawalRequest {
-    pub user: ActorId,
+    pub user: Address,
     pub amount: u128,
     pub request_id: u64,
     pub timestamp: u64,
@@ -27,19 +27,19 @@ pub struct VaultState {
     /// Token this Vault manages (e.g. USDC address)
     pub token: TokenId,
     /// User available balances
-    pub balances: BTreeMap<ActorId, u128>,
+    pub balances: BTreeMap<Address, u128>,
     /// Deposits waiting for quarantine period
     pub quarantined_deposits: Vec<QuarantinedDeposit>,
     /// Funds currently moving between Vault and Orderbook
-    pub locked_in_transit: BTreeMap<(ActorId, ActorId), u128>,
+    pub locked_in_transit: BTreeMap<(Address, Address), u128>,
     /// Authorized Orderbook programs
-    pub registered_orderbooks: BTreeSet<ActorId>,
+    pub registered_orderbooks: BTreeSet<Address>,
     /// Pending withdrawal requests
     pub pending_withdrawals: Vec<WithdrawalRequest>,
     /// Quarantine duration in seconds/blocks
     pub quarantine_period: u64,
     /// Admin
-    pub admin: Option<ActorId>,
+    pub admin: Option<Address>,
     /// Treasury for fees - kept from original (implied)
     pub treasury: u128,
     /// Fee rate in BPS

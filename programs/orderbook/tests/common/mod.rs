@@ -1,11 +1,21 @@
 #![allow(dead_code)]
-use clob_common::{eth_to_actor, TokenId};
+use dex_common::{Address, TokenId};
 use orderbook_client::{
     orderbook::*, Orderbook as OrderbookClient, OrderbookCtors, OrderbookProgram,
 };
+use sails_rs::prelude::*;
 use sails_rs::{client::*, gtest::*};
-use sails_rs::{prelude::*, ActorId};
 use vault_client::{vault::*, Vault as VualtClient, VaultCtors, VaultProgram};
+
+/// Convert dex_common::Address to orderbook_client::Address.
+pub fn oc(addr: Address) -> orderbook_client::Address {
+    orderbook_client::Address(addr.0)
+}
+
+/// Convert dex_common::Address to vault_client::Address.
+pub fn vc(addr: Address) -> vault_client::Address {
+    vault_client::Address(addr.0)
+}
 pub(crate) const ORDERBOOK_WASM: &str = "../../target/wasm32-gear/release/orderbook.opt.wasm";
 pub(crate) const VAULT_WASM: &str = "../../target/wasm32-gear/release/vault_app.opt.wasm";
 
@@ -14,34 +24,34 @@ pub(crate) const BUYER_ID: u64 = 101;
 pub(crate) const SELLER_ID: u64 = 102;
 pub(crate) const BUYER2_ID: u64 = 3;
 pub(crate) const SELLER2_ID: u64 = 4;
-pub(crate) const BASE_TOKEN_ID: TokenId = [20u8; 20];
-pub(crate) const QUOTE_TOKEN_ID: TokenId = [30u8; 20];
+pub(crate) const BASE_TOKEN_ID: TokenId = Address::from_bytes([20u8; 20]);
+pub(crate) const QUOTE_TOKEN_ID: TokenId = Address::from_bytes([30u8; 20]);
 pub(crate) const VAULT_ID: u64 = 10;
 
 const PRICE_PRECISION: u128 = 1_000_000_000_000_000_000_000_000_000_000_000; // 1e30
 pub const BASE_DECIMALS: u32 = 18;
 pub const QUOTE_DECIMALS: u32 = 6;
 
-pub fn buyer() -> ActorId {
-    ActorId::from(BUYER_ID)
+pub fn buyer() -> Address {
+    Address::from(BUYER_ID)
 }
-pub fn seller() -> ActorId {
-    ActorId::from(SELLER_ID)
+pub fn seller() -> Address {
+    Address::from(SELLER_ID)
 }
 
 pub fn eth_wei(x: u128) -> u128 {
     x * 10u128.pow(BASE_DECIMALS)
 }
 
-pub fn buyer2() -> ActorId {
-    ActorId::from(BUYER2_ID)
+pub fn buyer2() -> Address {
+    Address::from(BUYER2_ID)
 }
-pub fn seller2() -> ActorId {
-    ActorId::from(SELLER2_ID)
+pub fn seller2() -> Address {
+    Address::from(SELLER2_ID)
 }
 
-pub fn vault() -> ActorId {
-    ActorId::from(VAULT_ID)
+pub fn vault() -> Address {
+    Address::from(VAULT_ID)
 }
 pub fn eth_frac(num: u128, den: u128) -> u128 {
     eth_wei(1) * num / den
@@ -91,8 +101,8 @@ pub async fn setup_programs(
     let system = System::new();
     system.init_logger();
     system.mint_to(ADMIN_ID, 100_000_000_000_000_000);
-    system.mint_to(buyer(), 100_000_000_000_000_000);
-    system.mint_to(seller(), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(buyer()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(seller()), 100_000_000_000_000_000);
 
     let env = GtestEnv::new(system, ADMIN_ID.into());
 
@@ -100,12 +110,12 @@ pub async fn setup_programs(
     let vault_code_id = env.system().submit_code_file(VAULT_WASM);
     let base_vault_program = env
         .deploy::<vault_client::VaultProgram>(vault_code_id, b"salt".to_vec())
-        .create(eth_to_actor(BASE_TOKEN_ID))
+        .create(vc(BASE_TOKEN_ID))
         .await
         .unwrap();
     let quote_vault_program = env
         .deploy::<vault_client::VaultProgram>(vault_code_id, b"quote-salt".to_vec())
-        .create(eth_to_actor(QUOTE_TOKEN_ID))
+        .create(vc(QUOTE_TOKEN_ID))
         .await
         .unwrap();
 
@@ -114,10 +124,10 @@ pub async fn setup_programs(
     let orderbook_program = env
         .deploy::<orderbook_client::OrderbookProgram>(orderbook_code_id, b"salt".to_vec())
         .create(
-            base_vault_program.id(),
-            quote_vault_program.id(),
-            BASE_TOKEN_ID,
-            QUOTE_TOKEN_ID,
+            orderbook_client::Address(base_vault_program.id().to_address_lossy()),
+            orderbook_client::Address(quote_vault_program.id().to_address_lossy()),
+            oc(BASE_TOKEN_ID),
+            oc(QUOTE_TOKEN_ID),
             max_trades,
             max_preview_scans,
         )
@@ -125,13 +135,11 @@ pub async fn setup_programs(
         .unwrap();
 
     // Auth in both vaults
+    let ob_addr = vault_client::Address(orderbook_program.id().to_address_lossy());
     let mut base_vault = base_vault_program.vault();
-    base_vault.add_market(orderbook_program.id()).await.unwrap();
+    base_vault.add_market(ob_addr.clone()).await.unwrap();
     let mut quote_vault = quote_vault_program.vault();
-    quote_vault
-        .add_market(orderbook_program.id())
-        .await
-        .unwrap();
+    quote_vault.add_market(ob_addr.clone()).await.unwrap();
 
     // Return quote vault for tests that fund quote side.
     (env, orderbook_program, quote_vault_program)
@@ -145,11 +153,11 @@ pub async fn setup_orderbook(
     system.init_logger();
     system.mint_to(ADMIN_ID, 100_000_000_000_000_000);
     // Fund trader actor IDs so gtest can send messages.
-    system.mint_to(buyer(), 100_000_000_000_000_000);
-    system.mint_to(seller(), 100_000_000_000_000_000);
-    system.mint_to(buyer2(), 100_000_000_000_000_000);
-    system.mint_to(seller2(), 100_000_000_000_000_000);
-    system.mint_to(vault(), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(buyer()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(seller()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(buyer2()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(seller2()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(vault()), 100_000_000_000_000_000);
 
     let env = GtestEnv::new(system, ADMIN_ID.into());
     // Deploy OrderBook passing the vault_id
@@ -157,10 +165,10 @@ pub async fn setup_orderbook(
 
     env.deploy::<orderbook_client::OrderbookProgram>(program_code_id, b"salt".to_vec())
         .create(
-            vault(),
-            vault(),
-            BASE_TOKEN_ID,
-            QUOTE_TOKEN_ID,
+            oc(vault()),
+            oc(vault()),
+            oc(BASE_TOKEN_ID),
+            oc(QUOTE_TOKEN_ID),
             max_trades,
             max_preview_scans,
         )
@@ -170,11 +178,11 @@ pub async fn setup_orderbook(
 
 pub async fn assert_balance(
     program: &Actor<OrderbookProgram, GtestEnv>,
-    who: ActorId,
+    who: Address,
     base: u128,
     quote: u128,
 ) {
-    let b = program.orderbook().balance_of(who).await.unwrap();
+    let b = program.orderbook().balance_of(oc(who)).await.unwrap();
     assert_eq!(b.0, base);
     assert_eq!(b.1, quote);
 }

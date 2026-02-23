@@ -1,12 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-   # "programs/ethapp_with_events",
-   # "programs/ethapp",
     "programs/vault",
-    "programs/vault/client", "libraries/clob-common", "programs/orderbook", "programs/orderbook/client", "programs/registry",
-    "libraries/intrusive_arena", 
-    "libraries/matching_engine",
+    "programs/vault/client",
+    "libraries/dex-common", "programs/orderbook", "programs/orderbook/client",
+    "libraries/intrusive_arena",
+    "libraries/matching-engine",
 ]
 
 [workspace.package]
@@ -21,3 +20,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 gtest = "1"
 insta = "1"
 alloy-sol-types = { version = "0.8.15", default-features = false }
+
+dex-common = { path = "libraries/dex-common" }
+matching-engine = { path = "libraries/matching-engine" }

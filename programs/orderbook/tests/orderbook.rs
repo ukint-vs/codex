@@ -1,10 +1,15 @@
-use clob_common::TokenId;
+use dex_common::{Address, TokenId};
 use orderbook_client::{
     orderbook::*, Orderbook as OrderbookClient, OrderbookCtors, OrderbookProgram,
 };
 
+use sails_rs::prelude::*;
 use sails_rs::{client::*, gtest::*};
-use sails_rs::{prelude::*, ActorId};
+
+/// Convert dex_common::Address to orderbook_client::Address (both wrap H160).
+fn oc(addr: Address) -> orderbook_client::Address {
+    orderbook_client::Address(addr.0)
+}
 pub(crate) const ORDERBOOK_WASM: &str = "../../target/wasm32-gear/release/orderbook.opt.wasm";
 
 pub(crate) const ADMIN_ID: u64 = 10;
@@ -13,26 +18,26 @@ pub(crate) const SELLER_ID: u64 = 2;
 pub(crate) const BUYER2_ID: u64 = 3;
 pub(crate) const SELLER2_ID: u64 = 4;
 pub(crate) const VAULT_ID: u64 = 10;
-pub(crate) const BASE_TOKEN_ID: TokenId = [20u8; 20];
-pub(crate) const QUOTE_TOKEN_ID: TokenId = [30u8; 20];
+pub(crate) const BASE_TOKEN_ID: TokenId = Address::from_bytes([20u8; 20]);
+pub(crate) const QUOTE_TOKEN_ID: TokenId = Address::from_bytes([30u8; 20]);
 
-fn buyer() -> ActorId {
-    ActorId::from(BUYER_ID)
+fn buyer() -> Address {
+    Address::from(BUYER_ID)
 }
 
-fn seller() -> ActorId {
-    ActorId::from(SELLER_ID)
+fn seller() -> Address {
+    Address::from(SELLER_ID)
 }
 
-fn buyer2() -> ActorId {
-    ActorId::from(BUYER2_ID)
+fn buyer2() -> Address {
+    Address::from(BUYER2_ID)
 }
-fn seller2() -> ActorId {
-    ActorId::from(SELLER2_ID)
+fn seller2() -> Address {
+    Address::from(SELLER2_ID)
 }
 
-fn vault() -> ActorId {
-    ActorId::from(VAULT_ID)
+fn vault() -> Address {
+    Address::from(VAULT_ID)
 }
 
 const PRICE_PRECISION: u128 = 1_000_000_000_000_000_000_000_000_000_000_000; // 1e30
@@ -89,10 +94,10 @@ async fn setup_orderbook(
     system.init_logger();
     system.mint_to(ADMIN_ID, 100_000_000_000_000_000);
     // Fund trader actor IDs so gtest can send messages.
-    system.mint_to(buyer(), 100_000_000_000_000_000);
-    system.mint_to(seller(), 100_000_000_000_000_000);
-    system.mint_to(buyer2(), 100_000_000_000_000_000);
-    system.mint_to(seller2(), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(buyer()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(seller()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(buyer2()), 100_000_000_000_000_000);
+    system.mint_to(ActorId::from(seller2()), 100_000_000_000_000_000);
 
     let env = GtestEnv::new(system, ADMIN_ID.into());
     // Deploy OrderBook passing the vault_id
@@ -100,10 +105,10 @@ async fn setup_orderbook(
 
     env.deploy::<orderbook_client::OrderbookProgram>(program_code_id, b"salt".to_vec())
         .create(
-            vault(),
-            vault(),
-            BASE_TOKEN_ID,
-            QUOTE_TOKEN_ID,
+            oc(vault()),
+            oc(vault()),
+            oc(BASE_TOKEN_ID),
+            oc(QUOTE_TOKEN_ID),
             max_trades,
             max_preview_scans,
         )
@@ -113,11 +118,11 @@ async fn setup_orderbook(
 
 async fn assert_balance(
     program: &Actor<OrderbookProgram, GtestEnv>,
-    who: ActorId,
+    who: Address,
     base: u128,
     quote: u128,
 ) {
-    let b = program.orderbook().balance_of(who).await.unwrap();
+    let b = program.orderbook().balance_of(oc(who)).await.unwrap();
     assert_eq!(b.0, base);
     assert_eq!(b.1, quote);
 }
@@ -132,21 +137,21 @@ async fn market_buy_strict_partial_fill_refunds_unused_budget() {
     let buy_amount = eth_frac(2, 5); // 0.4 ETH
 
     // Maker: place ask 0.5 ETH @ 2000 USDT/ETH
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask_id = c
         .submit_order(
             /*side=*/ 1, /*kind=*/ 0, price, ask_amount, /*max_quote=*/ 0,
         )
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Taker: deposit quote and do a strict Market BUY with a max_quote budget
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -157,7 +162,7 @@ async fn market_buy_strict_partial_fill_refunds_unused_budget() {
         /*side=*/ 0, /*kind=*/ 1, /*limit_price=*/ 0, buy_amount,
         /*max_quote=*/ budget,
     )
-    .with_actor_id(buyer())
+    .with_actor_id(buyer().into())
     .await
     .unwrap();
 
@@ -175,7 +180,7 @@ async fn market_buy_strict_partial_fill_refunds_unused_budget() {
 
     assert!(found);
     assert_eq!(id, ask_id);
-    assert_eq!(owner, seller());
+    assert_eq!(owner, oc(seller()));
     assert_eq!(side_io, 1); // SELL
     assert_eq!(p, price);
     assert_eq!(remaining_base, ask_amount - buy_amount);
@@ -192,19 +197,19 @@ async fn market_buy_strict_budget_exceeded_reverts_without_state_change() {
     let buy_amount = eth_frac(2, 5); // 0.4 ETH
 
     // Maker ask
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask_id = c
         .submit_order(1, 0, price, ask_amount, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Buyer deposits quote
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -214,7 +219,7 @@ async fn market_buy_strict_budget_exceeded_reverts_without_state_change() {
 
     let res = c
         .submit_order(0, 1, 0, buy_amount, too_small_budget)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await;
 
     assert!(res.is_err(), "Expected Market BUY budget check to fail");
@@ -243,21 +248,21 @@ async fn market_sell_matches_bid_and_decrements_reserved_quote() {
     let sell_amount = eth_frac(2, 5); // 0.4 ETH
 
     // Buyer places a bid (locks quote)
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let bid_id = c
         .submit_order(0, 0, price, bid_amount, 0)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
     let locked = quote_ceil_atoms(bid_amount, price);
 
     // Seller market sells into the bid
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -270,7 +275,7 @@ async fn market_sell_matches_bid_and_decrements_reserved_quote() {
         sell_amount,
         /*max_quote=*/ 0,
     )
-    .with_actor_id(seller())
+    .with_actor_id(seller().into())
     .await
     .unwrap();
 
@@ -302,18 +307,18 @@ async fn ioc_buy_partial_fill_refunds_remainder_and_does_not_place_resting() {
     let buy_amount = eth_frac(1, 2); // 0.5 ETH (more than available)
 
     // Seller places ask 0.3 ETH @ 2000
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     c.submit_order(1, 0, price, ask_amount, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Buyer IOC buys 0.5 ETH @ 2000; only 0.3 ETH is available
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -323,7 +328,7 @@ async fn ioc_buy_partial_fill_refunds_remainder_and_does_not_place_resting() {
         /*side=*/ 0, /*kind=*/ 3, /*limit_price=*/ price, buy_amount,
         /*max_quote=*/ 0,
     )
-    .with_actor_id(buyer())
+    .with_actor_id(buyer().into())
     .await
     .unwrap();
 
@@ -351,8 +356,8 @@ async fn limit_buy_places_and_reserves_quote_ceil() {
     let price = price_fp_usdt_per_eth(1_900);
     let bid_amount = eth_frac(1, 2); // 0.5 ETH
 
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -361,7 +366,7 @@ async fn limit_buy_places_and_reserves_quote_ceil() {
         .submit_order(
             /*side=*/ 0, /*kind=*/ 0, price, bid_amount, /*max_quote=*/ 0,
         )
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
@@ -377,7 +382,7 @@ async fn limit_buy_places_and_reserves_quote_ceil() {
         c.order_by_id(bid_id).await.unwrap();
     assert!(found);
     assert_eq!(id, bid_id);
-    assert_eq!(owner, buyer());
+    assert_eq!(owner, oc(buyer()));
     assert_eq!(side_io, 0); // BUY
     assert_eq!(p, price);
     assert_eq!(remaining_base, bid_amount);
@@ -394,18 +399,18 @@ async fn fok_buy_rejects_without_mutating_book_or_balances() {
     let buy_amount = eth_wei(1); // 1 ETH (not enough liquidity)
 
     // Seller places ask 0.5
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     c.submit_order(1, 0, price, ask_amount, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Buyer deposits quote and submits FOK buy 1.0 ETH @ 2000
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -413,7 +418,7 @@ async fn fok_buy_rejects_without_mutating_book_or_balances() {
         /*side=*/ 0, /*kind=*/ 2, /*limit_price=*/ price, buy_amount,
         /*max_quote=*/ 0,
     )
-    .with_actor_id(buyer())
+    .with_actor_id(buyer().into())
     .await
     .unwrap();
 
@@ -440,8 +445,8 @@ async fn limit_sell_places_and_locks_base() {
     let expected_remaining_base = eth_frac(1, 2); // 0.5 ETH
 
     service_client
-        .deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+        .deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -453,7 +458,7 @@ async fn limit_sell_places_and_locks_base() {
             expected_remaining_base,
             /*max_quote=*/ 0,
         )
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
@@ -468,7 +473,7 @@ async fn limit_sell_places_and_locks_base() {
         service_client.order_by_id(ask_id).await.unwrap();
     assert!(found);
     assert_eq!(id, ask_id);
-    assert_eq!(owner, seller());
+    assert_eq!(owner, oc(seller()));
     assert_eq!(side_io, 1); // SELL
     assert_eq!(price, expected_price_fp);
     assert_eq!(remaining_base, expected_remaining_base);
@@ -489,30 +494,30 @@ async fn market_buy_strict_fills_across_two_price_levels_best_to_worse() {
     let fill2 = buy - ask1; // 0.15 ETH
 
     // Seller1 places ask 0.3 @ 1990
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask1_id = c
         .submit_order(1, 0, price_1990, ask1, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Seller2 places ask 0.2 @ 2000
-    c.deposit(seller2(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller2()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask2_id = c
         .submit_order(1, 0, price_2000, ask2, 0)
-        .with_actor_id(seller2())
+        .with_actor_id(seller2().into())
         .await
         .unwrap();
 
     // Buyer deposits quote and performs strict Market BUY
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -523,7 +528,7 @@ async fn market_buy_strict_fills_across_two_price_levels_best_to_worse() {
     let budget = spent_total + usdt_micro(50); // unused budget must be refunded
 
     c.submit_order(0, 1, 0, buy, budget)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
@@ -542,7 +547,7 @@ async fn market_buy_strict_fills_across_two_price_levels_best_to_worse() {
     let (found2, _id, owner, side_io, p, remaining_base, rq) =
         c.order_by_id(ask2_id).await.unwrap();
     assert!(found2);
-    assert_eq!(owner, seller2());
+    assert_eq!(owner, oc(seller2()));
     assert_eq!(side_io, 1); // SELL
     assert_eq!(p, price_2000);
     assert_eq!(remaining_base, ask2 - fill2);
@@ -565,30 +570,30 @@ async fn market_buy_strict_fifo_within_same_price_level() {
     let fill_b = buy - ask_a; // 0.05 ETH
 
     // Seller1 places first ask
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask_a_id = c
         .submit_order(1, 0, price, ask_a, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // Seller2 places second ask at same price (must be behind FIFO)
-    c.deposit(seller2(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller2()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask_b_id = c
         .submit_order(1, 0, price, ask_b, 0)
-        .with_actor_id(seller2())
+        .with_actor_id(seller2().into())
         .await
         .unwrap();
 
     // Buyer deposits quote
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -598,7 +603,7 @@ async fn market_buy_strict_fifo_within_same_price_level() {
     let budget = spent_total + usdt_micro(25);
 
     c.submit_order(0, 1, 0, buy, budget)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
@@ -612,7 +617,7 @@ async fn market_buy_strict_fifo_within_same_price_level() {
     let (found_b, _id, owner, side_io, p, remaining_base, rq) =
         c.order_by_id(ask_b_id).await.unwrap();
     assert!(found_b);
-    assert_eq!(owner, seller2());
+    assert_eq!(owner, oc(seller2()));
     assert_eq!(side_io, 1);
     assert_eq!(p, price);
     assert_eq!(remaining_base, ask_b - fill_b);
@@ -641,32 +646,32 @@ async fn market_sell_consumes_multiple_bids_best_to_worse_and_updates_reserved_q
     let rem2 = bid2 - fill2; // 0.1 ETH
 
     // Buyer1 places best bid
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let bid1_id = c
         .submit_order(0, 0, price_1900, bid1, 0)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
     let locked1 = quote_ceil_atoms(bid1, price_1900);
 
     // Buyer2 places worse bid
-    c.deposit(buyer2(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer2()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let bid2_id = c
         .submit_order(0, 0, price_1890, bid2, 0)
-        .with_actor_id(buyer2())
+        .with_actor_id(buyer2().into())
         .await
         .unwrap();
     let locked2 = quote_ceil_atoms(bid2, price_1890);
 
     // Seller market sells 0.6 ETH
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -675,7 +680,7 @@ async fn market_sell_consumes_multiple_bids_best_to_worse_and_updates_reserved_q
     let got_total = got1 + got2;
 
     c.submit_order(1, 1, 0, sell, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
@@ -696,7 +701,7 @@ async fn market_sell_consumes_multiple_bids_best_to_worse_and_updates_reserved_q
     let (found2, _id, owner, side_io, p, remaining_base, reserved_quote) =
         c.order_by_id(bid2_id).await.unwrap();
     assert!(found2);
-    assert_eq!(owner, buyer2());
+    assert_eq!(owner, oc(buyer2()));
     assert_eq!(side_io, 0); // BUY
     assert_eq!(p, price_1890);
     assert_eq!(remaining_base, rem2);
@@ -726,8 +731,8 @@ async fn limit_buy_partial_fill_across_two_asks_then_places_remainder_bid() {
     let remaining_base = buy_amount - filled_base; // 0.6 ETH (3/5)
 
     // --- Maker #1 places ask 0.2 ETH @ 1950
-    c.deposit(seller(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask1_id = c
@@ -738,13 +743,13 @@ async fn limit_buy_partial_fill_across_two_asks_then_places_remainder_bid() {
             ask1_amount,
             /*max_quote=*/ 0,
         )
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     // --- Maker #2 places ask 0.2 ETH @ 1990
-    c.deposit(seller2(), BASE_TOKEN_ID, eth_wei(1))
-        .with_actor_id(vault())
+    c.deposit(oc(seller2()), oc(BASE_TOKEN_ID), eth_wei(1))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let ask2_id = c
@@ -755,13 +760,13 @@ async fn limit_buy_partial_fill_across_two_asks_then_places_remainder_bid() {
             ask2_amount,
             /*max_quote=*/ 0,
         )
-        .with_actor_id(seller2())
+        .with_actor_id(seller2().into())
         .await
         .unwrap();
 
     // --- Buyer deposits quote and submits Limit BUY 1.0 ETH @ 2000
-    c.deposit(buyer(), QUOTE_TOKEN_ID, usdt_micro(10_000))
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), usdt_micro(10_000))
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     // What sellers should receive (engine uses floor for fills)
@@ -781,7 +786,7 @@ async fn limit_buy_partial_fill_across_two_asks_then_places_remainder_bid() {
             buy_amount,
             /*max_quote=*/ 0,
         )
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
     // --- Balance checks
@@ -821,7 +826,7 @@ async fn limit_buy_partial_fill_across_two_asks_then_places_remainder_bid() {
     let (found, id, owner, side_io, p, rem_base, reserved_q) = c.order_by_id(bid_id).await.unwrap();
     assert!(found);
     assert_eq!(id, bid_id);
-    assert_eq!(owner, buyer());
+    assert_eq!(owner, oc(buyer()));
     assert_eq!(side_io, 0); // BUY
     assert_eq!(p, limit_price_2000);
     assert_eq!(rem_base, remaining_base);
@@ -842,8 +847,8 @@ async fn stress_1000_makers_one_taker_market_buy_strict_consumes_all() {
     assert_eq!(chunk_base * 1000, total_base);
 
     // Maker deposits exactly 1 ETH, then places 1000 asks at the same price.
-    c.deposit(seller(), BASE_TOKEN_ID, total_base)
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), total_base)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -856,7 +861,7 @@ async fn stress_1000_makers_one_taker_market_buy_strict_consumes_all() {
                 /*limit_price=*/ price, /*amount_base=*/ chunk_base,
                 /*max_quote=*/ 0,
             )
-            .with_actor_id(seller())
+            .with_actor_id(seller().into())
             .await
             .unwrap();
 
@@ -871,8 +876,8 @@ async fn stress_1000_makers_one_taker_market_buy_strict_consumes_all() {
 
     // Buyer deposits quote and submits strict Market BUY for the full 1 ETH.
     let initial_quote = usdt_micro(10_000);
-    c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), initial_quote)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -889,7 +894,7 @@ async fn stress_1000_makers_one_taker_market_buy_strict_consumes_all() {
         /*kind=*/ 1, // MARKET
         /*limit_price=*/ 0, /*amount_base=*/ total_base, /*max_quote=*/ budget,
     )
-    .with_actor_id(buyer())
+    .with_actor_id(buyer().into())
     .await
     .unwrap();
 
@@ -946,8 +951,8 @@ async fn one_big_market_buy_matches_n_small_asks() {
     assert!(total_base > 0);
 
     // Maker: deposit total_base and place n asks at the same price (FIFO).
-    c.deposit(seller(), BASE_TOKEN_ID, total_base)
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), total_base)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
     let mut first_id: u64 = 0;
@@ -961,7 +966,7 @@ async fn one_big_market_buy_matches_n_small_asks() {
                 /*limit_price=*/ price, /*amount_base=*/ chunk_base,
                 /*max_quote=*/ 0,
             )
-            .with_actor_id(seller())
+            .with_actor_id(seller().into())
             .await
             .unwrap();
 
@@ -976,8 +981,8 @@ async fn one_big_market_buy_matches_n_small_asks() {
 
     // Buyer: deposit quote and submit one big strict Market BUY for total_base.
     let initial_quote = usdt_micro(10_000);
-    c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), initial_quote)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
@@ -996,7 +1001,7 @@ async fn one_big_market_buy_matches_n_small_asks() {
         /*kind=*/ 1, // MARKET
         /*limit_price=*/ 0, /*amount_base=*/ total_base, /*max_quote=*/ budget,
     )
-    .with_actor_id(buyer())
+    .with_actor_id(buyer().into())
     .await
     .unwrap();
 
@@ -1037,14 +1042,14 @@ async fn cancel_limit_buy_unlocks_reserved_quote_and_removes_order() {
     let price = price_fp_usdt_per_eth(1_900);
     let amount = eth_frac(1, 2); // 0.5 ETH
 
-    c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), initial_quote)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
     let order_id = c
         .submit_order(0, 0, price, amount, 0)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
@@ -1052,7 +1057,7 @@ async fn cancel_limit_buy_unlocks_reserved_quote_and_removes_order() {
     assert_balance(&program, buyer(), 0, initial_quote - reserved).await;
 
     c.cancel_order(order_id)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await
         .unwrap();
 
@@ -1071,21 +1076,21 @@ async fn cancel_limit_sell_unlocks_locked_base_and_removes_order() {
     let price = price_fp_usdt_per_eth(2_000);
     let amount = eth_frac(3, 10); // 0.3 ETH
 
-    c.deposit(seller(), BASE_TOKEN_ID, initial_base)
-        .with_actor_id(vault())
+    c.deposit(oc(seller()), oc(BASE_TOKEN_ID), initial_base)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
     let order_id = c
         .submit_order(1, 0, price, amount, 0)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
     assert_balance(&program, seller(), initial_base - amount, 0).await;
 
     c.cancel_order(order_id)
-        .with_actor_id(seller())
+        .with_actor_id(seller().into())
         .await
         .unwrap();
 
@@ -1104,14 +1109,14 @@ async fn limit_buy_rejects_when_quote_balance_insufficient() {
     let price = price_fp_usdt_per_eth(2_000);
     let amount = eth_frac(1, 2); // requires much more than 100 USDT
 
-    c.deposit(buyer(), QUOTE_TOKEN_ID, initial_quote)
-        .with_actor_id(vault())
+    c.deposit(oc(buyer()), oc(QUOTE_TOKEN_ID), initial_quote)
+        .with_actor_id(vault().into())
         .await
         .unwrap();
 
     let res = c
         .submit_order(0, 0, price, amount, 0)
-        .with_actor_id(buyer())
+        .with_actor_id(buyer().into())
         .await;
     assert!(res.is_err(), "Expected insufficient quote balance");
 

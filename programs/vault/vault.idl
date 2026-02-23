@@ -1,47 +1,51 @@
+type Address = struct {
+  h160,
+};
+
 constructor {
-  Create : (token_id: actor_id);
+  Create : (token_id: Address);
 };
 
 service Vault {
-  AddMarket : (program_id: actor_id) -> null;
+  AddMarket : (program_id: Address) -> null;
   ClaimFees : () -> null;
   /// Debug/testing helper to mint balance without requiring market/admin routing.
   /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
-  DebugDeposit : (user: actor_id, amount: u128) -> null;
+  DebugDeposit : (user: Address, amount: u128) -> null;
   /// Enable/disable debug minting helpers (intended for test environments).
   SetDebugMode : (enabled: bool) -> null;
   SetQuarantinePeriod : (period: u64) -> null;
-  TransferToMarket : (market_id: actor_id, amount: u128) -> null;
+  TransferToMarket : (market_id: Address, amount: u128) -> null;
   UpdateFeeRate : (new_rate: u128) -> null;
-  VaultDeposit : (user: actor_id, amount: u128) -> null;
-  VaultForceExit : (user: actor_id, amount: u128) -> null;
-  VaultWithdraw : (user: actor_id, amount: u128) -> null;
-  query Admin : () -> actor_id;
+  VaultDeposit : (user: Address, amount: u128) -> null;
+  VaultForceExit : (user: Address, amount: u128) -> null;
+  VaultWithdraw : (user: Address, amount: u128) -> null;
+  query Admin : () -> Address;
   query DebugMode : () -> bool;
-  query GetBalance : (user: actor_id) -> struct { u128, u128 };
+  query GetBalance : (user: Address) -> struct { u128, u128 };
   query GetTreasury : () -> u128;
-  query IsAuthorized : (program_id: actor_id) -> bool;
+  query IsAuthorized : (program_id: Address) -> bool;
 
   events {
     Deposit: struct {
-      user: [u8, 20],
-      token: [u8, 20],
+      user: Address,
+      token: Address,
       amount: u128,
       balance_after: u128,
     };
     Withdrawal: struct {
-      user: [u8, 20],
-      token: [u8, 20],
+      user: Address,
+      token: Address,
       amount: u128,
       status: str,
     };
     FeesClaimed: struct {
-      token: [u8, 20],
+      token: Address,
       amount: u128,
     };
     QuarantineReleased: struct {
-      user: [u8, 20],
-      token: [u8, 20],
+      user: Address,
+      token: Address,
       amount: u128,
       balance_after: u128,
     };

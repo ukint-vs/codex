@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "debug"] }
-clob-common = { path = "../../libraries/clob-common" }
-alloy-sol-types = { workspace = true }
+dex-common.workspace = true
+alloy-sol-types.workspace = true
 
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
@@ -16,4 +16,4 @@ insta.workspace = true
 sails-rs = { workspace = true, features = ["ethexe", "gtest", "idl-gen"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 vault-client = { path = "client" }
-alloy-sol-types = { workspace = true }
+alloy-sol-types.workspace = true

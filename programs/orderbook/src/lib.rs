@@ -1,7 +1,11 @@
 #![no_std]
-use clob_common::TokenId;
+use dex_common::{Address, TokenId};
 use matching_engine::{Book, IncomingOrder, MatchError, OrderId, Side};
-use sails_rs::{cell::RefCell, gstd::msg, prelude::*};
+use sails_rs::{
+    cell::RefCell,
+    gstd::{debug, msg},
+    prelude::*,
+};
 
 use crate::state::{kind_from_io, side_from_io, Asset, OrderKindIO, SideIO};
 use vault_client::vault::io as vault_io;
@@ -31,9 +35,13 @@ impl<'a> Orderbook<'a> {
 #[sails_rs::service]
 impl<'a> Orderbook<'a> {
     #[export]
-    pub fn deposit(&mut self, account: ActorId, token: TokenId, amount: u128) -> bool {
+    pub fn deposit(&mut self, account: Address, token: TokenId, amount: u128) -> bool {
         let mut st = self.get_mut();
-        let caller = sails_rs::gstd::msg::source();
+        let caller: Address = msg::source().into();
+        debug!(
+            "Orderbook::deposit caller={:?} account={:?}",
+            caller, account
+        );
         if token == st.base_token_id {
             if caller != st.base_vault_id {
                 panic!("Not allowed to deposit")
@@ -52,14 +60,18 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub async fn withdraw_base(&mut self, amount: u128) {
-        let caller = msg::source();
+        let caller: Address = msg::source().into();
         let base_vault_id = {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Base, U256::from(amount));
             st.base_vault_id
         };
-        let payload = vault_io::VaultDeposit::encode_params_with_prefix("Vault", caller, amount);
-        let result = msg::send_bytes_for_reply(base_vault_id, payload, 0)
+        let payload = vault_io::VaultDeposit::encode_params_with_prefix(
+            "Vault",
+            vault_client::Address(caller.0),
+            amount,
+        );
+        let result = msg::send_bytes_for_reply(base_vault_id.into(), payload, 0)
             .expect("SendFailed")
             .await;
 
@@ -71,14 +83,18 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub async fn withdraw_quote(&mut self, amount: u128) {
-        let caller = msg::source();
+        let caller: Address = msg::source().into();
         let quote_vault_id = {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Quote, U256::from(amount));
             st.quote_vault_id
         };
-        let payload = vault_io::VaultDeposit::encode_params_with_prefix("Vault", caller, amount);
-        let result = msg::send_bytes_for_reply(quote_vault_id, payload, 0)
+        let payload = vault_io::VaultDeposit::encode_params_with_prefix(
+            "Vault",
+            vault_client::Address(caller.0),
+            amount,
+        );
+        let result = msg::send_bytes_for_reply(quote_vault_id.into(), payload, 0)
             .expect("SendFailed")
             .await;
 
@@ -99,7 +115,7 @@ impl<'a> Orderbook<'a> {
         amount_base: u128,
         max_quote: u128,
     ) -> Result<OrderId, MatchError> {
-        let caller = sails_rs::gstd::msg::source();
+        let caller = sails_rs::gstd::msg::source().into();
         let mut st = self.get_mut();
         let order_id = st.alloc_order_id();
 
@@ -121,7 +137,7 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub fn cancel_order(&mut self, order_id: u64) {
-        let caller = msg::source();
+        let caller = msg::source().into();
         let mut st = self.get_mut();
 
         let Some(view) = st.book.peek_order(order_id) else {
@@ -163,19 +179,19 @@ impl<'a> Orderbook<'a> {
     }
 
     #[export]
-    pub fn balance_of(&self, who: ActorId) -> (u128, u128) {
+    pub fn balance_of(&self, who: Address) -> (u128, u128) {
         let st = self.get();
         let b = st.balances.get(&who).cloned().unwrap_or_default();
         (b.base.low_u128(), b.quote.low_u128())
     }
 
     #[export]
-    pub fn order_by_id(&self, order_id: u64) -> (bool, u64, ActorId, u16, u128, u128, u128) {
+    pub fn order_by_id(&self, order_id: u64) -> (bool, u64, Address, u16, u128, u128, u128) {
         let st = self.get();
 
         // Tuple-only ABI: return (found, fields...). If not found -> found=false and zeros.
         let Some(o) = st.book.peek_order(order_id) else {
-            return (false, 0, ActorId::zero(), 0, 0, 0, 0);
+            return (false, 0, Address::default(), 0, 0, 0, 0);
         };
 
         let side_io: u16 = match o.side {
@@ -203,8 +219,8 @@ pub struct OrderBookProgram {
 #[sails_rs::program]
 impl OrderBookProgram {
     pub fn create(
-        base_vault_id: ActorId,
-        quote_vault_id: ActorId,
+        base_vault_id: Address,
+        quote_vault_id: Address,
         base_token_id: TokenId,
         quote_token_id: TokenId,
         max_trades: u32,

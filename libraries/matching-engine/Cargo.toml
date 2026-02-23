@@ -1,0 +1,8 @@
+[package]
+name = "matching-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sails-rs.workspace = true
+dex-common.workspace = true

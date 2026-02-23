@@ -1,4 +1,4 @@
-use clob_common::TokenId;
+use dex_common::{Address, TokenId};
 use sails_rs::{collections::HashMap, prelude::*, U256};
 
 use matching_engine::{
@@ -43,12 +43,12 @@ pub struct State {
     pub next_order_id: OrderId,
     pub limits: EngineLimits,
     pub book: OrderBook,
-    pub balances: HashMap<ActorId, AccountBalances>,
+    pub balances: HashMap<Address, AccountBalances>,
     pub protocol_fee_quote: U256,
     pub base_token_id: TokenId,
     pub quote_token_id: TokenId,
-    pub base_vault_id: ActorId,
-    pub quote_vault_id: ActorId,
+    pub base_vault_id: Address,
+    pub quote_vault_id: Address,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,8 +59,8 @@ pub enum Asset {
 
 impl State {
     pub fn new(
-        base_vault_id: ActorId,
-        quote_vault_id: ActorId,
+        base_vault_id: Address,
+        quote_vault_id: Address,
         base_token_id: TokenId,
         quote_token_id: TokenId,
         max_trades: u32,
@@ -88,11 +88,11 @@ impl State {
         id
     }
 
-    pub fn balance_mut(&mut self, who: ActorId) -> &mut AccountBalances {
+    pub fn balance_mut(&mut self, who: Address) -> &mut AccountBalances {
         self.balances.entry(who).or_default()
     }
 
-    fn lock(&mut self, who: ActorId, asset: Asset, amount: U256) {
+    fn lock(&mut self, who: Address, asset: Asset, amount: U256) {
         if amount.is_zero() {
             return;
         }
@@ -103,7 +103,7 @@ impl State {
         }
     }
 
-    pub fn unlock(&mut self, who: ActorId, asset: Asset, amount: U256) {
+    pub fn unlock(&mut self, who: Address, asset: Asset, amount: U256) {
         if amount.is_zero() {
             return;
         }
@@ -114,11 +114,11 @@ impl State {
         }
     }
 
-    pub fn deposit(&mut self, who: ActorId, asset: Asset, amount: U256) {
+    pub fn deposit(&mut self, who: Address, asset: Asset, amount: U256) {
         self.unlock(who, asset, amount);
     }
 
-    pub fn withdraw(&mut self, who: ActorId, asset: Asset, amount: U256) {
+    pub fn withdraw(&mut self, who: Address, asset: Asset, amount: U256) {
         self.lock(who, asset, amount);
     }
 
