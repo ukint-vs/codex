@@ -1,0 +1,28 @@
+{
+  "name": "dex",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "showcase": "tsx scripts/showcase/main.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.28.2",
+  "dependencies": {
+    "@vara-eth/api": "^0.2.0",
+    "dotenv": "^17.2.3",
+    "sails-js": "^0.5.1",
+    "sails-js-parser": "^0.5.1",
+    "viem": "^2.45.1"
+  },
+  "devDependencies": {
+    "sails-js-types": "^0.5.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

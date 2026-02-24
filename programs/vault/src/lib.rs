@@ -190,17 +190,6 @@ impl<'a> VaultService<'a> {
         reply_ok();
     }
 
-    /// Enable/disable debug minting helpers (intended for test environments).
-    #[export]
-    pub fn set_debug_mode(&mut self, enabled: bool) {
-        let mut state = self.get_mut();
-        if state.admin != Some(msg::source().into()) {
-            panic!("Unauthorized: Not Admin");
-        }
-        state.debug_mode = enabled;
-        reply_ok();
-    }
-
     // Admin function to claim accumulated fees
     #[export]
     pub fn claim_fees(&mut self) {
@@ -263,19 +252,23 @@ impl<'a> VaultService<'a> {
     }
 
     /// Debug/testing helper to mint balance without requiring market/admin routing.
-    /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
+    /// Only available when compiled with the `debug` feature.
     #[export]
-    pub fn debug_deposit(&mut self, user: Address, amount: u128) {
-        let state = self.get();
-        let caller = msg::source().into();
-        if !state.debug_mode {
-            panic!("DebugModeDisabled");
+    pub fn debug_deposit(&mut self, _user: ActorId, _amount: u128) {
+        #[cfg(not(feature = "debug"))]
+        {
+            panic!("DebugFeatureDisabled");
         }
-        if state.admin != Some(caller) && caller != user {
-            panic!("UnauthorizedDebugDeposit");
+        #[cfg(feature = "debug")]
+        {
+            let state = self.get();
+            let caller = msg::source();
+            if state.admin != Some(caller) && caller != _user {
+                panic!("UnauthorizedDebugDeposit");
+            }
+            drop(state);
+            self.vault_deposit_unchecked(_user, _amount);
         }
-        drop(state);
-        self.vault_deposit_unchecked(user, amount);
     }
 
     fn vault_deposit_unchecked(&mut self, user: Address, amount: u128) {
@@ -512,11 +505,6 @@ impl<'a> VaultService<'a> {
     #[export]
     pub fn get_treasury(&self) -> u128 {
         self.get().treasury
-    }
-
-    #[export]
-    pub fn debug_mode(&self) -> bool {
-        self.get().debug_mode
     }
 }
 

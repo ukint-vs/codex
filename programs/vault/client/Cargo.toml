@@ -14,3 +14,4 @@ vault-app = { path = "../" }
 
 [features]
 mocks = ["sails-rs/mockall", "dep:mockall"]
+debug = ["vault-app/debug"]

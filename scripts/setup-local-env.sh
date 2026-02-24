@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 # Get the directory where this script is located
@@ -121,7 +120,7 @@ trap cleanup EXIT INT TERM
 
 # Step 5: Run the node
 log_info "Starting Vara.Eth node..."
-"$PATH_TO_VARA_ETH_BIN" run --dev --block-time "$BLOCK_TIME" --rpc-port 9944 >> "$LOG_FILE" 2>&1 &
+RUST_LOG=debug "$PATH_TO_VARA_ETH_BIN" run --dev --block-time "$BLOCK_TIME" --rpc-port 9944 >> "$LOG_FILE" 2>&1 &
 NODE_PID=$!
 
 log_info "Node started with PID: $NODE_PID"
@@ -203,7 +202,7 @@ log_info "Deploying program codes..."
 ANVIL_WS_RPC="ws://127.0.0.1:8545"
 # Default sender address with balance
 # Derived from the default test mnemonic
-SENDER_ADDRESS=${SENDER_ADDRESS:-"0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"}
+SENDER_ADDRESS=${SENDER_ADDRESS:-"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"}
 
 log_info "Using SENDER_ADDRESS: $SENDER_ADDRESS"
 log_info "Using ANVIL_WS_RPC: $ANVIL_WS_RPC"
@@ -242,56 +241,101 @@ export VAULT_CODE_ID
 
 log_info "========================================="
 log_info "Code Deployment Complete"
-log_info "========================================="
 log_info "Orderbook Code ID: $ORDERBOOK_CODE_ID"
 log_info "Vault Code ID: $VAULT_CODE_ID"
 log_info "========================================="
 
 # Step 8: Create mirror programs
-log_info "Creating mirror programs..."
+create_programs() {
+    log_info "Creating mirror programs..."
 
-# Set default private key if not provided
-# It's a well-known private key for testing purposes
-# derived from the default test mnemonic
-# "test test test test test test test test test test test junk"
-PRIVATE_KEY=${PRIVATE_KEY:-"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"}
-ETH_RPC_HTTP="http://127.0.0.1:8545"
+    # Set default private key if not provided
+    # It's a well-known private key for testing purposes
+    # derived from the default test mnemonic
+    # "test test test test test test test test test test test junk"
+    PRIVATE_KEY=${PRIVATE_KEY:-"0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"}
+    ETH_RPC_HTTP="http://127.0.0.1:8545"
 
-log_info "Using ETH_RPC_HTTP: $ETH_RPC_HTTP"
+    log_info "Using ETH_RPC_HTTP: $ETH_RPC_HTTP"
 
-# Create Orderbook mirror program
-log_info "Creating Orderbook mirror program..."
-set +e
-ORDERBOOK_PROGRAM_ADDRESS=$(create_mirror_program "$ORDERBOOK_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY" "$ETH_RPC_HTTP")
-program_exit_code=$?
-set -e
+    # Create Vault mirror program
+    log_info "Creating Vault mirror programs..."
+    source "$SCRIPT_DIR/helpers.sh"
+    # Creating Base Token Vault
+    set +e
+    BASE_VAULT_INIT_PAYLOAD=$(create_base_vault_init_payload)
+    log_info "Base Vault Init Payload: $BASE_VAULT_INIT_PAYLOAD"
+    BASE_TOKEN_VAULT_PROGRAM_ADDRESS=$(create_mirror_program "$VAULT_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY" "$ETH_RPC_HTTP" "$BASE_VAULT_INIT_PAYLOAD")
+    program_exit_code=$?
+    set -e
 
-if [ $program_exit_code -ne 0 ] || [ -z "$ORDERBOOK_PROGRAM_ADDRESS" ]; then
-    log_error "Failed to create Orderbook mirror program"
-    exit 1
-fi
-log_info "Orderbook Program Address: $ORDERBOOK_PROGRAM_ADDRESS"
-export ORDERBOOK_PROGRAM_ADDRESS
+    if [ $program_exit_code -ne 0 ] || [ -z "$BASE_TOKEN_VAULT_PROGRAM_ADDRESS" ]; then
+        log_error "Failed to create Base Token Vault mirror program"
+        exit 1
+    fi
+    log_info "Base Token Vault Program Address: $BASE_TOKEN_VAULT_PROGRAM_ADDRESS"
+    export BASE_TOKEN_VAULT_PROGRAM_ADDRESS
 
-# Create Vault mirror program
-log_info "Creating Vault mirror program..."
-set +e
-VAULT_PROGRAM_ADDRESS=$(create_mirror_program "$VAULT_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY" "$ETH_RPC_HTTP")
-program_exit_code=$?
-set -e
+    # Creating Quote Token Vault
+    set +e
+    QUOTE_VAULT_INIT_PAYLOAD=$(create_quote_vault_init_payload)
+    log_info "Quote Vault Init Payload: $QUOTE_VAULT_INIT_PAYLOAD"
+    QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS=$(create_mirror_program "$VAULT_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY" "$ETH_RPC_HTTP" "$QUOTE_VAULT_INIT_PAYLOAD")
+    program_exit_code=$?
+    set -e
 
-if [ $program_exit_code -ne 0 ] || [ -z "$VAULT_PROGRAM_ADDRESS" ]; then
-    log_error "Failed to create Vault mirror program"
-    exit 1
-fi
-log_info "Vault Program Address: $VAULT_PROGRAM_ADDRESS"
-export VAULT_PROGRAM_ADDRESS
+    if [ $program_exit_code -ne 0 ] || [ -z "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS" ]; then
+        log_error "Failed to create Quote Token Vault mirror program"
+        exit 1
+    fi
+    log_info "Quote Token Vault Program Address: $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
+    export QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS
+
+    # Create Orderbook mirror program
+    log_info "Creating Orderbook mirror program..."
+    set +e
+    ORDERBOOK_INIT_PAYLOAD=$(create_orderbook_init_payload "$BASE_TOKEN_VAULT_PROGRAM_ADDRESS" "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS")
+    log_info "Orderbook Init Payload: $ORDERBOOK_INIT_PAYLOAD"
+    ORDERBOOK_PROGRAM_ADDRESS=$(create_mirror_program "$ORDERBOOK_CODE_ID" "$ROUTER_ADDRESS" "$PRIVATE_KEY" "$ETH_RPC_HTTP" "$ORDERBOOK_INIT_PAYLOAD")
+    program_exit_code=$?
+    set -e
+
+    if [ $program_exit_code -ne 0 ] || [ -z "$ORDERBOOK_PROGRAM_ADDRESS" ]; then
+        log_error "Failed to create Orderbook mirror program"
+        exit 1
+    fi
+    log_info "Orderbook Program Address: $ORDERBOOK_PROGRAM_ADDRESS"
+    export ORDERBOOK_PROGRAM_ADDRESS
+
+    log_info
+
+    payload=$(create_vault_add_market_payload "$ORDERBOOK_PROGRAM_ADDRESS")
+    # echo send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" $BASE_TOKEN_VAULT_PROGRAM_ADDRESS "$payload" "$SENDER_ADDRESS" "$KEY_STORE" "$ETH_RPC_HTTP" "$ROUTER_ADDRESS"
+    send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" $BASE_TOKEN_VAULT_PROGRAM_ADDRESS \
+        "$payload" "$SENDER_ADDRESS" "$KEY_STORE" "$ETH_RPC_HTTP" "$ROUTER_ADDRESS"
+    send_message $PATH_TO_VARA_ETH_BIN "ws://127.0.0.1:9944" $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS \
+        "$payload" "$SENDER_ADDRESS" "$KEY_STORE" "$ETH_RPC_HTTP" "$ROUTER_ADDRESS"
+
+    log_info "========================================="
+    log_info "Mirror Programs Created"
+    log_info "========================================="
+    log_info "Orderbook Program: $ORDERBOOK_PROGRAM_ADDRESS"
+    log_info "Base Token Vault Program: $BASE_TOKEN_VAULT_PROGRAM_ADDRESS"
+    log_info "Quote Token Vault Program: $QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
+    log_info "========================================="
+}
+
+create_programs
+
+# Step 9: Update .env file with contract addresses
+log_info "Updating .env file with contract addresses..."
+update_env_var "$ENV_FILE" "ORDERBOOK_ADDRESS" "$ORDERBOOK_PROGRAM_ADDRESS"
+update_env_var "$ENV_FILE" "BASE_TOKEN_VAULT_ADDRESS" "$BASE_TOKEN_VAULT_PROGRAM_ADDRESS"
+update_env_var "$ENV_FILE" "QUOTE_TOKEN_VAULT_ADDRESS" "$QUOTE_TOKEN_VAULT_PROGRAM_ADDRESS"
+update_env_var "$ENV_FILE" "ROUTER_ADDRESS" "$ROUTER_ADDRESS"
 
 log_info "========================================="
-log_info "Mirror Programs Created"
-log_info "========================================="
-log_info "Orderbook Program: $ORDERBOOK_PROGRAM_ADDRESS"
-log_info "Vault Program: $VAULT_PROGRAM_ADDRESS"
+log_info ".env file updated successfully"
 log_info "========================================="
 
 # Keep the script running and monitoring the node

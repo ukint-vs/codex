@@ -10,10 +10,8 @@ service Vault {
   AddMarket : (program_id: Address) -> null;
   ClaimFees : () -> null;
   /// Debug/testing helper to mint balance without requiring market/admin routing.
-  /// Must be explicitly enabled by admin via `set_debug_mode(true)`.
-  DebugDeposit : (user: Address, amount: u128) -> null;
-  /// Enable/disable debug minting helpers (intended for test environments).
-  SetDebugMode : (enabled: bool) -> null;
+  /// Only available when compiled with the `debug` feature.
+  DebugDeposit : (_user: actor_id, _amount: u128) -> null;
   SetQuarantinePeriod : (period: u64) -> null;
   TransferToMarket : (market_id: Address, amount: u128) -> null;
   UpdateFeeRate : (new_rate: u128) -> null;
@@ -21,7 +19,6 @@ service Vault {
   VaultForceExit : (user: Address, amount: u128) -> null;
   VaultWithdraw : (user: Address, amount: u128) -> null;
   query Admin : () -> Address;
-  query DebugMode : () -> bool;
   query GetBalance : (user: Address) -> struct { u128, u128 };
   query GetTreasury : () -> u128;
   query IsAuthorized : (program_id: Address) -> bool;
