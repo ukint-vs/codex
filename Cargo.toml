@@ -4,7 +4,7 @@ members = [
     "programs/vault",
     "programs/vault/client",
     "libraries/dex-common", "programs/orderbook", "programs/orderbook/client",
-    "libraries/intrusive_arena",
+    "libraries/intrusive-arena",
     "libraries/matching-engine",
 ]
 
@@ -20,6 +20,14 @@ tokio = { version = "1", features = ["rt", "macros"] }
 gtest = "1"
 insta = "1"
 alloy-sol-types = { version = "0.8.15", default-features = false }
+mockall = { version = "0.12" }
 
 dex-common = { path = "libraries/dex-common" }
 matching-engine = { path = "libraries/matching-engine" }
+intrusive-arena = { path = "libraries/intrusive-arena" }
+
+orderbook = { path = "programs/orderbook" }
+orderbook-client = { path = "programs/orderbook/client" }
+
+vault = { path = "programs/vault" }
+vault-client = { path = "programs/vault/client" }

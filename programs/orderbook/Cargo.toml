@@ -6,8 +6,8 @@ edition.workspace = true
 [dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "debug"] }
 dex-common.workspace = true
-vault-client = { path = "../vault/client" }
-intrusive_arena = { path = "../../libraries/intrusive_arena" }
+vault-client.workspace = true
+intrusive-arena.workspace = true
 matching-engine.workspace = true
 
 [build-dependencies]
@@ -17,4 +17,4 @@ sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
 insta.workspace = true
 sails-rs = { workspace = true, features = ["ethexe", "gtest", "idl-gen"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
-orderbook-client = { path = "client" }
+orderbook-client.workspace = true

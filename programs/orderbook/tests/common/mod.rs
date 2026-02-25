@@ -17,7 +17,7 @@ pub fn vc(addr: Address) -> vault_client::Address {
     vault_client::Address(addr.0)
 }
 pub(crate) const ORDERBOOK_WASM: &str = "../../target/wasm32-gear/release/orderbook.opt.wasm";
-pub(crate) const VAULT_WASM: &str = "../../target/wasm32-gear/release/vault_app.opt.wasm";
+pub(crate) const VAULT_WASM: &str = "../../target/wasm32-gear/release/vault.opt.wasm";
 
 pub(crate) const ADMIN_ID: u64 = 100;
 pub(crate) const BUYER_ID: u64 = 101;

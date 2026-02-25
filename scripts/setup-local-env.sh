@@ -209,7 +209,7 @@ log_info "Using ANVIL_WS_RPC: $ANVIL_WS_RPC"
 
 # Define program paths
 ORDERBOOK_WASM="./target/wasm32-gear/release/orderbook.opt.wasm"
-VAULT_WASM="./target/wasm32-gear/release/vault_app.opt.wasm"
+VAULT_WASM="./target/wasm32-gear/release/vault.opt.wasm"
 
 # Deploy Orderbook
 log_info "Deploying Orderbook code..."

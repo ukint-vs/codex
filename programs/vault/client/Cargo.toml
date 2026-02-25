@@ -4,14 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-mockall = { version = "0.12", optional = true }
+mockall = { workspace = true, optional = true }
 sails-rs = { workspace = true, features = ["ethexe"] }
 
 [build-dependencies]
 sails-client-gen.workspace = true
 sails-idl-gen.workspace = true
-vault-app = { path = "../" }
+vault.workspace = true
 
 [features]
 mocks = ["sails-rs/mockall", "dep:mockall"]
-debug = ["vault-app/debug"]
+debug = ["vault/debug"]

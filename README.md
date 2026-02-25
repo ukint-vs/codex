@@ -59,7 +59,7 @@ If `releaseFunds` reverts on Ethereum (e.g., daily limit reached), Gear balances
 
 ### Testing
 - **Solidity:** `forge test`
-- **Gear Programs:** `cargo test -p vault-app`
+- **Gear Programs:** `cargo test -p vault`
 
 ## Deployment (Hoodi Testnet)
 

@@ -1,5 +1,5 @@
 [package]
-name = "vault-app"
+name = "vault"
 version.workspace = true
 edition.workspace = true
 
@@ -18,5 +18,5 @@ sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
 insta.workspace = true
 sails-rs = { workspace = true, features = ["ethexe", "gtest", "idl-gen"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
-vault-client = { path = "client" }
+vault-client.workspace = true
 alloy-sol-types.workspace = true
