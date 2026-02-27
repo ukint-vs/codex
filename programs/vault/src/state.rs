@@ -5,11 +5,28 @@ use sails_rs::prelude::*;
 #[derive(Clone, Debug, Encode, Decode, TypeInfo)]
 #[codec(crate = sails_rs::scale_codec)]
 #[scale_info(crate = sails_rs::scale_info)]
-pub struct QuarantinedDeposit {
-    pub user: Address,
+pub struct QuarantineEntry {
     pub amount: u128,
-    pub deposit_timestamp: u64,
     pub release_timestamp: u64,
+}
+
+#[derive(Clone, Debug, Encode, Decode, TypeInfo)]
+#[codec(crate = sails_rs::scale_codec)]
+#[scale_info(crate = sails_rs::scale_info)]
+pub struct UserBalance {
+    /// Total user balance in the vault, including quarantined funds.
+    pub amount: u128,
+    /// Quarantined sub-balances locked for `transfer_to_market`.
+    pub quarantined: Vec<QuarantineEntry>,
+}
+
+impl Default for UserBalance {
+    fn default() -> Self {
+        Self {
+            amount: 0,
+            quarantined: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Encode, Decode, TypeInfo)]
@@ -26,10 +43,8 @@ pub struct WithdrawalRequest {
 pub struct VaultState {
     /// Token this Vault manages (e.g. USDC address)
     pub token: TokenId,
-    /// User available balances
-    pub balances: BTreeMap<Address, u128>,
-    /// Deposits waiting for quarantine period
-    pub quarantined_deposits: Vec<QuarantinedDeposit>,
+    /// Per-user total balances and quarantine entries.
+    pub balances: BTreeMap<Address, UserBalance>,
     /// Authorized Orderbook programs
     pub registered_orderbooks: BTreeSet<Address>,
     /// Pending withdrawal requests

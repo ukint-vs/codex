@@ -10,7 +10,7 @@ A decentralized Central Limit Order Book (CLOB) with a Gear/Vara matching engine
 - **Router/Mirror (`VAR_ETH_PROGRAM`):** Sails-compatible program address that accepts `sendMessage` from L1 and routes it to Gear programs.
 
 ### L2 (Gear)
-- **Vault program (`programs/vault`):** Balance ledger with available/reserved funds, fee treasury, and cross-chain release calls.
+- **Vault program (`programs/vault`):** Per-user total balances, lazy quarantine checks in `transfer_to_market`, transit-lock accounting, and fee treasury.
 - **OrderBook program (`programs/orderbook`):** Matching engine and order lifecycle.
 - **Registry program (`programs/registry`):** Maps (base, quote) pairs to orderbook/vault actors.
 - **Common types (`libraries/clob-common`):** Shared types and pricing helpers.
@@ -46,6 +46,11 @@ A decentralized Central Limit Order Book (CLOB) with a Gear/Vara matching engine
 - **Per-Token Daily Limits:** Optional caps on withdrawals.
 - **Emergency Pause:** Owner can halt `releaseFunds`.
 - **Force Exit:** Users can initiate a force exit with a 7-day delay; `Vault` can cancel it via `cancelForceExit`. See [docs/ASSET_SAFETY.md](docs/ASSET_SAFETY.md) for details.
+
+## Vault Quarantine Model
+- Deposits always increase a user's total vault balance immediately.
+- With non-zero quarantine, spendability is restricted only in `transfer_to_market`.
+- Quarantine release is evaluated lazily for the caller during `transfer_to_market`.
 
 ### ⚠️ Warning: State Desynchronization Risk
 If `releaseFunds` reverts on Ethereum (e.g., daily limit reached), Gear balances have already been decremented by `eth_withdraw`. There is no automated rollback today; users must check limits before withdrawing.

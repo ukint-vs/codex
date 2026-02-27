@@ -5,7 +5,7 @@ This document describes the current on-chain implementation in `programs/` and `
 ## Components
 
 - **OrderBook program (Gear):** Matching engine + order lifecycle. `programs/orderbook`.
-- **Vault program (Gear):** Balance ledger, reserve/unlock/settle, and L1 release calls. `programs/vault`.
+- **Vault program (Gear):** Per-user balance ledger with lazy quarantine checks during `TransferToMarket`, transit-lock accounting, and L1 release calls. `programs/vault`.
 - **Registry program (Gear):** Maps market pairs to OrderBook/Vault actors. `programs/registry`.
 - **OrderbookCaller (Ethereum):** L1 entrypoint for placing/canceling orders on Gear. `ethereum/src/Orderbook.sol`.
 - **VaultCaller (Ethereum):** L1 vault that holds ERC-20s and bridges deposits/withdrawals. `ethereum/src/Vault.sol`.
@@ -94,6 +94,12 @@ pub struct Order {
 - Used for cost rounding via `mul_div_ceil`.
 
 ## Vault (Gear)
+
+### Quarantine Semantics (Current)
+
+- Deposits immediately increase the user's total balance.
+- Quarantine is tracked per user and enforced only in `TransferToMarket`.
+- Matured quarantine entries are released lazily when the caller invokes `TransferToMarket`.
 
 ### State
 

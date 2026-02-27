@@ -47,6 +47,44 @@ pub struct VaultProgram {
     state: RefCell<VaultState>,
 }
 
+fn quarantined_total(entries: &[QuarantineEntry]) -> u128 {
+    entries
+        .iter()
+        .try_fold(0u128, |acc, entry| acc.checked_add(entry.amount))
+        .expect("MathOverflow")
+}
+
+fn transfer_available(balance: &UserBalance) -> u128 {
+    balance
+        .amount
+        .saturating_sub(quarantined_total(&balance.quarantined))
+}
+
+fn quarantine_release_events(
+    total_balance: u128,
+    matured: &[QuarantineEntry],
+    active_after: u128,
+) -> Vec<(u128, u128)> {
+    let matured_total = quarantined_total(matured);
+    let active_before = active_after
+        .checked_add(matured_total)
+        .expect("MathOverflow");
+
+    let mut released_so_far = 0u128;
+    let mut released_events = Vec::with_capacity(matured.len());
+    for released in matured {
+        released_so_far = released_so_far
+            .checked_add(released.amount)
+            .expect("MathOverflow");
+        let active_quarantine_now = active_before
+            .checked_sub(released_so_far)
+            .expect("MathOverflow");
+        let balance_after = total_balance.saturating_sub(active_quarantine_now);
+        released_events.push((released.amount, balance_after));
+    }
+    released_events
+}
+
 #[program]
 impl VaultProgram {
     #[export]
@@ -93,45 +131,51 @@ impl<'a, G> VaultService<'a, G>
 where
     G: MarketGateway,
 {
-    fn release_matured_quarantine(&self) {
+    fn release_matured_quarantine_for_user(&self, user: Address) {
         let now = Syscall::block_timestamp();
-        let mut state = self.get_mut();
-        if state.quarantined_deposits.is_empty() {
-            return;
-        }
+        let (token, released_events) = {
+            let mut state = self.get_mut();
+            let token = state.token;
+            let Some(balance) = state.balances.get_mut(&user) else {
+                return;
+            };
+            if balance.quarantined.is_empty() {
+                return;
+            }
 
-        let token = state.token;
-        let matured_count = state
-            .quarantined_deposits
-            .partition_point(|q| q.release_timestamp <= now);
-        if matured_count == 0 {
-            return;
-        }
+            let matured_count = balance
+                .quarantined
+                .partition_point(|q| q.release_timestamp <= now);
+            if matured_count == 0 {
+                return;
+            }
 
-        let matured: Vec<_> = state.quarantined_deposits.drain(..matured_count).collect();
-        for q in matured {
-            let balance = state.balances.entry(q.user).or_default();
-            *balance = balance.checked_add(q.amount).expect("MathOverflow");
-            let balance_after = *balance;
+            let matured: Vec<_> = balance.quarantined.drain(..matured_count).collect();
+            let active_after = quarantined_total(&balance.quarantined);
+            let released_events = quarantine_release_events(balance.amount, &matured, active_after);
+            (token, released_events)
+        };
 
+        for (amount, balance_after) in released_events {
             self.emit_eth_event(Events::QuarantineReleased {
-                user: q.user,
+                user,
                 token,
-                amount: q.amount,
+                amount,
                 balance_after,
             })
             .expect("EmitEventFailed");
             let mut emitter = self.emitter();
             emitter
                 .emit_event(Events::QuarantineReleased {
-                    user: q.user,
+                    user,
                     token,
-                    amount: q.amount,
+                    amount,
                     balance_after,
                 })
                 .expect("EmitEventFailed");
         }
     }
+
     // Admin function to authorize an OrderBook program
     #[export]
     pub fn add_market(&mut self, program_id: Address) {
@@ -213,13 +257,12 @@ where
     fn vault_deposit_unchecked(&mut self, user: Address, amount: u128) {
         let mut state = self.get_mut();
         let token = state.token;
+        let quarantine_period = state.quarantine_period;
+        let balance = state.balances.entry(user).or_default();
+        balance.amount = balance.amount.checked_add(amount).expect("MathOverflow");
+        let balance_after = balance.amount;
 
-        if state.quarantine_period == 0 {
-            let balance = state.balances.entry(user).or_default();
-            *balance = balance.checked_add(amount).expect("MathOverflow");
-            let balance_after = *balance;
-
-            // Emitting event with token
+        if quarantine_period == 0 {
             self.emit_eth_event(Events::Deposit {
                 user,
                 token,
@@ -238,17 +281,14 @@ where
                 .expect("EmitEventFailed");
         } else {
             let now = Syscall::block_timestamp();
-            let quarantine_period = state.quarantine_period;
             let release_timestamp = now.saturating_add(quarantine_period);
-            let idx = state
-                .quarantined_deposits
+            let idx = balance
+                .quarantined
                 .partition_point(|q| q.release_timestamp <= release_timestamp);
-            state.quarantined_deposits.insert(
+            balance.quarantined.insert(
                 idx,
-                QuarantinedDeposit {
-                    user,
+                QuarantineEntry {
                     amount,
-                    deposit_timestamp: now,
                     release_timestamp,
                 },
             );
@@ -258,7 +298,6 @@ where
     #[export]
     pub fn vault_withdraw(&mut self, user: Address, amount: u128) {
         self.ensure_authorized_program_or_user(user);
-        self.release_matured_quarantine();
         self.vault_withdraw_unchecked(user, amount);
     }
 
@@ -267,11 +306,11 @@ where
         let token = state.token;
         let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-        if *balance < amount {
+        if balance.amount < amount {
             panic!("InsufficientBalance");
         }
 
-        *balance = balance.checked_sub(amount).expect("MathOverflow");
+        balance.amount = balance.amount.checked_sub(amount).expect("MathOverflow");
 
         self.emit_eth_event(Events::Withdrawal {
             user,
@@ -295,21 +334,20 @@ where
     pub async fn transfer_to_market(&mut self, market_id: Address, amount: u128) {
         let user = Syscall::message_source().into();
         self.ensure_authorized_program_or_user(user);
-        self.release_matured_quarantine();
+        self.release_matured_quarantine_for_user(user);
         let token = {
             let mut state = self.get_mut();
             if !state.registered_orderbooks.contains(&market_id) {
                 panic!("UnauthorizedMarket");
             }
 
-            // 1. Verify and deduct balance
             let balance = state.balances.get_mut(&user).expect("UserNotFound");
-
-            if *balance < amount {
+            let transferable = transfer_available(balance);
+            if transferable < amount {
                 panic!("InsufficientBalance");
             }
 
-            *balance = balance.checked_sub(amount).expect("MathOverflow");
+            balance.amount = balance.amount.checked_sub(amount).expect("MathOverflow");
             state.token
         };
 
@@ -321,21 +359,24 @@ where
         if result.is_err() {
             let mut state = self.get_mut();
             let balance = state.balances.get_mut(&user).expect("UserNotFound");
-            *balance += amount;
+            balance.amount = balance.amount.checked_add(amount).expect("MathOverflow");
         }
     }
 
     #[export]
     pub fn vault_force_exit(&mut self, user: Address, amount: u128) {
         self.ensure_authorized_program_or_user(user);
-        self.release_matured_quarantine();
         let mut state = self.get_mut();
         let token = state.token;
         let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-        let to_deduct = if *balance < amount { *balance } else { amount };
+        let to_deduct = if balance.amount < amount {
+            balance.amount
+        } else {
+            amount
+        };
 
-        *balance = balance.checked_sub(to_deduct).expect("MathOverflow");
+        balance.amount = balance.amount.checked_sub(to_deduct).expect("MathOverflow");
 
         self.emit_eth_event(Events::Withdrawal {
             user,
@@ -371,6 +412,6 @@ where
     #[export]
     pub fn get_balance(&self, user: Address) -> u128 {
         let state = self.get();
-        state.balances.get(&user).copied().unwrap_or(0)
+        state.balances.get(&user).map(|b| b.amount).unwrap_or(0)
     }
 }

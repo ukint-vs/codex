@@ -1,16 +1,18 @@
 use crate::orderbook_client::ob_client::orderbook::io::Deposit as ObDepositCall;
 use crate::{
     market_gateway::MarketGateway,
-    state::{QuarantinedDeposit, VaultState},
+    state::{QuarantineEntry, UserBalance, VaultState},
     VaultService,
 };
 use dex_common::Address;
 use sails_rs::gstd::services::Service;
+use sails_rs::prelude::*;
 use sails_rs::{
     cell::RefCell,
     client::{GstdEnv, PendingCall},
     ActorId, Syscall,
 };
+
 pub const ADMIN_ID: Address = Address::from_bytes([21u8; 20]);
 pub const TOKEN_ID: Address = Address::from_bytes([20u8; 20]);
 pub const USER_ID: Address = Address::from_bytes([7u8; 20]);
@@ -19,8 +21,23 @@ pub const MARKET_ID: Address = Address::from_bytes([5u8; 20]);
 pub fn admin() -> ActorId {
     ActorId::from(ADMIN_ID)
 }
+
 pub fn user() -> ActorId {
     ActorId::from(USER_ID)
+}
+
+fn user_balance(amount: u128) -> UserBalance {
+    UserBalance {
+        amount,
+        quarantined: Vec::new(),
+    }
+}
+
+fn quarantine(amount: u128, release_timestamp: u64) -> QuarantineEntry {
+    QuarantineEntry {
+        amount,
+        release_timestamp,
+    }
 }
 
 fn fresh_state() -> RefCell<VaultState> {
@@ -68,31 +85,24 @@ impl MarketGateway for MockMarketGateway {
 
 #[test]
 fn add_market() {
-    let state = RefCell::new(VaultState {
-        admin: Some(ADMIN_ID),
-        token: TOKEN_ID,
-        ..Default::default()
-    });
-
+    let state = fresh_state();
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
     let program_id = Address::from_bytes([5u8; 20]);
     Syscall::with_message_source(admin());
     vault.add_market(program_id);
-    assert!(vault.is_authorized(program_id))
+    assert!(vault.is_authorized(program_id));
 }
 
 #[test]
 #[should_panic(expected = "Unauthorized: Not Admin")]
 fn add_market_wrong_admin() {
     let state = fresh_state();
-
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
-    let program_id = Address::from_bytes([5u8; 20]);
     let wrong_admin = ActorId::from(1000);
     Syscall::with_message_source(wrong_admin);
-    vault.add_market(program_id);
+    vault.add_market(MARKET_ID);
 }
 
 #[test]
@@ -116,6 +126,7 @@ fn update_fee_rate_wrong_admin_panics() {
     Syscall::with_message_source(wrong_admin);
     vault.update_fee_rate(500);
 }
+
 #[test]
 #[should_panic(expected = "InvalidRate")]
 fn update_fee_rate_invalid_rate_panics() {
@@ -155,10 +166,12 @@ async fn transfer_to_market_panics_if_market_not_registered() {
     let gateway = MockMarketGateway::new(Mode::Ok);
     let mut vault = VaultService::new(&state, gateway).expose(&[]);
 
-    state.borrow_mut().balances.insert(USER_ID, 100);
+    state
+        .borrow_mut()
+        .balances
+        .insert(USER_ID, user_balance(100));
 
     Syscall::with_message_source(user());
-
     vault.transfer_to_market(MARKET_ID, 10).await;
 }
 
@@ -172,7 +185,7 @@ async fn transfer_to_market_insufficient_balance_panics() {
     Syscall::with_message_source(admin());
     vault.add_market(MARKET_ID);
 
-    state.borrow_mut().balances.insert(USER_ID, 5);
+    state.borrow_mut().balances.insert(USER_ID, user_balance(5));
 
     Syscall::with_message_source(user());
     vault.transfer_to_market(MARKET_ID, 10).await;
@@ -187,51 +200,90 @@ async fn transfer_to_market_ok_deducts_balance_calls_gateway() {
     Syscall::with_message_source(admin());
     vault.add_market(MARKET_ID);
 
-    state.borrow_mut().balances.insert(USER_ID, 100);
+    state
+        .borrow_mut()
+        .balances
+        .insert(USER_ID, user_balance(100));
 
     Syscall::with_message_source(user());
     vault.transfer_to_market(MARKET_ID, 40).await;
 
-    assert_eq!(state.borrow().balances.get(&USER_ID).copied().unwrap(), 60);
+    assert_eq!(state.borrow().balances.get(&USER_ID).unwrap().amount, 60);
 }
 
 #[tokio::test]
 async fn transfer_to_market_releases_matured_quarantine_before_spend() {
     let state = fresh_state();
-
-    // now = 1_000
     Syscall::with_block_timestamp(1_000);
 
     {
         let mut s = state.borrow_mut();
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 50,
-            deposit_timestamp: 10,
-            release_timestamp: 999,
-        });
+        s.balances.insert(
+            USER_ID,
+            UserBalance {
+                amount: 50,
+                quarantined: vec![quarantine(50, 999)],
+            },
+        );
     }
+
     let gateway = MockMarketGateway::new(Mode::Ok);
     let mut vault = VaultService::new(&state, gateway).expose(&[]);
 
     Syscall::with_message_source(admin());
     vault.add_market(MARKET_ID);
 
-    // balance before release = 0
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        0
-    );
-
     Syscall::with_message_source(user());
     vault.transfer_to_market(MARKET_ID, 50).await;
 
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        0
-    );
+    let balance = state.borrow().balances.get(&USER_ID).unwrap().clone();
+    assert_eq!(balance.amount, 0);
+    assert!(balance.quarantined.is_empty());
+}
 
-    assert!(state.borrow().quarantined_deposits.is_empty());
+#[tokio::test]
+async fn transfer_to_market_releases_only_caller_quarantine() {
+    let state = fresh_state();
+    Syscall::with_block_timestamp(1_000);
+
+    let user2 = Address::from_bytes([8u8; 20]);
+    {
+        let mut s = state.borrow_mut();
+        s.balances.insert(
+            USER_ID,
+            UserBalance {
+                amount: 11,
+                quarantined: vec![quarantine(11, 999)],
+            },
+        );
+        s.balances.insert(
+            user2,
+            UserBalance {
+                amount: 22,
+                quarantined: vec![quarantine(22, 999)],
+            },
+        );
+    }
+
+    let gateway = MockMarketGateway::new(Mode::Ok);
+    let mut vault = VaultService::new(&state, gateway).expose(&[]);
+
+    Syscall::with_message_source(admin());
+    vault.add_market(MARKET_ID);
+
+    Syscall::with_message_source(user());
+    vault.transfer_to_market(MARKET_ID, 11).await;
+
+    let s = state.borrow();
+    let user1_balance = s.balances.get(&USER_ID).unwrap();
+    let user2_balance = s.balances.get(&user2).unwrap();
+
+    assert_eq!(user1_balance.amount, 0);
+    assert!(user1_balance.quarantined.is_empty());
+
+    assert_eq!(user2_balance.amount, 22);
+    assert_eq!(user2_balance.quarantined.len(), 1);
+    assert_eq!(user2_balance.quarantined[0].amount, 22);
 }
 
 #[tokio::test]
@@ -241,24 +293,17 @@ async fn transfer_to_market_releases_only_matured_prefix() {
 
     {
         let mut s = state.borrow_mut();
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 10,
-            deposit_timestamp: 10,
-            release_timestamp: 900,
-        });
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 20,
-            deposit_timestamp: 10,
-            release_timestamp: 1_000,
-        });
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 30,
-            deposit_timestamp: 10,
-            release_timestamp: 1_001,
-        });
+        s.balances.insert(
+            USER_ID,
+            UserBalance {
+                amount: 60,
+                quarantined: vec![
+                    quarantine(10, 900),
+                    quarantine(20, 1_000),
+                    quarantine(30, 1_001),
+                ],
+            },
+        );
     }
 
     let gateway = MockMarketGateway::new(Mode::Ok);
@@ -270,13 +315,65 @@ async fn transfer_to_market_releases_only_matured_prefix() {
     Syscall::with_message_source(user());
     vault.transfer_to_market(MARKET_ID, 30).await;
 
-    // Balance is 0,  30 in quarantine
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        0
-    );
-    assert_eq!(state.borrow().quarantined_deposits.len(), 1);
-    assert_eq!(state.borrow().quarantined_deposits[0].amount, 30);
+    let balance = state.borrow().balances.get(&USER_ID).unwrap().clone();
+    assert_eq!(balance.amount, 30);
+    assert_eq!(balance.quarantined.len(), 1);
+    assert_eq!(balance.quarantined[0].amount, 30);
+    assert_eq!(balance.quarantined[0].release_timestamp, 1_001);
+}
+
+#[tokio::test]
+#[should_panic(expected = "InsufficientBalance")]
+async fn transfer_to_market_blocks_amount_above_transferable_with_unmatured_quarantine() {
+    let state = fresh_state();
+    Syscall::with_block_timestamp(1_000);
+
+    {
+        let mut s = state.borrow_mut();
+        s.balances.insert(
+            USER_ID,
+            UserBalance {
+                amount: 100,
+                quarantined: vec![quarantine(50, 2_000)],
+            },
+        );
+    }
+
+    let gateway = MockMarketGateway::new(Mode::Ok);
+    let mut vault = VaultService::new(&state, gateway).expose(&[]);
+
+    Syscall::with_message_source(admin());
+    vault.add_market(MARKET_ID);
+
+    Syscall::with_message_source(user());
+    vault.transfer_to_market(MARKET_ID, 60).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "InsufficientBalance")]
+async fn transfer_to_market_over_quarantined_balance_does_not_overflow() {
+    let state = fresh_state();
+    Syscall::with_block_timestamp(1_000);
+
+    {
+        let mut s = state.borrow_mut();
+        s.balances.insert(
+            USER_ID,
+            UserBalance {
+                amount: 50,
+                quarantined: vec![quarantine(30, 2_000), quarantine(40, 2_100)],
+            },
+        );
+    }
+
+    let gateway = MockMarketGateway::new(Mode::Ok);
+    let mut vault = VaultService::new(&state, gateway).expose(&[]);
+
+    Syscall::with_message_source(admin());
+    vault.add_market(MARKET_ID);
+
+    Syscall::with_message_source(user());
+    vault.transfer_to_market(MARKET_ID, 1).await;
 }
 
 #[tokio::test]
@@ -288,7 +385,10 @@ async fn transfer_to_market_gateway_error_balance_doesnt_change() {
     Syscall::with_message_source(admin());
     vault.add_market(MARKET_ID);
 
-    state.borrow_mut().balances.insert(USER_ID, 100);
+    state
+        .borrow_mut()
+        .balances
+        .insert(USER_ID, user_balance(100));
 
     Syscall::with_message_source(user());
     vault.transfer_to_market(MARKET_ID, 10).await;
@@ -322,7 +422,7 @@ fn vault_withdraw_user_not_found_panics() {
 #[should_panic(expected = "InsufficientBalance")]
 fn vault_withdraw_insufficient_balance_panics() {
     let state = fresh_state();
-    state.borrow_mut().balances.insert(USER_ID, 5);
+    state.borrow_mut().balances.insert(USER_ID, user_balance(5));
 
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
@@ -333,135 +433,60 @@ fn vault_withdraw_insufficient_balance_panics() {
 #[test]
 fn vault_withdraw_user_succeeds_and_deducts_balance() {
     let state = fresh_state();
-    state.borrow_mut().balances.insert(USER_ID, 100);
+    state
+        .borrow_mut()
+        .balances
+        .insert(USER_ID, user_balance(100));
 
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
     Syscall::with_message_source(user());
     vault.vault_withdraw(USER_ID, 40);
 
-    let balance = vault.get_balance(USER_ID);
-    assert_eq!(balance, 60);
+    assert_eq!(vault.get_balance(USER_ID), 60);
 }
 
 #[test]
 fn vault_withdraw_authorized_market_can_withdraw_for_user() {
     let state = fresh_state();
-    state.borrow_mut().balances.insert(USER_ID, 100);
+    state
+        .borrow_mut()
+        .balances
+        .insert(USER_ID, user_balance(100));
 
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
-    // authorize market
     Syscall::with_message_source(admin());
     vault.add_market(MARKET_ID);
 
-    // caller = MARKET_ID (authorized program), withdraw for USER_ID
     Syscall::with_message_source(ActorId::from(MARKET_ID));
     vault.vault_withdraw(USER_ID, 20);
 
-    assert_eq!(state.borrow().balances.get(&USER_ID).copied().unwrap(), 80);
+    assert_eq!(state.borrow().balances.get(&USER_ID).unwrap().amount, 80);
 }
 
 #[test]
-fn vault_withdraw_releases_matured_quarantine_then_withdraws() {
+fn vault_withdraw_does_not_release_matured_quarantine() {
     let state = fresh_state();
     Syscall::with_block_timestamp(1_000);
 
-    state
-        .borrow_mut()
-        .quarantined_deposits
-        .push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 50,
-            deposit_timestamp: 10,
-            release_timestamp: 999,
-        });
+    state.borrow_mut().balances.insert(
+        USER_ID,
+        UserBalance {
+            amount: 100,
+            quarantined: vec![quarantine(50, 999)],
+        },
+    );
 
     let mut vault = VaultService::new(&state, MockMarketGateway::new(Mode::Ok)).expose(&[]);
 
     Syscall::with_message_source(user());
-    vault.vault_withdraw(USER_ID, 50);
+    vault.vault_withdraw(USER_ID, 40);
 
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        0
-    );
-    assert!(state.borrow().quarantined_deposits.is_empty());
-}
-
-#[tokio::test]
-async fn transfer_to_market_does_not_release_unmatured_quarantine() {
-    let state = fresh_state();
-    Syscall::with_block_timestamp(1_000);
-
-    state
-        .borrow_mut()
-        .quarantined_deposits
-        .push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 50,
-            deposit_timestamp: 10,
-            release_timestamp: 2_000,
-        });
-
-    let gateway = MockMarketGateway::new(Mode::Ok);
-    let mut vault = VaultService::new(&state, gateway).expose(&[]);
-
-    Syscall::with_message_source(admin());
-    vault.add_market(MARKET_ID);
-
-    // balance for transfer
-    state.borrow_mut().balances.insert(USER_ID, 100);
-
-    Syscall::with_message_source(user());
-    vault.transfer_to_market(MARKET_ID, 10).await;
-
-    assert_eq!(state.borrow().balances.get(&USER_ID).copied().unwrap(), 90);
-    assert_eq!(state.borrow().quarantined_deposits.len(), 1);
-    assert_eq!(state.borrow().quarantined_deposits[0].amount, 50);
-}
-
-#[tokio::test]
-async fn release_matured_quarantine_releases_for_multiple_users_on_any_callsite() {
-    let state = fresh_state();
-    Syscall::with_block_timestamp(1_000);
-
-    let user2: Address = Address::from_bytes([8u8; 20]);
-
-    {
-        let mut s = state.borrow_mut();
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: USER_ID,
-            amount: 11,
-            deposit_timestamp: 1,
-            release_timestamp: 999,
-        });
-        s.quarantined_deposits.push(QuarantinedDeposit {
-            user: user2,
-            amount: 22,
-            deposit_timestamp: 2,
-            release_timestamp: 999,
-        });
-    }
-
-    let gateway = MockMarketGateway::new(Mode::Ok);
-    let mut vault = VaultService::new(&state, gateway).expose(&[]);
-
-    Syscall::with_message_source(admin());
-    vault.add_market(MARKET_ID);
-
-    Syscall::with_message_source(user());
-    vault.transfer_to_market(MARKET_ID, 0).await;
-
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        11
-    );
-    assert_eq!(
-        state.borrow().balances.get(&user2).copied().unwrap_or(0),
-        22
-    );
-    assert!(state.borrow().quarantined_deposits.is_empty());
+    let balance = state.borrow().balances.get(&USER_ID).unwrap().clone();
+    assert_eq!(balance.amount, 60);
+    assert_eq!(balance.quarantined.len(), 1);
+    assert_eq!(balance.quarantined[0].amount, 50);
 }
 
 #[test]
@@ -472,11 +497,11 @@ fn vault_deposit_allows_admin_via_ensure_authorized_program() {
     Syscall::with_message_source(admin());
     vault.vault_deposit(USER_ID, 123);
 
-    assert_eq!(state.borrow().balances.get(&USER_ID).copied().unwrap(), 123);
+    assert_eq!(state.borrow().balances.get(&USER_ID).unwrap().amount, 123);
 }
 
 #[test]
-fn vault_deposit_with_quarantine_inserts_quarantined_deposit() {
+fn vault_deposit_with_quarantine_tracks_entry_and_total() {
     let state = fresh_state();
     state.borrow_mut().quarantine_period = 100;
 
@@ -486,17 +511,11 @@ fn vault_deposit_with_quarantine_inserts_quarantined_deposit() {
     Syscall::with_message_source(admin());
     vault.vault_deposit(USER_ID, 42);
 
-    let q = &state.borrow().quarantined_deposits;
-    assert_eq!(q.len(), 1);
-    assert_eq!(q[0].user, USER_ID);
-    assert_eq!(q[0].amount, 42);
-    assert_eq!(q[0].deposit_timestamp, 1_000);
-    assert_eq!(q[0].release_timestamp, 1_100);
-
-    assert_eq!(
-        state.borrow().balances.get(&USER_ID).copied().unwrap_or(0),
-        0
-    );
+    let balance = state.borrow().balances.get(&USER_ID).unwrap().clone();
+    assert_eq!(balance.amount, 42);
+    assert_eq!(balance.quarantined.len(), 1);
+    assert_eq!(balance.quarantined[0].amount, 42);
+    assert_eq!(balance.quarantined[0].release_timestamp, 1_100);
 }
 
 #[test]
