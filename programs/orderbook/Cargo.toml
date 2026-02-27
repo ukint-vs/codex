@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+mockall = { workspace = true, optional = true }
 sails-rs = { workspace = true, features = ["ethexe", "debug"] }
 dex-common.workspace = true
 vault-client.workspace = true
 intrusive-arena.workspace = true
 matching-engine.workspace = true
+gstd.workspace = true
 
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
@@ -17,4 +19,5 @@ sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
 insta.workspace = true
 sails-rs = { workspace = true, features = ["ethexe", "gtest", "idl-gen"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
-orderbook-client.workspace = true
+orderbook-client = { workspace = true }
+vault-client = { workspace = true, features = ["mocks"]}

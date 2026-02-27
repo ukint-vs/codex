@@ -1,24 +1,39 @@
 #![no_std]
 use dex_common::{Address, TokenId};
 use matching_engine::{Book, IncomingOrder, MatchError, OrderId, Side};
-use sails_rs::{
-    cell::RefCell,
-    gstd::{debug, msg},
-    prelude::*,
-};
+use sails_rs::{cell::RefCell, client::*, gstd::Syscall, prelude::*};
 
 use crate::state::{kind_from_io, side_from_io, Asset, OrderKindIO, SideIO};
-use vault_client::vault::io as vault_io;
+use vault_client::{vault::Vault, *};
+
+use vault_client::vault::VaultImpl;
+use vault_client::Vault as VaultClient;
 mod orderbook;
 mod state;
 
-pub struct Orderbook<'a> {
-    state: &'a RefCell<state::State>,
-}
+#[cfg(test)]
+mod tests;
 
-impl<'a> Orderbook<'a> {
-    pub fn new(state: &'a RefCell<state::State>) -> Self {
-        Self { state }
+pub struct Orderbook<'a, BaseVaultClient, QuoteVaultClient> {
+    state: &'a RefCell<state::State>,
+    base_vault: BaseVaultClient,
+    quote_vault: QuoteVaultClient,
+}
+impl<'a, BaseVaultClient, QuoteVaultClient> Orderbook<'a, BaseVaultClient, QuoteVaultClient>
+where
+    BaseVaultClient: Vault<Env = GstdEnv>,
+    QuoteVaultClient: Vault<Env = GstdEnv>,
+{
+    pub fn new(
+        state: &'a RefCell<state::State>,
+        base_vault: BaseVaultClient,
+        quote_vault: QuoteVaultClient,
+    ) -> Self {
+        Self {
+            state,
+            base_vault,
+            quote_vault,
+        }
     }
 
     #[inline]
@@ -33,15 +48,15 @@ impl<'a> Orderbook<'a> {
 }
 
 #[sails_rs::service]
-impl<'a> Orderbook<'a> {
+impl<'a, BaseVaultClient, QuoteVaultClient> Orderbook<'a, BaseVaultClient, QuoteVaultClient>
+where
+    BaseVaultClient: Vault<Env = GstdEnv>,
+    QuoteVaultClient: Vault<Env = GstdEnv>,
+{
     #[export]
     pub fn deposit(&mut self, account: Address, token: TokenId, amount: u128) -> bool {
         let mut st = self.get_mut();
-        let caller: Address = msg::source().into();
-        debug!(
-            "Orderbook::deposit caller={:?} account={:?}",
-            caller, account
-        );
+        let caller: Address = Syscall::message_source().into();
         if token == st.base_token_id {
             if caller != st.base_vault_id {
                 panic!("Not allowed to deposit")
@@ -60,19 +75,15 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub async fn withdraw_base(&mut self, amount: u128) {
-        let caller: Address = msg::source().into();
-        let base_vault_id = {
+        let caller: Address = Syscall::message_source().into();
+        {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Base, U256::from(amount));
-            st.base_vault_id
         };
-        let payload = vault_io::VaultDeposit::encode_params_with_prefix(
-            "Vault",
-            vault_client::Address(caller.0),
-            amount,
-        );
-        let result = msg::send_bytes_for_reply(base_vault_id.into(), payload, 0)
-            .expect("SendFailed")
+
+        let result = self
+            .base_vault
+            .vault_deposit(vault_client::Address(caller.0), amount)
             .await;
 
         if result.is_err() {
@@ -83,19 +94,14 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub async fn withdraw_quote(&mut self, amount: u128) {
-        let caller: Address = msg::source().into();
-        let quote_vault_id = {
+        let caller: Address = Syscall::message_source().into();
+        {
             let mut st = self.get_mut();
             st.withdraw(caller, Asset::Quote, U256::from(amount));
-            st.quote_vault_id
         };
-        let payload = vault_io::VaultDeposit::encode_params_with_prefix(
-            "Vault",
-            vault_client::Address(caller.0),
-            amount,
-        );
-        let result = msg::send_bytes_for_reply(quote_vault_id.into(), payload, 0)
-            .expect("SendFailed")
+        let result = self
+            .quote_vault
+            .vault_deposit(vault_client::Address(caller.0), amount)
             .await;
 
         if result.is_err() {
@@ -115,7 +121,7 @@ impl<'a> Orderbook<'a> {
         amount_base: u128,
         max_quote: u128,
     ) -> Result<OrderId, MatchError> {
-        let caller = sails_rs::gstd::msg::source().into();
+        let caller = Syscall::message_source().into();
         let mut st = self.get_mut();
         let order_id = st.alloc_order_id();
 
@@ -137,7 +143,7 @@ impl<'a> Orderbook<'a> {
 
     #[export]
     pub fn cancel_order(&mut self, order_id: u64) {
-        let caller = msg::source().into();
+        let caller = Syscall::message_source().into();
         let mut st = self.get_mut();
 
         let Some(view) = st.book.peek_order(order_id) else {
@@ -213,6 +219,8 @@ impl<'a> Orderbook<'a> {
 
 #[derive(Default)]
 pub struct OrderBookProgram {
+    base_vault_id: Address,
+    quote_vault_id: Address,
     state: RefCell<state::State>,
 }
 
@@ -227,6 +235,8 @@ impl OrderBookProgram {
         max_preview_scans: u32,
     ) -> Self {
         Self {
+            base_vault_id,
+            quote_vault_id,
             state: RefCell::new(state::State::new(
                 base_vault_id,
                 quote_vault_id,
@@ -238,7 +248,9 @@ impl OrderBookProgram {
         }
     }
 
-    pub fn orderbook(&self) -> Orderbook<'_> {
-        Orderbook::new(&self.state)
+    pub fn orderbook(&self) -> Orderbook<'_, Service<VaultImpl>, Service<VaultImpl>> {
+        let base_vault = VaultProgram::client(self.base_vault_id.into()).vault();
+        let quote_vault = VaultProgram::client(self.quote_vault_id.into()).vault();
+        Orderbook::new(&self.state, base_vault, quote_vault)
     }
 }

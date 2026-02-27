@@ -30,8 +30,6 @@ pub struct VaultState {
     pub balances: BTreeMap<Address, u128>,
     /// Deposits waiting for quarantine period
     pub quarantined_deposits: Vec<QuarantinedDeposit>,
-    /// Funds currently moving between Vault and Orderbook
-    pub locked_in_transit: BTreeMap<(Address, Address), u128>,
     /// Authorized Orderbook programs
     pub registered_orderbooks: BTreeSet<Address>,
     /// Pending withdrawal requests
@@ -40,8 +38,6 @@ pub struct VaultState {
     pub quarantine_period: u64,
     /// Admin
     pub admin: Option<Address>,
-    /// Treasury for fees - kept from original (implied)
-    pub treasury: u128,
     /// Fee rate in BPS
     pub fee_rate_bps: u128,
 }

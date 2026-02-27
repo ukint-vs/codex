@@ -3983,9 +3983,11 @@ name = "orderbook"
 version = "0.1.0"
 dependencies = [
  "dex-common",
+ "gstd",
  "insta",
  "intrusive-arena",
  "matching-engine",
+ "mockall",
  "orderbook-client",
  "sails-rs",
  "tokio",
@@ -6686,7 +6688,11 @@ version = "0.1.0"
 dependencies = [
  "alloy-sol-types 0.8.26",
  "dex-common",
+ "gstd",
  "insta",
+ "mockall",
+ "sails-client-gen",
+ "sails-idl-gen",
  "sails-rs",
  "tokio",
  "vault-client",

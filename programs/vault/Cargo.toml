@@ -4,15 +4,20 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+mockall = { workspace = true, optional = true }
 sails-rs = { workspace = true, features = ["ethexe", "debug"] }
 dex-common.workspace = true
 alloy-sol-types.workspace = true
+gstd.workspace = true
 
 [features]
 debug = []
+mocks = ["sails-rs/mockall", "dep:mockall"]
 
 [build-dependencies]
 sails-rs = { workspace = true, features = ["ethexe", "wasm-builder"] }
+sails-client-gen.workspace = true
+sails-idl-gen.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

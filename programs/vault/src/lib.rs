@@ -1,10 +1,16 @@
 #![no_std]
 
 use dex_common::{Address, TokenId};
-use sails_rs::{cell::RefCell, gstd::debug, gstd::exec, gstd::msg, prelude::*};
+use sails_rs::{cell::RefCell, gstd::Syscall, prelude::*};
 
 mod state;
 use state::*;
+
+mod market_gateway;
+mod orderbook_client;
+#[cfg(test)]
+mod tests;
+use crate::market_gateway::{MarketGateway, SailsMarketGateway};
 
 // --- Events ---
 
@@ -41,40 +47,11 @@ pub struct VaultProgram {
     state: RefCell<VaultState>,
 }
 
-fn reply_ok() {
-    // Empty reply is enough for callers; depositless on ethexe.
-    msg::reply((), 0).expect("ReplyFailed");
-}
-
-fn locked_balance_of(state: &VaultState, user: Address) -> u128 {
-    let in_transit = state
-        .locked_in_transit
-        .iter()
-        .filter(|((u, _), _)| *u == user)
-        .try_fold(0u128, |acc, (_, amount)| acc.checked_add(*amount))
-        .expect("MathOverflow");
-    in_transit
-}
-
-fn decode_orderbook_deposit_ack(reply: &[u8]) -> bool {
-    let mut wrapped = reply;
-    if let Ok((service, method, ack)) = <(String, String, bool)>::decode(&mut wrapped) {
-        return wrapped.is_empty() && service == "Orderbook" && method == "Deposit" && ack;
-    }
-
-    let mut raw = reply;
-    if let Ok(ack) = bool::decode(&mut raw) {
-        return raw.is_empty() && ack;
-    }
-
-    false
-}
-
 #[program]
 impl VaultProgram {
     #[export]
     pub fn create(token_id: Address) -> Self {
-        let source = sails_rs::gstd::msg::source().into();
+        let source = Syscall::message_source().into();
         let state = VaultState {
             admin: Some(source),
             token: token_id,
@@ -85,18 +62,19 @@ impl VaultProgram {
         }
     }
 
-    pub fn vault(&self) -> VaultService<'_> {
-        VaultService::new(&self.state)
+    pub fn vault(&self) -> VaultService<'_, SailsMarketGateway> {
+        VaultService::new(&self.state, SailsMarketGateway)
     }
 }
 
-pub struct VaultService<'a> {
+pub struct VaultService<'a, G> {
     state: &'a RefCell<VaultState>,
+    gateway: G,
 }
 
-impl<'a> VaultService<'a> {
-    pub fn new(state: &'a RefCell<VaultState>) -> Self {
-        Self { state }
+impl<'a, G> VaultService<'a, G> {
+    pub fn new(state: &'a RefCell<VaultState>, gateway: G) -> Self {
+        Self { state, gateway }
     }
 
     #[inline]
@@ -111,9 +89,12 @@ impl<'a> VaultService<'a> {
 }
 
 #[service(events = Events)]
-impl<'a> VaultService<'a> {
+impl<'a, G> VaultService<'a, G>
+where
+    G: MarketGateway,
+{
     fn release_matured_quarantine(&self) {
-        let now = exec::block_timestamp();
+        let now = Syscall::block_timestamp();
         let mut state = self.get_mut();
         if state.quarantined_deposits.is_empty() {
             return;
@@ -155,76 +136,37 @@ impl<'a> VaultService<'a> {
     #[export]
     pub fn add_market(&mut self, program_id: Address) {
         let mut state = self.get_mut();
-        if state.admin != Some(sails_rs::gstd::msg::source().into()) {
+        if state.admin != Some(Syscall::message_source().into()) {
             panic!("Unauthorized: Not Admin");
         }
-        debug!(
-            "Vault::add_market caller={:?} program_id={:?}",
-            msg::source(),
-            program_id
-        );
         state.registered_orderbooks.insert(program_id);
-        reply_ok();
     }
 
     #[export]
     pub fn update_fee_rate(&mut self, new_rate: u128) {
         let mut state = self.get_mut();
-        if state.admin != Some(msg::source().into()) {
+        if state.admin != Some(Syscall::message_source().into()) {
             panic!("Unauthorized: Not Admin");
         }
         if new_rate > 10000 {
             panic!("InvalidRate");
         }
         state.fee_rate_bps = new_rate;
-        reply_ok();
     }
 
     #[export]
     pub fn set_quarantine_period(&mut self, period: u64) {
         let mut state = self.get_mut();
-        if state.admin != Some(msg::source().into()) {
+        if state.admin != Some(Syscall::message_source().into()) {
             panic!("Unauthorized: Not Admin");
         }
         state.quarantine_period = period;
-        reply_ok();
-    }
-
-    // Admin function to claim accumulated fees
-    #[export]
-    pub fn claim_fees(&mut self) {
-        let mut state = self.get_mut();
-
-        if state.admin != Some(msg::source().into()) {
-            panic!("Unauthorized: Not Admin");
-        }
-
-        let amount = state.treasury;
-        if amount == 0 {
-            // No fees to claim, return early to save gas/noise
-            return;
-        }
-        state.treasury = 0;
-
-        let token = state.token;
-        self.emit_eth_event(Events::FeesClaimed { token, amount })
-            .expect("EmitEventFailed");
-        let mut emitter = self.emitter();
-        emitter
-            .emit_event(Events::FeesClaimed { token, amount })
-            .expect("EmitEventFailed");
-        reply_ok();
     }
 
     fn ensure_authorized_program(&self) {
         let state = self.get();
-        let caller = msg::source().into();
-        debug!(
-            "Vault::ensure_authorized_program caller={:?} admin={:?} authorized_set={:?}",
-            caller,
-            state.admin,
-            state.registered_orderbooks.contains(&caller)
-        );
+        let caller = Syscall::message_source().into();
+
         if state.admin == Some(caller) {
             return;
         }
@@ -234,11 +176,8 @@ impl<'a> VaultService<'a> {
     }
 
     fn ensure_authorized_program_or_user(&self, user: Address) {
-        let caller: Address = msg::source().into();
-        debug!(
-            "Vault::ensure_authorized_program_or_user caller={:?} user={:?}",
-            caller, user
-        );
+        let caller: Address = Syscall::message_source().into();
+
         if caller == user {
             return;
         }
@@ -254,7 +193,7 @@ impl<'a> VaultService<'a> {
     /// Debug/testing helper to mint balance without requiring market/admin routing.
     /// Only available when compiled with the `debug` feature.
     #[export]
-    pub fn debug_deposit(&mut self, _user: ActorId, _amount: u128) {
+    pub fn debug_deposit(&mut self, _user: Address, _amount: u128) {
         #[cfg(not(feature = "debug"))]
         {
             panic!("DebugFeatureDisabled");
@@ -262,7 +201,7 @@ impl<'a> VaultService<'a> {
         #[cfg(feature = "debug")]
         {
             let state = self.get();
-            let caller = msg::source();
+            let caller = Syscall::message_source().into();
             if state.admin != Some(caller) && caller != _user {
                 panic!("UnauthorizedDebugDeposit");
             }
@@ -275,22 +214,10 @@ impl<'a> VaultService<'a> {
         let mut state = self.get_mut();
         let token = state.token;
 
-        debug!(
-            "Vault::vault_deposit caller={:?} user={:?} token={:?} amount={}",
-            sails_rs::gstd::msg::source(),
-            user,
-            token,
-            amount
-        );
         if state.quarantine_period == 0 {
             let balance = state.balances.entry(user).or_default();
             *balance = balance.checked_add(amount).expect("MathOverflow");
             let balance_after = *balance;
-
-            debug!(
-                "Vault::vaule_deposit_unchecked balance_after={:?}",
-                balance_after
-            );
 
             // Emitting event with token
             self.emit_eth_event(Events::Deposit {
@@ -310,7 +237,7 @@ impl<'a> VaultService<'a> {
                 })
                 .expect("EmitEventFailed");
         } else {
-            let now = exec::block_timestamp();
+            let now = Syscall::block_timestamp();
             let quarantine_period = state.quarantine_period;
             let release_timestamp = now.saturating_add(quarantine_period);
             let idx = state
@@ -326,7 +253,6 @@ impl<'a> VaultService<'a> {
                 },
             );
         }
-        reply_ok();
     }
 
     #[export]
@@ -363,12 +289,11 @@ impl<'a> VaultService<'a> {
                 status: "Initiated".into(),
             })
             .expect("EmitEventFailed");
-        reply_ok();
     }
 
     #[export]
     pub async fn transfer_to_market(&mut self, market_id: Address, amount: u128) {
-        let user = msg::source().into();
+        let user = Syscall::message_source().into();
         self.ensure_authorized_program_or_user(user);
         self.release_matured_quarantine();
         let token = {
@@ -380,73 +305,24 @@ impl<'a> VaultService<'a> {
             // 1. Verify and deduct balance
             let balance = state.balances.get_mut(&user).expect("UserNotFound");
 
-            debug!(
-                "Vault::transfer_to_market balance={:?} amount={:?} market={:?}",
-                balance, amount, market_id
-            );
-
             if *balance < amount {
                 panic!("InsufficientBalance");
             }
 
             *balance = balance.checked_sub(amount).expect("MathOverflow");
-            let in_transit = state
-                .locked_in_transit
-                .entry((user, market_id))
-                .or_insert(0);
-            *in_transit = in_transit.checked_add(amount).expect("MathOverflow");
             state.token
         };
 
-        // 2. Send deposit message to OrderBook using the current service envelope.
-        // Payload is ("Orderbook", "Deposit", (user, token, amount)).
-        let payload = ("Orderbook", "Deposit", (user, token, amount)).encode();
-
-        let result = msg::send_bytes_for_reply(ActorId::from(market_id), payload, 0)
-            .expect("SendFailed")
+        let result = self
+            .gateway
+            .deposit_to_market(market_id, user, token, amount)
             .await;
-        let deposit_acked = match result {
-            Ok(reply) => decode_orderbook_deposit_ack(&reply),
-            Err(err) => {
-                debug!("Vault::transfer_to_market error={:?}", err);
-                false
-            }
-        };
 
-        if !deposit_acked {
+        if result.is_err() {
             let mut state = self.get_mut();
             let balance = state.balances.get_mut(&user).expect("UserNotFound");
-            *balance = balance.checked_add(amount).expect("MathOverflow");
-
-            let key = (user, market_id);
-            let in_transit = state
-                .locked_in_transit
-                .get_mut(&key)
-                .expect("TransitMissing");
-            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
-            if *in_transit == 0 {
-                state.locked_in_transit.remove(&key);
-            }
-
-            debug!("OrderbookDepositFailed");
-            reply_ok();
-            return;
+            *balance += amount;
         }
-
-        {
-            let mut state = self.get_mut();
-            let key = (user, market_id);
-            let in_transit = state
-                .locked_in_transit
-                .get_mut(&key)
-                .expect("TransitMissing");
-            *in_transit = in_transit.checked_sub(amount).expect("MathOverflow");
-            if *in_transit == 0 {
-                state.locked_in_transit.remove(&key);
-            }
-        }
-
-        reply_ok();
     }
 
     #[export]
@@ -478,8 +354,6 @@ impl<'a> VaultService<'a> {
                 status: "ForceExit".into(),
             })
             .expect("EmitEventFailed");
-
-        reply_ok();
     }
 
     // --- Queries ---
@@ -495,61 +369,8 @@ impl<'a> VaultService<'a> {
     }
 
     #[export]
-    pub fn get_balance(&self, user: Address) -> (u128, u128) {
+    pub fn get_balance(&self, user: Address) -> u128 {
         let state = self.get();
-        let available = state.balances.get(&user).copied().unwrap_or(0);
-        let locked = locked_balance_of(&state, user);
-        (available, locked)
-    }
-
-    #[export]
-    pub fn get_treasury(&self) -> u128 {
-        self.get().treasury
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_orderbook_deposit_ack;
-    use sails_rs::prelude::*;
-
-    #[test]
-    fn decode_ack_accepts_valid_wrapped_tuple() {
-        let reply = (String::from("Orderbook"), String::from("Deposit"), true).encode();
-        assert!(decode_orderbook_deposit_ack(&reply));
-    }
-
-    #[test]
-    fn decode_ack_rejects_wrapped_tuple_with_trailing_bytes() {
-        let mut reply = (String::from("Orderbook"), String::from("Deposit"), true).encode();
-        reply.push(0xAB);
-        assert!(!decode_orderbook_deposit_ack(&reply));
-    }
-
-    #[test]
-    fn decode_ack_rejects_wrong_wrapped_service_or_method() {
-        let wrong_service = (String::from("Vault"), String::from("Deposit"), true).encode();
-        let wrong_method = (String::from("Orderbook"), String::from("Other"), true).encode();
-        assert!(!decode_orderbook_deposit_ack(&wrong_service));
-        assert!(!decode_orderbook_deposit_ack(&wrong_method));
-    }
-
-    #[test]
-    fn decode_ack_accepts_valid_raw_bool() {
-        let reply = true.encode();
-        assert!(decode_orderbook_deposit_ack(&reply));
-    }
-
-    #[test]
-    fn decode_ack_rejects_raw_bool_with_trailing_bytes() {
-        let mut reply = true.encode();
-        reply.push(0x01);
-        assert!(!decode_orderbook_deposit_ack(&reply));
-    }
-
-    #[test]
-    fn decode_ack_rejects_malformed_payload() {
-        let reply = vec![0xFF, 0xAA, 0x10];
-        assert!(!decode_orderbook_deposit_ack(&reply));
+        state.balances.get(&user).copied().unwrap_or(0)
     }
 }

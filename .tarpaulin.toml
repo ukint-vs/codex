@@ -1,0 +1,5 @@
+[coverage]
+workspace = true
+engine = "Llvm"
+out = ["Xml"]
+fail-under = 85

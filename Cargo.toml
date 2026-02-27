@@ -17,6 +17,7 @@ sails-rs = "=0.10.2"
 sails-idl-gen = "=0.10.2"
 sails-client-gen = "=0.10.2"
 tokio = { version = "1", features = ["rt", "macros"] }
+gstd = "=1.10.0"
 gtest = "1"
 insta = "1"
 alloy-sol-types = { version = "0.8.15", default-features = false }
